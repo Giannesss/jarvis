@@ -101,7 +101,6 @@ def listen() -> str | None:
             print("Δεν κατάλαβα τι είπες.")
             return None
 
-        print(f"Εσύ: {text}")
         return text
 
     except Exception as e:
