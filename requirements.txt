@@ -4,3 +4,6 @@ piper-tts
 edge-tts
 pyaudio
 python-dotenv
+openwakeword
+scipy
+scikit-learn

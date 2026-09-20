@@ -22,6 +22,17 @@ SILENCE_DURATION = 1.0  # seconds of silence before ffmpeg reports it
 MAX_RECORD_SECONDS = 15  # hard safety cap on recording length
 NO_SPEECH_TIMEOUT = 8  # stop early if nothing is said within this long
 
+# Wake-word listening (see jarvis/listener.py, jarvis/wakeword.py). Off by
+# default; opt in per session, e.g. `$env:WAKE_WORD_ENABLED="true"`.
+WAKE_WORD_ENABLED = os.environ.get("WAKE_WORD_ENABLED", "false").lower() == "true"
+
+# "openwakeword" (only one implemented). See CLAUDE.md "Providers" pattern.
+WAKE_WORD_ENGINE = os.environ.get("WAKE_WORD_ENGINE", "openwakeword")
+
+# Detection score cutoff, 0-1. Higher = stricter (fewer false triggers, must
+# say the wake phrase more clearly); lower = easier to trigger but chattier.
+WAKE_THRESHOLD = float(os.environ.get("WAKE_THRESHOLD", "0.5"))
+
 # Skill: websites openable via "άνοιξε το ..." (jarvis/skills.py). Keys are
 # matched as accent/case-insensitive substrings of the spoken text, so they
 # can be spelled naturally here.

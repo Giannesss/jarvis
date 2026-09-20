@@ -69,6 +69,13 @@ _VOICE_PROVIDERS = {
 _lock = threading.Lock()
 
 
+def is_speaking() -> bool:
+    """True while speak() is actively playing audio (it holds _lock for the
+    whole synchronous playback). Used by the wake-word listener to avoid
+    scoring Jarvis's own voice."""
+    return _lock.locked()
+
+
 def speak(text: str) -> None:
     with _lock:
         provider = _VOICE_PROVIDERS.get(TTS_ENGINE)
