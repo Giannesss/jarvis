@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import queue
+import re
 import subprocess
 import tempfile
 import threading
@@ -25,6 +26,12 @@ FFMPEG_PATH = (
 )
 
 MICROPHONE_NAME = "Μικρόφωνο (Razer Seiren Mini)"
+
+# silence_start timestamps at or below this are leading silence (before any
+# speech); above it, they mark silence that follows speech.
+LEADING_SILENCE_MAX = 0.5
+
+SILENCE_START_RE = re.compile(r"silence_start:\s*(-?[\d.]+)")
 
 INITIAL_PROMPT = (
     "Τζάρβις. Γεια σου Τζάρβις, τι κάνεις; Τζάρβις, τι ώρα είναι; "
@@ -68,11 +75,18 @@ def _read_lines(pipe, line_queue: "queue.Queue[str | None]") -> None:
 def listen() -> str | None:
     """Record from the Razer microphone and transcribe locally with Whisper.
 
-    Recording stops ~1s after the speaker falls silent, using ffmpeg's
-    silencedetect filter on the live stream. A silence right at the start
-    (before any speech) doesn't count, so a slow start isn't cut off. Hard
-    limits: MAX_RECORD_SECONDS overall, NO_SPEECH_TIMEOUT if nothing is
-    ever said.
+    Recording stops once the speaker falls silent, using ffmpeg's
+    silencedetect filter on the live stream. silencedetect only logs
+    "silence_start: X" after SILENCE_DURATION of silence has already
+    elapsed, and only logs "silence_end" once sound returns — so a
+    silence_start with X near 0 is leading silence before any speech,
+    while a silence_start with a later X means speech happened first and
+    the trailing silence has already been waited out (safe to stop right
+    away). NO_SPEECH_TIMEOUT only fires while we're still waiting out that
+    leading silence (a silence_start near 0 with no silence_end after it);
+    if no silence event has been logged yet, sound has been present from
+    the start, so only MAX_RECORD_SECONDS is enforced. Hard limit either
+    way: MAX_RECORD_SECONDS overall.
     """
 
     wav_path = Path(tempfile.gettempdir()) / "jarvis_mic.wav"
@@ -125,6 +139,7 @@ def listen() -> str | None:
 
     stderr_lines: list[str] = []
     speech_detected = False
+    leading_silence_pending = False
     stop_reason = "eof"
 
     while True:
@@ -134,7 +149,7 @@ def listen() -> str | None:
             stop_reason = "max"
             break
 
-        if not speech_detected and elapsed >= NO_SPEECH_TIMEOUT:
+        if leading_silence_pending and elapsed >= NO_SPEECH_TIMEOUT:
             stop_reason = "no_speech"
             break
 
@@ -149,11 +164,21 @@ def listen() -> str | None:
 
         stderr_lines.append(line)
 
-        if "silence_end" in line:
+        if "silence_start" in line:
+            match = SILENCE_START_RE.search(line)
+            silence_at = float(match.group(1)) if match else 0.0
+
+            if silence_at > LEADING_SILENCE_MAX:
+                # Speech happened before this silence, and SILENCE_DURATION
+                # has already elapsed by the time this line shows up.
+                speech_detected = True
+                stop_reason = "silence"
+                break
+
+            leading_silence_pending = True
+        elif "silence_end" in line and leading_silence_pending:
             speech_detected = True
-        elif "silence_start" in line and speech_detected:
-            stop_reason = "silence"
-            break
+            leading_silence_pending = False
 
     if stop_reason in ("silence", "no_speech", "max") and process.poll() is None:
         try:
