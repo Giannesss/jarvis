@@ -1,0 +1,5 @@
+ollama
+speechrecognition
+piper-tts
+pyaudio
+python-dotenv
