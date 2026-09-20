@@ -1,13 +1,21 @@
 from __future__ import annotations
 
+import queue
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 
 from faster_whisper import WhisperModel
 
-from jarvis.config import WHISPER_MODEL
+from jarvis.config import (
+    MAX_RECORD_SECONDS,
+    NO_SPEECH_TIMEOUT,
+    SILENCE_DURATION,
+    SILENCE_THRESHOLD_DB,
+    WHISPER_MODEL,
+)
 
 
 FFMPEG_PATH = (
@@ -17,7 +25,6 @@ FFMPEG_PATH = (
 )
 
 MICROPHONE_NAME = "Μικρόφωνο (Razer Seiren Mini)"
-RECORD_SECONDS = 6
 
 INITIAL_PROMPT = (
     "Τζάρβις. Γεια σου Τζάρβις, τι κάνεις; Τζάρβις, τι ώρα είναι; "
@@ -48,16 +55,35 @@ def preload() -> None:
     _get_model()
 
 
+def _read_lines(pipe, line_queue: "queue.Queue[str | None]") -> None:
+    try:
+        for line in iter(pipe.readline, ""):
+            line_queue.put(line)
+    except Exception as e:
+        line_queue.put(f"[reader error] {e}\n")
+    finally:
+        line_queue.put(None)  # sentinel: ffmpeg closed stderr (process exited)
+
+
 def listen() -> str | None:
-    """Record from the Razer microphone and transcribe locally with Whisper."""
+    """Record from the Razer microphone and transcribe locally with Whisper.
+
+    Recording stops ~1s after the speaker falls silent, using ffmpeg's
+    silencedetect filter on the live stream. A silence right at the start
+    (before any speech) doesn't count, so a slow start isn't cut off. Hard
+    limits: MAX_RECORD_SECONDS overall, NO_SPEECH_TIMEOUT if nothing is
+    ever said.
+    """
 
     wav_path = Path(tempfile.gettempdir()) / "jarvis_mic.wav"
 
     command = [
         FFMPEG_PATH,
         "-y",
+        "-hide_banner",
         "-loglevel",
-        "error",
+        "info",
+        "-nostats",
         "-f",
         "dshow",
         "-audio_buffer_size",
@@ -65,7 +91,9 @@ def listen() -> str | None:
         "-i",
         f"audio={MICROPHONE_NAME}",
         "-t",
-        str(RECORD_SECONDS),
+        str(MAX_RECORD_SECONDS),
+        "-af",
+        f"silencedetect=noise={SILENCE_THRESHOLD_DB}dB:d={SILENCE_DURATION}",
         "-c:a",
         "pcm_s16le",
         str(wav_path),
@@ -75,22 +103,89 @@ def listen() -> str | None:
 
     t0 = time.perf_counter()
     try:
-        result = subprocess.run(
+        process = subprocess.Popen(
             command,
-            capture_output=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=RECORD_SECONDS + 10,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
         )
-    except subprocess.TimeoutExpired:
-        print("Timeout στην ηχογράφηση.")
-        return None
     except OSError as e:
         print(f"Σφάλμα εκκίνησης FFmpeg: {e}")
         return None
+
+    line_queue: "queue.Queue[str | None]" = queue.Queue()
+    reader = threading.Thread(
+        target=_read_lines, args=(process.stderr, line_queue), daemon=True
+    )
+    reader.start()
+
+    stderr_lines: list[str] = []
+    speech_detected = False
+    stop_reason = "eof"
+
+    while True:
+        elapsed = time.perf_counter() - t0
+
+        if elapsed >= MAX_RECORD_SECONDS:
+            stop_reason = "max"
+            break
+
+        if not speech_detected and elapsed >= NO_SPEECH_TIMEOUT:
+            stop_reason = "no_speech"
+            break
+
+        try:
+            line = line_queue.get(timeout=0.1)
+        except queue.Empty:
+            continue
+
+        if line is None:
+            stop_reason = "eof"
+            break
+
+        stderr_lines.append(line)
+
+        if "silence_end" in line:
+            speech_detected = True
+        elif "silence_start" in line and speech_detected:
+            stop_reason = "silence"
+            break
+
+    if stop_reason in ("silence", "no_speech", "max") and process.poll() is None:
+        try:
+            process.stdin.write("q")
+            process.stdin.flush()
+        except (BrokenPipeError, OSError):
+            pass
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+    else:
+        process.wait()
+
+    reader.join(timeout=1)
+    while True:
+        try:
+            line = line_queue.get_nowait()
+        except queue.Empty:
+            break
+        if line is not None:
+            stderr_lines.append(line)
+
     print(f"[timing] Recording: {time.perf_counter() - t0:.2f}s")
 
-    if result.returncode != 0:
-        error = result.stderr.strip()
+    if stop_reason == "eof" and process.returncode != 0:
+        error = "".join(stderr_lines).strip()
         print(f"Σφάλμα μικροφώνου: {error or 'άγνωστο σφάλμα'}")
         return None
 
