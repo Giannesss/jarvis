@@ -16,15 +16,6 @@ from jarvis.listener import FFMPEG_PATH
 _voice = PiperVoice.load(Path(PIPER_MODEL_PATH))
 
 
-def speak(text: str) -> None:
-    if TTS_ENGINE == "edge":
-        if _speak_edge(text):
-            return
-        print("Edge TTS απέτυχε (πιθανώς χωρίς σύνδεση), χρήση Piper.")
-
-    _speak_piper(text)
-
-
 def _speak_piper(text: str) -> None:
     t0 = time.perf_counter()
     buffer = io.BytesIO()
@@ -61,3 +52,20 @@ def _speak_edge(text: str) -> bool:
     print(f"[timing] Edge TTS synthesis: {time.perf_counter() - t0:.2f}s")
     winsound.PlaySound(wav_bytes, winsound.SND_MEMORY)
     return True
+
+
+# Add "elevenlabs" here later (not implemented yet). Piper is the
+# always-available fallback/default, so it deliberately isn't listed here.
+_VOICE_PROVIDERS = {
+    "edge": _speak_edge,
+}
+
+
+def speak(text: str) -> None:
+    provider = _VOICE_PROVIDERS.get(TTS_ENGINE)
+    if provider is not None:
+        if provider(text):
+            return
+        print("Edge TTS απέτυχε (πιθανώς χωρίς σύνδεση), χρήση Piper.")
+
+    _speak_piper(text)

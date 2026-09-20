@@ -43,6 +43,24 @@ All settings live in `.env` (copy from `.env.example`): `OLLAMA_MODEL`, `PIPER_M
 The mic device name, record duration, and FFmpeg path are hardcoded constants at the
 top of `jarvis/listener.py`.
 
+## Providers
+
+`brain.py` and `speaker.py` dispatch to a provider function based on
+`BRAIN_PROVIDER` and `TTS_ENGINE` (both in `.env`, see `.env.example`).
+
+- Brain: `BRAIN_PROVIDER` selects from `_PROVIDERS` in `jarvis/brain.py`.
+  Only `"ollama"` is implemented. An unknown value raises `ValueError` at
+  import time (startup), before the app's request-level error handling can
+  swallow it. `"claude"` / `"openai"` are placeholders for later — adding
+  them means a new function plus a new dict entry, no other changes.
+- Voice: `TTS_ENGINE` selects from `_VOICE_PROVIDERS` in `jarvis/speaker.py`.
+  Only `"edge"` is implemented there; `"piper"` (or any unrecognized value)
+  isn't in the dict and is used directly as the always-available fallback.
+  `"elevenlabs"` is a placeholder for later, added the same way.
+
+No new dependencies or API-key handling have been added for the
+placeholders — that's future work when one is actually implemented.
+
 ## Language
 
 The user speaks Greek. Jarvis should answer in Greek by default.

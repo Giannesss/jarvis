@@ -8,6 +8,9 @@ OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3:8b")
 PIPER_MODEL_PATH = os.environ.get("PIPER_MODEL_PATH", "models/el_GR-joy-medium.onnx")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
 
+# "ollama" (local, only one implemented). See CLAUDE.md "Providers".
+BRAIN_PROVIDER = os.environ.get("BRAIN_PROVIDER", "ollama")
+
 # "edge" (online, Microsoft Edge TTS, male voice by default) or "piper"
 # (offline, falls back to this automatically if edge synthesis fails).
 TTS_ENGINE = os.environ.get("TTS_ENGINE", "edge")
