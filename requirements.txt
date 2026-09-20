@@ -1,5 +1,6 @@
 ollama
 speechrecognition
 piper-tts
+edge-tts
 pyaudio
 python-dotenv

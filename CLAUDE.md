@@ -1,6 +1,8 @@
 # Jarvis
 
 Local, offline Greek-speaking voice assistant. No cloud APIs, no API keys.
+Voice output can optionally use Microsoft's online Edge TTS (falls back to
+offline Piper if it's unavailable); everything else stays local.
 
 ## Run
 

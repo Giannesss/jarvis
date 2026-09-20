@@ -8,6 +8,11 @@ OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3:8b")
 PIPER_MODEL_PATH = os.environ.get("PIPER_MODEL_PATH", "models/el_GR-joy-medium.onnx")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
 
+# "edge" (online, Microsoft Edge TTS, male voice by default) or "piper"
+# (offline, falls back to this automatically if edge synthesis fails).
+TTS_ENGINE = os.environ.get("TTS_ENGINE", "edge")
+TTS_VOICE = os.environ.get("TTS_VOICE", "el-GR-NestorasNeural")
+
 # Recording silence detection (see jarvis/listener.py).
 SILENCE_THRESHOLD_DB = -35  # ffmpeg silencedetect noise floor, in dB
 SILENCE_DURATION = 1.0  # seconds of silence before ffmpeg reports it
