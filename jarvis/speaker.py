@@ -2,6 +2,7 @@ import asyncio
 import io
 import subprocess
 import tempfile
+import threading
 import time
 import wave
 import winsound
@@ -60,12 +61,20 @@ _VOICE_PROVIDERS = {
     "edge": _speak_edge,
 }
 
+# Serializes playback: speak() can be called from the main loop and from a
+# skill timer's background thread (see jarvis/skills.py), and winsound has no
+# concept of concurrent sounds — a second PlaySound call while one is still
+# running cuts it off instead of queuing. This makes a concurrent call simply
+# wait its turn.
+_lock = threading.Lock()
+
 
 def speak(text: str) -> None:
-    provider = _VOICE_PROVIDERS.get(TTS_ENGINE)
-    if provider is not None:
-        if provider(text):
-            return
-        print("Edge TTS απέτυχε (πιθανώς χωρίς σύνδεση), χρήση Piper.")
+    with _lock:
+        provider = _VOICE_PROVIDERS.get(TTS_ENGINE)
+        if provider is not None:
+            if provider(text):
+                return
+            print("Edge TTS απέτυχε (πιθανώς χωρίς σύνδεση), χρήση Piper.")
 
-    _speak_piper(text)
+        _speak_piper(text)

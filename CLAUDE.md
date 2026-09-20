@@ -25,12 +25,14 @@ voice model downloaded into `models/`. Enter at the prompt to record, `exit`/`qu
 4. **Text-to-speech** — `jarvis/speaker.py` synthesizes the reply with Piper
    and plays it via `winsound`.
 
-`main.py` just wires these three together in a loop.
+`main.py` wires these together in a loop, trying `jarvis/skills.py` first and
+only falling back to the brain when a skill doesn't match (see "Skills").
 
 ## Files
 
-- `main.py` — CLI loop tying listener → brain → speaker together.
+- `main.py` — CLI loop tying listener → skills → brain → speaker together.
 - `jarvis/listener.py` — FFmpeg recording + Whisper transcription.
+- `jarvis/skills.py` — local Greek voice commands, handled without the LLM.
 - `jarvis/brain.py` — Ollama chat call + conversation history + system prompt.
 - `jarvis/speaker.py` — Piper TTS + playback.
 - `jarvis/config.py` — loads `.env` (via `python-dotenv`) into `OLLAMA_MODEL` and `PIPER_MODEL_PATH`.
@@ -60,6 +62,31 @@ top of `jarvis/listener.py`.
 
 No new dependencies or API-key handling have been added for the
 placeholders — that's future work when one is actually implemented.
+
+## Skills
+
+`jarvis/skills.py` handles a fixed set of Greek voice commands locally,
+before the transcribed text ever reaches the brain: `main.py` calls
+`skills.handle(text)` first and only calls `brain.ask(text)` when that
+returns `None`. Matching is accent-insensitive, case-insensitive, and
+tolerant of extra words (simple substring matching on normalized text),
+since the input comes from speech recognition.
+
+Implemented: current time / date; opening a website (`SKILL_SITES` in
+`config.py`) or a local app (`SKILL_APPS` in `config.py`) by name; a spoken
+timer that announces itself (print + `speaker.speak`) when it fires; and
+shutting Jarvis down. Only the sites/apps listed in `config.py` can ever be
+opened — `skills.py` never builds a command from spoken text, and app
+launches always use a fixed argv list (never a shell).
+
+Shutdown is signalled via a `skills.shutdown_requested` flag (set by the
+skill, checked by `main.py` after speaking the reply) rather than by
+`handle()`'s return value, since `handle()` is otherwise always `str | None`.
+
+Timers run on a daemon `threading.Timer` so a pending one can't hang process
+exit. `speaker.speak()` is guarded by a lock so a timer announcement firing
+while Jarvis is already talking waits its turn instead of cutting off or
+overlapping the current audio.
 
 ## Language
 
