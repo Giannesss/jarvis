@@ -7,6 +7,8 @@ from pathlib import Path
 
 from faster_whisper import WhisperModel
 
+from jarvis.config import WHISPER_MODEL
+
 
 FFMPEG_PATH = (
     r"C:\Users\User\AppData\Local\Microsoft\WinGet\Packages"
@@ -16,6 +18,11 @@ FFMPEG_PATH = (
 
 MICROPHONE_NAME = "Μικρόφωνο (Razer Seiren Mini)"
 RECORD_SECONDS = 6
+
+INITIAL_PROMPT = (
+    "Τζάρβις. Γεια σου Τζάρβις, τι κάνεις; Τζάρβις, τι ώρα είναι; "
+    "Τζάρβις, πες μου κάτι."
+)
 
 _model: WhisperModel | None = None
 
@@ -27,7 +34,7 @@ def _get_model() -> WhisperModel:
         print("Φόρτωση Whisper...")
         t0 = time.perf_counter()
         _model = WhisperModel(
-            "base",
+            WHISPER_MODEL,
             device="cpu",
             compute_type="int8",
         )
@@ -100,6 +107,7 @@ def listen() -> str | None:
             language="el",
             vad_filter=True,
             beam_size=5,
+            initial_prompt=INITIAL_PROMPT,
         )
 
         text = " ".join(
