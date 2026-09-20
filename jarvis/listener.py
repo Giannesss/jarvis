@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 from faster_whisper import WhisperModel
@@ -24,13 +25,20 @@ def _get_model() -> WhisperModel:
 
     if _model is None:
         print("Φόρτωση Whisper...")
+        t0 = time.perf_counter()
         _model = WhisperModel(
             "base",
             device="cpu",
             compute_type="int8",
         )
+        print(f"[timing] Whisper load: {time.perf_counter() - t0:.2f}s")
 
     return _model
+
+
+def preload() -> None:
+    """Load the Whisper model now instead of on the first listen() call."""
+    _get_model()
 
 
 def listen() -> str | None:
@@ -58,6 +66,7 @@ def listen() -> str | None:
 
     print("Μίλησε τώρα...")
 
+    t0 = time.perf_counter()
     try:
         result = subprocess.run(
             command,
@@ -71,6 +80,7 @@ def listen() -> str | None:
     except OSError as e:
         print(f"Σφάλμα εκκίνησης FFmpeg: {e}")
         return None
+    print(f"[timing] Recording: {time.perf_counter() - t0:.2f}s")
 
     if result.returncode != 0:
         error = result.stderr.strip()
@@ -84,6 +94,7 @@ def listen() -> str | None:
     try:
         model = _get_model()
 
+        t0 = time.perf_counter()
         segments, info = model.transcribe(
             str(wav_path),
             language="el",
@@ -96,6 +107,7 @@ def listen() -> str | None:
             for segment in segments
             if segment.text.strip()
         ).strip()
+        print(f"[timing] Transcription: {time.perf_counter() - t0:.2f}s")
 
         if not text:
             print("Δεν κατάλαβα τι είπες.")

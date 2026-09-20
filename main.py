@@ -2,6 +2,7 @@ from jarvis import brain, listener, speaker
 
 
 def main() -> None:
+    listener.preload()
     print("Jarvis έτοιμος. Πάτα Enter για να μιλήσεις ('exit' για έξοδο).")
 
     while True:
