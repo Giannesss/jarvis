@@ -29,6 +29,11 @@ WAKE_WORD_ENABLED = os.environ.get("WAKE_WORD_ENABLED", "false").lower() == "tru
 # "openwakeword" (only one implemented). See CLAUDE.md "Providers" pattern.
 WAKE_WORD_ENGINE = os.environ.get("WAKE_WORD_ENGINE", "openwakeword")
 
+# Either the name of a pretrained openWakeWord model (downloaded on first use)
+# or a path to a custom .onnx model, e.g. "models/tzarvis.onnx" for the Greek
+# "Τζάρβις". Default is the pretrained English "Hey Jarvis".
+WAKE_MODEL_PATH = os.environ.get("WAKE_MODEL_PATH", "hey_jarvis")
+
 # Detection score cutoff, 0-1. Higher = stricter (fewer false triggers, must
 # say the wake phrase more clearly); lower = easier to trigger but chattier.
 WAKE_THRESHOLD = float(os.environ.get("WAKE_THRESHOLD", "0.5"))

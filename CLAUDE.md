@@ -59,9 +59,44 @@ top of `jarvis/listener.py`.
   Only `"edge"` is implemented there; `"piper"` (or any unrecognized value)
   isn't in the dict and is used directly as the always-available fallback.
   `"elevenlabs"` is a placeholder for later, added the same way.
+- Wake word: `WAKE_WORD_ENGINE` selects from `_ENGINES` in
+  `jarvis/wakeword.py`. Only `"openwakeword"` is implemented; an unknown
+  value raises `ValueError` at import time, same as `BRAIN_PROVIDER`.
 
 No new dependencies or API-key handling have been added for the
 placeholders — that's future work when one is actually implemented.
+
+## Wake word
+
+Off by default (`WAKE_WORD_ENABLED`). When on, `main.py` calls
+`listener.start_stream()` once and then loops
+`listen_for_wake_word()` → `record_command()` instead of prompting for
+Enter. Any failure starting or running detection falls back to the
+Enter-press flow for the rest of the run, so `listen()` stays the
+always-available path.
+
+`WAKE_MODEL_PATH` picks the model and accepts two forms, because
+openWakeWord's `Model()` already handles both:
+
+- a **pretrained model name** (the default, `"hey_jarvis"`) — downloaded on
+  first use, and the score is keyed by that name;
+- a **path to a custom `.onnx` model** (e.g. `models/tzarvis.onnx` for the
+  Greek "Τζάρβις") — the score is keyed by the file's stem instead.
+
+`wakeword.py` derives `_score_key` the same way at load time. A custom model
+must be `.onnx`, not `.tflite`, since `Model()` is constructed with
+`inference_framework="onnx"`. A path that doesn't exist is treated as a
+pretrained name and raises `ValueError`, which `main.py` catches into the
+Enter-press fallback.
+
+`download_models()` is called either way — it also fetches the shared
+melspectrogram/embedding models that every wake-word model runs on top of.
+For a custom model it's passed a name matching nothing, so it fetches those
+shared models and no pretrained wake-word model.
+
+`WAKE_THRESHOLD` (0-1) is the score cutoff. Expect a custom Greek model to
+need tuning here: Greek has only four usable TTS voices to synthesize
+training data from, so it won't be as robust as the pretrained models.
 
 ## Skills
 
