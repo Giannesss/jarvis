@@ -18,6 +18,22 @@ from jarvis import speaker
 from jarvis.config import SKILL_APPS, SKILL_SITES
 
 SHUTDOWN_PHRASES = ["κλεισε", "τερματισμος", "τερματισε"]
+
+# Leaving conversation mode (see main.py) — distinct from SHUTDOWN_PHRASES,
+# which quit Jarvis entirely. These only send it back to waiting for the
+# wake word.
+# Spelled with a plain σ, never a final ς: _normalize() folds ς to σ, so
+# "Τέλος Τζάρβις" arrives here as "τελοσ τζαρβισ".
+CONVERSATION_END_PHRASES = ["τελοσ τζαρβισ", "αντιο τζαρβισ"]
+
+# Matched only as the whole utterance, unlike everything else in this file:
+# as a substring, "τέλος" would end the conversation on an ordinary sentence
+# like "στο τέλος της μέρας".
+CONVERSATION_END_EXACT = ["τελοσ"]
+
+# Stripped before the whole-utterance comparison, since Whisper punctuates
+# what it transcribes ("Τέλος." / "Τέλος;").
+_PUNCTUATION = str.maketrans("", "", ".,;:!?…«»\"'")
 TIME_PHRASES = ["τι ωρα", "ποια ωρα", "πες μου την ωρα"]
 DATE_PHRASES = [
     "τι ημερομηνια",
@@ -176,6 +192,20 @@ def _handle_open(norm_text: str) -> str | None:
         return f"Άνοιξα το {key}."
 
     return None
+
+
+def is_conversation_end(text: str) -> bool:
+    """True if text asks to leave conversation mode (not to shut down).
+
+    Normalized the same way as every other phrase here, so it's
+    accent- and case-insensitive; see CONVERSATION_END_EXACT for why bare
+    "τέλος" is treated more strictly than the rest."""
+    norm = _normalize(text)
+
+    if any(phrase in norm for phrase in CONVERSATION_END_PHRASES):
+        return True
+
+    return norm.translate(_PUNCTUATION).strip() in CONVERSATION_END_EXACT
 
 
 def handle(text: str) -> str | None:

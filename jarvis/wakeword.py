@@ -12,7 +12,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from jarvis.config import WAKE_MODEL_PATH, WAKE_THRESHOLD, WAKE_WORD_ENGINE
+from jarvis.config import (
+    WAKE_DEBUG,
+    WAKE_MODEL_PATH,
+    WAKE_THRESHOLD,
+    WAKE_WORD_ENGINE,
+)
 
 # A name that matches no pretrained model, so download_models() fetches only
 # the shared feature models (see _get_model) and no wake-word model at all.
@@ -49,18 +54,38 @@ def _get_model() -> Any:
     return _model
 
 
+# Under WAKE_DEBUG, scores at or above this are printed even when they don't
+# reach WAKE_THRESHOLD, so a threshold that's set too high is visible as
+# "it scored 0.41" rather than as silence.
+_DEBUG_SCORE_FLOOR = 0.1
+
+
 def _detect_openwakeword(frame: bytes) -> bool:
     import numpy as np
 
     model = _get_model()
     audio = np.frombuffer(frame, dtype=np.int16)
     scores = model.predict(audio)
-    return scores.get(_score_key, 0.0) >= WAKE_THRESHOLD
+    score = scores.get(_score_key, 0.0)
+
+    if WAKE_DEBUG and score >= _DEBUG_SCORE_FLOOR:
+        hit = "HIT" if score >= WAKE_THRESHOLD else "   "
+        print(f"[wake] {hit} {_score_key}={score:.3f} (threshold {WAKE_THRESHOLD})")
+
+    return score >= WAKE_THRESHOLD
 
 
-# Add other engines here later, same idiom as brain.py's _PROVIDERS.
+def _reset_openwakeword() -> None:
+    # Only if the model was actually loaded: resetting is pointless before
+    # the first detect() call and would trigger the download/load early.
+    if _model is not None:
+        _model.reset()
+
+
+# Add other engines here later, same idiom as brain.py's _PROVIDERS. Each
+# entry is (detect, reset).
 _ENGINES = {
-    "openwakeword": _detect_openwakeword,
+    "openwakeword": (_detect_openwakeword, _reset_openwakeword),
 }
 
 if WAKE_WORD_ENGINE not in _ENGINES:
@@ -79,4 +104,17 @@ def preload() -> None:
 def detect(frame: bytes) -> bool:
     """frame must be one 2560-byte chunk: 1280 samples of 16-bit mono PCM
     at 16kHz (80ms). Returns True on the frame the wake word fires."""
-    return _ENGINES[WAKE_WORD_ENGINE](frame)
+    return _ENGINES[WAKE_WORD_ENGINE][0](frame)
+
+
+def reset() -> None:
+    """Clear the model's internal audio/feature buffer.
+
+    openWakeWord scores each frame using the ~1.5s of audio before it, so a
+    single spoken wake word keeps several consecutive frames above the
+    threshold. Without this, the same utterance re-fires detection on the
+    next listen_for_wake_word() call — flushing the audio queues isn't
+    enough, because the buffer lives inside the model. Call it after every
+    detection (and pair it with WAKE_RETRIGGER_COOLDOWN, which gives the
+    emptied buffer time to refill with fresh audio)."""
+    _ENGINES[WAKE_WORD_ENGINE][1]()

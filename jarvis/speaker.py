@@ -76,6 +76,31 @@ def is_speaking() -> bool:
     return _lock.locked()
 
 
+# Short non-speech cues for wake-word/conversation mode (see main.py).
+# Played under _lock like speak(), so is_speaking() covers them and the
+# listener's capture gate mutes the mic while they sound.
+READY_BEEP = (880, 120)  # wake word fired, go ahead
+DONE_BEEP = (523, 160)  # back to waiting for the wake word
+
+
+def _beep(frequency: int, duration_ms: int) -> None:
+    with _lock:
+        try:
+            winsound.Beep(frequency, duration_ms)
+        except RuntimeError as e:
+            # No audio device / beep unsupported: a missing cue must never
+            # take down the conversation loop.
+            print(f"Σφάλμα ήχου: {e}")
+
+
+def beep_ready() -> None:
+    _beep(*READY_BEEP)
+
+
+def beep_done() -> None:
+    _beep(*DONE_BEEP)
+
+
 def speak(text: str) -> None:
     with _lock:
         provider = _VOICE_PROVIDERS.get(TTS_ENGINE)

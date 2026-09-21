@@ -70,10 +70,43 @@ placeholders — that's future work when one is actually implemented.
 
 Off by default (`WAKE_WORD_ENABLED`). When on, `main.py` calls
 `listener.start_stream()` once and then loops
-`listen_for_wake_word()` → `record_command()` instead of prompting for
-Enter. Any failure starting or running detection falls back to the
-Enter-press flow for the rest of the run, so `listen()` stays the
+`listen_for_wake_word()` → `acknowledge()` → `record_command()` instead of
+prompting for Enter. Any failure starting or running detection falls back to
+the Enter-press flow for the rest of the run, so `listen()` stays the
 always-available path.
+
+After a detection, `listen_for_wake_word()` calls `wakeword.reset()` and
+ignores detections for `WAKE_RETRIGGER_COOLDOWN` (1s) while still feeding
+frames. openWakeWord scores each frame from the ~1.5s of audio before it, so
+one spoken wake word keeps several consecutive frames above the threshold;
+draining the audio queues isn't enough, because that buffer lives inside the
+model.
+
+`acknowledge()` plays a short beep and then flushes both queues, so
+`record_command()` starts from nothing and the wake word never reaches
+Whisper. `WAKE_BEEP=false` restores the older pre-roll path instead: no beep,
+no flush, and the ~1s captured before the trigger is prepended so words said
+in the same breath as the wake word survive — at the cost of the wake word
+being in the audio. Follow-up turns in conversation mode never use a pre-roll.
+
+`record_command()` decides speech vs. silence from each 80ms frame's own RMS
+level (`_frame_db()` vs `SILENCE_THRESHOLD_DB`), not from ffmpeg's
+`silencedetect` lines. `silencedetect` only reports a silence after
+`SILENCE_DURATION` of it has already passed, and the stream reader can only
+stamp a line with its arrival time, so a natural pause right after the wake
+word read as end-of-speech and ended the recording before the user spoke.
+Measuring frames is drift-free and needs no clock rebasing. It waits for
+speech to actually start (`SPEECH_ONSET_FRAMES` loud frames) and only then
+stops on `SILENCE_DURATION` of continuous quiet. It returns
+`(text, stop_reason)` — `"speech_end"`, `"no_speech"`, `"max"` or
+`"stream_end"` — because the caller must tell "you finished talking" from
+"you never started". `"no_speech"` returns without transcribing at all;
+running Whisper on pure silence just invites it to hallucinate a phrase out
+of room noise.
+
+`WAKE_DEBUG=true` prints detection scores (including near-misses below the
+threshold, for tuning), the mic level once a second while waiting for speech,
+and why each recording stopped.
 
 `WAKE_MODEL_PATH` picks the model and accepts two forms, because
 openWakeWord's `Model()` already handles both:
@@ -97,6 +130,32 @@ shared models and no pretrained wake-word model.
 `WAKE_THRESHOLD` (0-1) is the score cutoff. Expect a custom Greek model to
 need tuning here: Greek has only four usable TTS voices to synthesize
 training data from, so it won't be as robust as the pretrained models.
+
+## Conversation mode
+
+`CONVERSATION_MODE` (on by default, wake-word mode only). After a reply,
+`main.py`'s `_converse()` loops `record_command()` → skills/brain → `speak()`
+without needing the wake word again, calling `listener.flush()` after every
+reply so Jarvis never records its own voice as the next command. (The capture
+gate already mutes while `speaker.speak()` runs; the flush also clears what
+was queued just before it started talking.)
+
+It goes back to waiting for the wake word when:
+
+- an end phrase is said — `skills.is_conversation_end()`, normalized the same
+  accent/case-insensitive way as the rest of `skills.py`. `"τέλος Τζάρβις"`
+  and `"αντίο Τζάρβις"` match anywhere in the utterance; bare `"τέλος"` only
+  as the whole utterance, otherwise a sentence like *"στο τέλος της μέρας"*
+  would end the conversation. Jarvis says "Εντάξει." on the way out.
+- `CONVERSATION_TIMEOUT` seconds (6) pass with no speech — `record_command()`
+  returns `"no_speech"` and a short beep (`speaker.beep_done()`) signals the
+  switch back.
+
+`"κλείσε"` is unchanged: still a full shutdown via `skills.shutdown_requested`,
+which `_converse()` reports by returning `False` to break the outer loop.
+
+Phrase lists are spelled with a plain `σ`, never a final `ς`: `_normalize()`
+folds `ς` to `σ`, so `"Τέλος Τζάρβις"` arrives as `"τελοσ τζαρβισ"`.
 
 ## Skills
 

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import array
 import collections
 import io
+import math
 import queue
 import re
 import subprocess
@@ -19,6 +21,9 @@ from jarvis.config import (
     NO_SPEECH_TIMEOUT,
     SILENCE_DURATION,
     SILENCE_THRESHOLD_DB,
+    WAKE_BEEP,
+    WAKE_DEBUG,
+    WAKE_RETRIGGER_COOLDOWN,
     WHISPER_MODEL,
 )
 
@@ -62,6 +67,29 @@ WAKE_WORD_COOLDOWN = 0.4
 
 PREROLL_SECONDS = 1.0
 PREROLL_FRAMES = int(PREROLL_SECONDS / FRAME_SECONDS)
+
+# --- record_command() speech detection. It measures each 80ms frame's own
+# level instead of reading ffmpeg's silencedetect lines: every frame is
+# already in hand, so the decision is drift-free and immune to the delay
+# between a silence starting and ffmpeg logging it (silencedetect only
+# reports a silence after SILENCE_DURATION of it has already passed, which
+# made a natural pause right after the wake word look like end-of-speech).
+
+# Consecutive frames above the noise floor before speech is considered
+# started — one frame alone is usually a click or a door.
+SPEECH_ONSET_FRAMES = 2
+
+# Consecutive frames below the noise floor that end the recording, once
+# speech has actually started.
+SILENCE_STOP_FRAMES = max(1, round(SILENCE_DURATION / FRAME_SECONDS))
+
+MAX_RECORD_FRAMES = int(MAX_RECORD_SECONDS / FRAME_SECONDS)
+
+# How often WAKE_DEBUG prints the current level while waiting for speech.
+DEBUG_LEVEL_INTERVAL = 1.0
+
+# dB reported for a completely silent frame (log10(0) is undefined).
+SILENT_DB = -90.0
 
 _model: WhisperModel | None = None
 
@@ -483,14 +511,74 @@ def stop_stream() -> None:
         _stream_stderr_queue = None
 
 
-def listen_for_wake_word() -> tuple[bytes, float]:
-    """Block until the wake word fires. Flushes both queues first so a
-    backlog from the previous turn (e.g. queued silence while brain.ask()
-    ran) isn't treated as fresh audio. Returns (preroll_bytes,
-    segment_start_time): the ~1s of audio just before the trigger (so
-    words spoken in the same breath as the wake word aren't lost), and the
-    stream's internal clock at the exact frame that fired, for
-    record_command() to rebase its silence timing against."""
+def _debug(message: str) -> None:
+    if WAKE_DEBUG:
+        print(message)
+
+
+def _frame_db(frame: bytes) -> float:
+    """RMS level of one frame in dBFS, comparable to SILENCE_THRESHOLD_DB
+    (the same unit ffmpeg's silencedetect noise= option takes)."""
+    samples = array.array("h")
+    samples.frombytes(frame)
+    if not samples:
+        return SILENT_DB
+
+    total = 0
+    for sample in samples:
+        total += sample * sample
+    rms = math.sqrt(total / len(samples))
+
+    if rms <= 0:
+        return SILENT_DB
+    return 20 * math.log10(rms / 32768.0)
+
+
+def flush() -> None:
+    """Throw away everything captured so far on both stream queues.
+
+    Called after every spoken reply in conversation mode so the next turn
+    starts from silence: the capture gate already drops frames while
+    speaker.speak() runs, but anything queued just before it started
+    talking would otherwise be recorded as if the user had said it."""
+    if _stream_audio_queue is not None:
+        _drain(_stream_audio_queue)
+    if _stream_stderr_queue is not None:
+        _drain(_stream_stderr_queue)
+
+
+def acknowledge() -> None:
+    """Signal "go ahead" after the wake word fired, then clear the queues.
+
+    The flush is the point: it drops the wake word itself, the beep, and
+    the room's echo of the beep, so record_command() starts from nothing
+    and Whisper never sees the wake word as the command. A no-op when
+    WAKE_BEEP is false — with no beep there is nothing to signal and
+    nothing to flush, and the caller keeps the pre-roll instead."""
+    if not WAKE_BEEP:
+        return
+
+    # Deferred import: speaker.py imports FFMPEG_PATH from this module.
+    from jarvis import speaker
+
+    speaker.beep_ready()
+    flush()
+
+
+def listen_for_wake_word() -> bytes:
+    """Block until the wake word fires, returning the ~1s of audio ending
+    with the frame that fired (the pre-roll).
+
+    The caller uses that pre-roll only when WAKE_BEEP is false; with the
+    beep on, acknowledge() flushes instead and the pre-roll is discarded,
+    since it necessarily contains the wake word.
+
+    Both queues are flushed on entry so a backlog from the previous turn
+    isn't treated as fresh audio, and the model is reset — openWakeWord
+    scores each frame from the ~1.5s before it, so without a reset the
+    wake word still sitting in its buffer re-fires immediately. Frames are
+    fed but detections ignored for WAKE_RETRIGGER_COOLDOWN after that
+    reset, giving the emptied buffer time to refill with fresh audio."""
     audio_queue = _stream_audio_queue
     stderr_queue = _stream_stderr_queue
     if audio_queue is None or stderr_queue is None:
@@ -498,8 +586,11 @@ def listen_for_wake_word() -> tuple[bytes, float]:
 
     _drain(audio_queue)
     _drain(stderr_queue)
+    wakeword.reset()
 
     preroll: "collections.deque[bytes]" = collections.deque(maxlen=PREROLL_FRAMES)
+    cooldown_frames = int(WAKE_RETRIGGER_COOLDOWN / FRAME_SECONDS)
+    frames_seen = 0
 
     print("Πες «Hey Jarvis»...")
 
@@ -507,91 +598,140 @@ def listen_for_wake_word() -> tuple[bytes, float]:
         item = audio_queue.get()
         if item is None:
             raise RuntimeError("Η ροή μικροφώνου τερμάτισε απρόσμενα.")
-        stream_time, frame = item
-        if wakeword.detect(frame):
-            return b"".join(preroll), stream_time
-        preroll.append(frame)
+
+        _, frame = item
+        frames_seen += 1
+
+        # Scored even during the cooldown: the model needs the frames to
+        # rebuild its buffer, we just don't act on what it says yet.
+        fired = wakeword.detect(frame)
+        preroll.append(frame)  # includes the firing frame, not just before it
+
+        if fired:
+            if frames_seen <= cooldown_frames:
+                _debug(
+                    f"[wake] ignored (cooldown, "
+                    f"{frames_seen * FRAME_SECONDS:.2f}s of "
+                    f"{WAKE_RETRIGGER_COOLDOWN:.2f}s)"
+                )
+                continue
+
+            wakeword.reset()  # so the tail of this utterance can't re-fire
+            _debug(f"[wake] fired after {frames_seen * FRAME_SECONDS:.2f}s")
+            return b"".join(preroll)
 
 
-def record_command(preroll: bytes, segment_start_time: float) -> str | None:
-    """Continue recording after listen_for_wake_word() fires, reusing the
-    same persistent stream (mic opened only once for the whole run). Same
-    silence/timeout state machine as listen() (see its docstring), rebased
-    to segment_start_time — the moment the wake word fired, not ffmpeg's
-    process start (which no longer resets per utterance) and not the start
-    of the pre-roll — so a natural pause right after the wake word still
-    reads as leading silence instead of ending the recording early."""
+def record_command(
+    preroll: bytes = b"",
+    no_speech_timeout: float = NO_SPEECH_TIMEOUT,
+) -> tuple[str | None, str]:
+    """Record one spoken command off the persistent stream and transcribe it.
+
+    Waits for speech to actually start (SPEECH_ONSET_FRAMES frames above
+    SILENCE_THRESHOLD_DB) and only then stops on silence — SILENCE_DURATION
+    of continuous quiet. Nothing said within no_speech_timeout stops with
+    "no_speech" and no transcription at all; that is what ends conversation
+    mode. Hard cap either way: MAX_RECORD_SECONDS.
+
+    preroll is prepended to the audio and is used only on the WAKE_BEEP=false
+    path; follow-up turns in conversation mode always pass nothing.
+
+    Returns (text, stop_reason), where stop_reason is one of "speech_end",
+    "no_speech", "max" or "stream_end" — the caller needs it to tell "you
+    finished talking" from "you never started"."""
     audio_queue = _stream_audio_queue
     stderr_queue = _stream_stderr_queue
     if audio_queue is None or stderr_queue is None:
         raise RuntimeError("Wake-word stream not started; call start_stream() first.")
 
-    _drain(stderr_queue)  # discard idle-period leftovers from before the trigger
+    # silencedetect lines no longer drive this loop, but the queue still
+    # fills during the idle period; clear it so it doesn't go stale.
+    _drain(stderr_queue)
 
     t0 = time.perf_counter()
     audio = bytearray(preroll)
-    leading_silence_pending = False
-    stop_reason = "eof"
+    captured_frames = 0
+    loud_run = 0  # consecutive loud frames, before speech has started
+    silent_run = 0  # consecutive quiet frames, after speech has started
+    speech_started = False
+    stop_reason = "running"  # never a stop condition; each break sets a real one
+    last_level_print = t0
+
+    no_speech_frames = max(1, int(no_speech_timeout / FRAME_SECONDS))
+
+    print("Μίλησε τώρα...")
+    _debug(
+        f"[rec] floor {SILENCE_THRESHOLD_DB} dB, no-speech timeout "
+        f"{no_speech_timeout:.1f}s, pre-roll {len(preroll) / FRAME_BYTES:.0f} frames"
+    )
 
     while True:
-        elapsed = time.perf_counter() - t0
+        try:
+            item = audio_queue.get(timeout=0.2)
+        except queue.Empty:
+            # No frames at all (e.g. capture muted while a timer
+            # announcement plays): fall back to wall clock so this can't hang.
+            if time.perf_counter() - t0 >= MAX_RECORD_SECONDS + no_speech_timeout:
+                stop_reason = "max"
+                break
+            continue
 
-        if elapsed >= MAX_RECORD_SECONDS:
+        if item is None:
+            stop_reason = "stream_end"
+            break
+
+        _, frame = item
+        audio += frame
+        captured_frames += 1
+
+        level = _frame_db(frame)
+        loud = level > SILENCE_THRESHOLD_DB
+
+        if not speech_started:
+            now = time.perf_counter()
+            if WAKE_DEBUG and now - last_level_print >= DEBUG_LEVEL_INTERVAL:
+                last_level_print = now
+                print(
+                    f"[rec] waiting for speech: {level:.1f} dB "
+                    f"(floor {SILENCE_THRESHOLD_DB} dB, "
+                    f"{captured_frames * FRAME_SECONDS:.1f}s of "
+                    f"{no_speech_timeout:.1f}s)"
+                )
+
+            loud_run = loud_run + 1 if loud else 0
+            if loud_run >= SPEECH_ONSET_FRAMES:
+                speech_started = True
+                silent_run = 0
+                _debug(
+                    f"[rec] speech started at "
+                    f"{captured_frames * FRAME_SECONDS:.2f}s ({level:.1f} dB)"
+                )
+            elif captured_frames >= no_speech_frames:
+                stop_reason = "no_speech"
+                break
+        elif loud:
+            silent_run = 0
+        else:
+            silent_run += 1
+            if silent_run >= SILENCE_STOP_FRAMES:
+                stop_reason = "speech_end"
+                break
+
+        if captured_frames >= MAX_RECORD_FRAMES:
             stop_reason = "max"
             break
 
-        if leading_silence_pending and elapsed >= NO_SPEECH_TIMEOUT:
-            stop_reason = "no_speech"
-            break
-
-        got_something = False
-
-        while True:
-            try:
-                item = stderr_queue.get_nowait()
-            except queue.Empty:
-                break
-            got_something = True
-            if item is None:
-                stop_reason = "eof"
-                break
-            stream_time, line = item
-            relative = stream_time - segment_start_time
-
-            if "silence_start" in line:
-                if relative > LEADING_SILENCE_MAX:
-                    stop_reason = "silence"
-                else:
-                    leading_silence_pending = True
-            elif "silence_end" in line and leading_silence_pending:
-                leading_silence_pending = False
-
-        if stop_reason in ("eof", "silence"):
-            break
-
-        while True:
-            try:
-                item = audio_queue.get_nowait()
-            except queue.Empty:
-                break
-            got_something = True
-            if item is None:
-                stop_reason = "eof"
-                break
-            _, frame = item
-            audio += frame
-
-        if stop_reason == "eof":
-            break
-
-        if not got_something:
-            time.sleep(0.02)
-
     print(f"[timing] Recording: {time.perf_counter() - t0:.2f}s")
+    _debug(
+        f"[rec] stopped: {stop_reason} after {captured_frames} frames "
+        f"({captured_frames * FRAME_SECONDS:.2f}s captured, "
+        f"speech_started={speech_started})"
+    )
 
-    if not audio:
-        print("Δεν δημιουργήθηκε σωστή ηχογράφηση.")
-        return None
+    if not speech_started:
+        # Nothing was said. Transcribing pure silence only invites Whisper
+        # to hallucinate a phrase out of room noise.
+        return None, stop_reason
 
     wav_buffer = io.BytesIO()
     with wave.open(wav_buffer, "wb") as wav_file:
@@ -622,10 +762,10 @@ def record_command(preroll: bytes, segment_start_time: float) -> str | None:
 
         if not text:
             print("Δεν κατάλαβα τι είπες.")
-            return None
+            return None, stop_reason
 
-        return text
+        return text, stop_reason
 
     except Exception as e:
         print(f"Σφάλμα Whisper: {e}")
-        return None
+        return None, stop_reason
