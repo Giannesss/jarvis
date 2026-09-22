@@ -108,18 +108,32 @@ level (`_frame_db()` vs `SILENCE_THRESHOLD_DB`), not from ffmpeg's
 `SILENCE_DURATION` of it has already passed, and the stream reader can only
 stamp a line with its arrival time, so a natural pause right after the wake
 word read as end-of-speech and ended the recording before the user spoke.
-Measuring frames is drift-free and needs no clock rebasing. It waits for
-speech to actually start (`SPEECH_ONSET_FRAMES` loud frames) and only then
-stops on `SILENCE_DURATION` of continuous quiet. It returns
-`(text, stop_reason)` — `"speech_end"`, `"no_speech"`, `"max"` or
-`"stream_end"` — because the caller must tell "you finished talking" from
-"you never started". `"no_speech"` returns without transcribing at all;
-running Whisper on pure silence just invites it to hallucinate a phrase out
-of room noise.
+
+*When* each level counts is `_StopDecider`'s business, not the loop's — see
+"The recording clock". `record_command()` only moves bytes: read a frame,
+skip it if it predates the last `flush()`, pad any hole to its real length,
+stop when told. It returns `(text, stop_reason)` — `"speech_end"`,
+`"no_speech"`, `"gap"`, `"max"`, `"timeout"` or `"stream_end"` — because the
+caller must tell "you finished talking" from "you never started" from "what
+reached me had holes in it". `"no_speech"` and `"gap"` return without
+transcribing at all; running Whisper on pure silence invites it to
+hallucinate a phrase out of room noise, and running it on a splice invites a
+confident wrong one.
 
 `WAKE_DEBUG=true` prints detection scores (including near-misses below the
 threshold, for tuning), the mic level once a second while waiting for speech,
-and why each recording stopped.
+and a stopped-because line carrying the invariant: audio seconds, wall
+seconds, and seconds lost to holes. The `[timing] Recording` line always
+prints both clocks — `4.24s wall / 3.04s audio` — because the wall-clock
+number alone is what hid a 43-second recording and a 0.05-second one for
+hours.
+
+Read the ratio in two parts, which is why the debug line separates them.
+Every turn starts by waiting ~1s for ffmpeg's buffer to reach the new floor;
+that is fixed overhead and says nothing. *After* frames start flowing, audio
+should track wall clock at ~1.00 — that is the number that collapsed to 0.35
+on the 43-second turn, and the one to look at first if recordings ever feel
+wrong again.
 
 `WAKE_MODEL_PATH` picks the model and accepts two forms, because
 openWakeWord's `Model()` already handles both:
@@ -144,14 +158,99 @@ shared models and no pretrained wake-word model.
 need tuning here: Greek has only four usable TTS voices to synthesize
 training data from, so it won't be as robust as the pretrained models.
 
+## The recording clock
+
+Every frame off the stream carries the `stream_time` at which it was
+**recorded** — audio seconds since the device opened, counted for gated
+frames too. That is the only clock any recording decision may use. Wall
+clock survives in exactly two places: one backstop for "audio stopped
+arriving", and the timing line.
+
+The distinction is not academic. ffmpeg's dshow input (`-audio_buffer_size
+1000`) hands over **~1 second of audio at a time, in a sub-millisecond
+burst**, then nothing for a second; the device takes ~1.4s to produce its
+first frame at all; and the capture gate drops frames that never arrive.
+Measured, not assumed — 12.6 frames/s overall, 57 of 63 inter-frame gaps
+under 1ms, max gap 1.008s.
+
+Counting *frames*, as this used to, measured neither the audio nor the
+clock, and produced two symptoms that looked unrelated:
+
+- **43.06s for one utterance.** The stop was `187 frames` — 14.96s of audio
+  — collected from a stream delivering about a third of real time.
+  187 × 0.2303s = 43.07s. The wall-clock backstop that should have caught
+  it lived inside the `queue.Empty` branch, which a trickle of frames keeps
+  out of reach. It is checked every pass now.
+- **0.05s, nothing captured, "Δεν κατάλαβα τι είπες".** A burst already
+  sitting in the queue satisfied the whole end-of-speech rule — 2 loud
+  frames + 13 quiet = 1.2s of stale audio, drained in ~8ms — before the
+  user had said anything. `_frame_db()` costs 0.06ms against an 80ms
+  real-time budget, so the consumer outruns the producer by ~1300×.
+
+One clock fixes both, because the mapping needs no delay constant:
+
+```
+recorded_wall = _stream_origin + stream_time
+```
+
+Audio is *produced* in real time even though it *arrives* in bursts, so
+buffering changes when a frame shows up, never when it was spoken.
+`_stream_origin` is estimated as a rolling minimum of `wall_at_read -
+stream_time` (= the true origin plus that frame's arrival delay, so the
+minimum is the tightest estimate), windowed so one early sample can't pin it
+forever if the driver later drops audio.
+
+**Holes are classified, never papered over.** `_StopDecider` is a pure
+state machine — `feed(ts, level_db) -> stop reason or None`, no clock, no
+queue, no I/O, driven from a list in `tests/test_record_timing.py`. A
+contiguous frame is the ordinary case; a hole up to `MAX_GAP_SECONDS` is
+padded with real silence and counted as quiet (quiet is what the microphone
+heard, and concatenating across a hole welds words together for Whisper to
+transcribe as one); a longer hole, or more than `MAX_LOST_SECONDS` of them
+in one utterance, returns `"gap"` and the turn is re-asked instead of
+transcribed. Same principle as the fuzzy triggers' third guard: a silent
+wrong answer costs more than another try. `main.py` caps that at
+`MAX_GAP_RETRIES` (2) before going back to the wake word.
+
+**The capture gate asks about recorded time too.** `_should_capture()` asks
+`speaker.was_speaking(recorded_wall)`, not `speaker.is_speaking()`. The old
+question was unanswerable: by the time a frame reaches the gate, the audio
+in it is a second old, so a 0.4s cooldown against a ~1.0-1.4s pipeline delay
+muted the wrong second in *both* directions — it dropped live audio while
+Jarvis's own voice, buffered from before he stopped, sailed through and
+started a "recording" off his own reply. `speaker.ECHO_PAD` now means only
+what it says (the room's echo), and is deliberately not applied before an
+interval starts: audio recorded just before Jarvis opened his mouth is the
+user's. Intervals are recorded around playback only, not around Edge TTS
+synthesis — a second on the network makes no sound and shouldn't mute the
+microphone.
+
+**`flush()` is a watermark, not a drain.** It raises `_capture_floor` to the
+current recorded time, and every consumer skips frames below it. Draining
+alone never worked: ffmpeg still held the same second in its own buffer and
+handed it over immediately afterwards. The floor drops that second wherever
+it is sitting, while anything recorded *after* the flush survives — which
+draining could never manage.
+
+**openWakeWord gets a `reset()` on every hole.** It scores each frame from
+the ~1.5s of audio before it, so audio welded across a hole leaves that
+window holding two different moments spliced together. The retrigger
+cooldown restarts with it, since the buffer is empty either way.
+
 ## Conversation mode
 
 `CONVERSATION_MODE` (on by default, wake-word mode only). After a reply,
 `main.py`'s `_converse()` loops `record_command()` → skills/brain → `speak()`
 without needing the wake word again, calling `listener.flush()` after every
 reply so Jarvis never records its own voice as the next command. (The capture
-gate already mutes while `speaker.speak()` runs; the flush also clears what
-was queued just before it started talking.)
+gate already drops frames *recorded* while he was audible; the flush raises
+the floor past everything older than the end of the reply. See "The recording
+clock" — both are answering the same question on the same clock now.)
+
+A turn that comes back `"gap"` is re-asked rather than answered: Jarvis says
+«Δεν σε άκουσα καλά, πες το ξανά.» and records again, up to `MAX_GAP_RETRIES`
+(2) times. Past that, asking a third time won't fix a microphone dropping
+that much audio, so it goes back to the wake word.
 
 It goes back to waiting for the wake word when:
 

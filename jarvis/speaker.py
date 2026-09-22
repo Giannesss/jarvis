@@ -1,4 +1,8 @@
+from __future__ import annotations
+
 import asyncio
+import collections
+import contextlib
 import io
 import subprocess
 import tempfile
@@ -44,7 +48,8 @@ def _speak_piper(text: str) -> None:
     with wave.open(buffer, "wb") as wav_file:
         voice.synthesize_wav(text, wav_file)
     print(f"[timing] Piper synthesis: {time.perf_counter() - t0:.2f}s")
-    winsound.PlaySound(buffer.getvalue(), winsound.SND_MEMORY)
+    with _playing():
+        winsound.PlaySound(buffer.getvalue(), winsound.SND_MEMORY)
 
 
 def _speak_edge(text: str) -> bool:
@@ -72,7 +77,8 @@ def _speak_edge(text: str) -> bool:
         wav_path.unlink(missing_ok=True)
 
     print(f"[timing] Edge TTS synthesis: {time.perf_counter() - t0:.2f}s")
-    winsound.PlaySound(wav_bytes, winsound.SND_MEMORY)
+    with _playing():
+        winsound.PlaySound(wav_bytes, winsound.SND_MEMORY)
     return True
 
 
@@ -91,21 +97,82 @@ _lock = threading.Lock()
 
 
 def is_speaking() -> bool:
-    """True while speak() is actively playing audio (it holds _lock for the
-    whole synchronous playback). Used by the wake-word listener to avoid
-    scoring Jarvis's own voice."""
+    """True while speak() is running -- synthesis included, since it holds
+    _lock for the whole call. Only a fallback for the capture gate now, used
+    before the stream has an origin estimate; was_speaking() is the real
+    question. See listener._should_capture."""
     return _lock.locked()
 
 
+# How long after a sound stops before captured audio is trusted again. This
+# is the room's echo of it and nothing else: the pipeline's ~1s delay is
+# handled by comparing *recorded* times (listener._should_capture), not by
+# padding this. It was doing both jobs before, and was three times too small
+# for the second one.
+ECHO_PAD = 0.4
+
+# Closed (start, end) wall-clock intervals during which Jarvis was audible,
+# newest last. A handful is plenty: a frame older than the last few seconds
+# is long gone from the stream queue either way.
+_intervals: collections.deque[tuple[float, float]] = collections.deque(maxlen=8)
+_intervals_lock = threading.Lock()
+
+# Start of the interval currently open, while a sound is actually playing.
+_playback_start: float | None = None
+
+
+@contextlib.contextmanager
+def _playing():
+    """Mark the wall-clock interval during which a sound is actually audible.
+
+    Wrapped around playback only, not around synthesis: Edge TTS spends a
+    second on the network making no sound at all, and muting the microphone
+    through it would throw away audio the user really did speak.
+    """
+    global _playback_start
+
+    with _intervals_lock:
+        _playback_start = time.perf_counter()
+    try:
+        yield
+    finally:
+        with _intervals_lock:
+            _intervals.append((_playback_start, time.perf_counter()))
+            _playback_start = None
+
+
+def was_speaking(at_wall: float, pad: float = ECHO_PAD) -> bool:
+    """True if Jarvis was audible at wall-clock time at_wall (or within pad
+    afterwards, while the room was still ringing with it).
+
+    Unlike is_speaking(), this answers about a moment in the *past*, which is
+    the only answerable form of the question for the capture gate: a frame
+    reaches the gate up to a second after the audio in it was recorded. See
+    listener._should_capture.
+
+    Deliberately not padded before `start`: audio recorded just before Jarvis
+    opened his mouth is the user's, and keeping it is the point.
+    """
+    with _intervals_lock:
+        open_start = _playback_start
+        intervals = list(_intervals)
+
+    if open_start is not None and at_wall >= open_start:
+        return True  # still playing, so it has no end to compare against yet
+
+    return any(start <= at_wall <= end + pad for start, end in intervals)
+
+
 # Short non-speech cues for wake-word/conversation mode (see main.py).
-# Played under _lock like speak(), so is_speaking() covers them and the
-# listener's capture gate mutes the mic while they sound.
+# Played under _lock and _playing() like speak(), so the capture gate drops
+# the frames recorded while they sound -- and, just as importantly, keeps the
+# ones recorded before they started.
 READY_BEEP = (880, 120)  # wake word fired, go ahead
 DONE_BEEP = (523, 160)  # back to waiting for the wake word
 
 
 def _beep(frequency: int, duration_ms: int) -> None:
-    with _lock:
+    with _lock, _playing():
         try:
             winsound.Beep(frequency, duration_ms)
         except RuntimeError as e:

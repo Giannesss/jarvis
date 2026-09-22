@@ -33,6 +33,14 @@ class SpeakerLazyTestCase(unittest.TestCase):
     """Reloads jarvis.speaker against a fake `piper` module for each test, so
     every test sees a module whose _voice has never been populated."""
 
+    @staticmethod
+    def _restore_module(name: str, original) -> None:
+        """Put sys.modules[name] back exactly as it was -- absent if it was."""
+        if original is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = original
+
     def setUp(self) -> None:
         self.fake_voice = mock.Mock(name="PiperVoice instance")
         # A real PiperVoice fills in the wave header; without this the
@@ -45,9 +53,18 @@ class SpeakerLazyTestCase(unittest.TestCase):
         fake_piper = mock.Mock(name="piper module")
         fake_piper.PiperVoice = self.piper_voice_cls
 
-        patcher = mock.patch.dict(sys.modules, {"piper": fake_piper})
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        # Injected by key, deliberately not with mock.patch.dict(sys.modules,
+        # ...). patch.dict restores by clearing the dict and repopulating it
+        # from a snapshot taken at start(), which evicts every module imported
+        # *during* the test -- here numpy, pulled in below by jarvis.speaker ->
+        # jarvis.listener -> faster_whisper. The next setUp re-imported it, and
+        # numpy refuses to load its C extension twice in one process, so
+        # running this file on its own failed every test after the first.
+        # Under `discover` it passed by luck: an earlier file had already
+        # imported numpy, so the snapshot kept it.
+        original_piper = sys.modules.get("piper")
+        sys.modules["piper"] = fake_piper
+        self.addCleanup(self._restore_module, "piper", original_piper)
 
         import jarvis.speaker
 
@@ -131,9 +148,11 @@ class PiperEngineTests(SpeakerLazyTestCase):
 
 class LockAndCueTests(SpeakerLazyTestCase):
     def test_speak_holds_the_lock_for_the_whole_call(self) -> None:
-        # listener._CaptureGate mutes the mic on is_speaking(), which is
-        # _lock.locked() -- so the lock must be held across synthesis, not just
-        # playback, or Jarvis records its own voice.
+        # is_speaking() is _lock.locked(), so the lock must be held across
+        # synthesis, not just playback: it serializes two callers (main loop
+        # and a skill timer), and listener._should_capture falls back to it
+        # before the stream has an origin estimate. The gate's real question
+        # is was_speaking() -- see test_record_timing.py.
         observed = []
 
         def record_then_succeed(text: str) -> bool:

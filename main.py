@@ -10,6 +10,14 @@ from jarvis.config import (
 )
 
 
+# Said when a recording came back with holes in it (listener returns "gap").
+# Two tries, then back to the wake word: if the microphone is dropping that
+# much audio, asking a third time won't fix it and the user is owed silence
+# rather than a loop.
+GAP_REPLY = "Δεν σε άκουσα καλά, πες το ξανά."
+MAX_GAP_RETRIES = 2
+
+
 def _reply_to(text: str) -> str | None:
     """Skill first, brain only when no skill matches. None on a brain error
     (already reported), so the caller just moves on to the next turn."""
@@ -42,6 +50,7 @@ def _converse(preroll: bytes) -> bool:
     # never replay it.
     turn_preroll = b"" if WAKE_BEEP else preroll
     timeout = NO_SPEECH_TIMEOUT
+    gap_retries = 0
 
     while True:
         text, stop_reason = listener.record_command(turn_preroll, timeout)
@@ -49,10 +58,21 @@ def _converse(preroll: bytes) -> bool:
         timeout = CONVERSATION_TIMEOUT
 
         if text is None:
+            if stop_reason == "gap" and gap_retries < MAX_GAP_RETRIES:
+                # Too much of that utterance never arrived to transcribe it
+                # honestly (see listener._StopDecider). Ask again rather than
+                # answer a spliced one.
+                gap_retries += 1
+                speaker.speak(GAP_REPLY)
+                listener.flush()
+                timeout = NO_SPEECH_TIMEOUT  # a re-ask starts the turn over
+                continue
+
             if stop_reason == "no_speech":
                 speaker.beep_done()  # back to waiting for the wake word
             return True
 
+        gap_retries = 0
         print(f"Εσύ: {text}")
 
         if skills.is_conversation_end(text):
