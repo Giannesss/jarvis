@@ -101,7 +101,9 @@ class RecallContentTests(RecallTestCase):
         self._save("Θυμήσου ότι με λένε Γιάννης")
         block = memory.recall("κάτι εντελώς άσχετο", self.conn, NOW)
         self.assertIn("Προφίλ", block)
-        self.assertIn("γιαννισ", block)
+        # The digest carries the value the way it was said. It reached the
+        # prompt folded ("γιαννισ") until captures became verbatim.
+        self.assertIn("Γιάννης", block)
 
     def test_exam_due_today_is_always_present(self) -> None:
         self.conn.execute(
@@ -125,7 +127,8 @@ class RecallContentTests(RecallTestCase):
         # otherwise hold only its note and be unfindable by "επιχείρηση".
         self._save("Θυμήσου ότι η επιχείρησή μου χρειάζεται καινούριο λογιστή")
         block = memory.recall("τι γίνεται με την επιχείρηση;", self.conn, NOW)
-        self.assertIn("λογιστι", block)
+        # Found through the folded `norm`, rendered from the verbatim note.
+        self.assertIn("λογιστή", block)
 
     def test_empty_memory_yields_an_empty_block(self) -> None:
         self.assertEqual(memory.recall("οτιδήποτε", self.conn, NOW), "")
@@ -192,8 +195,12 @@ class BudgetTests(RecallTestCase):
 
 
 class SpokenProfileTests(RecallTestCase):
-    """The topic-less "Τι θυμάσαι;" answer. Distinct from _profile_digest():
-    this one is spoken, so it must never read a stored value aloud."""
+    """The topic-less "Τι θυμάσαι;" answer.
+
+    This used to name the keys it held and refuse to say the values, because
+    values were stored folded and "γιαννισ" is worse than silence. They are
+    stored verbatim now, so it answers with the facts themselves.
+    """
 
     def test_every_profile_key_has_a_spoken_label(self) -> None:
         # A new PROFILE_PATTERNS entry without a label would be stored and
@@ -207,23 +214,33 @@ class SpokenProfileTests(RecallTestCase):
         reply = memory.spoken_profile(self.conn)
         self.assertIn("Δεν έχω κρατήσει", reply)
 
-    def test_names_the_keys_it_holds(self) -> None:
+    def test_speaks_the_facts_it_holds(self) -> None:
         self._save("Θυμήσου ότι με λένε Γιάννης")
         self._save("Θυμήσου ότι μένω στην Αθήνα")
 
         reply = memory.spoken_profile(self.conn)
-        self.assertIn("το όνομά σου", reply)
-        self.assertIn("πού μένεις", reply)
+        self.assertIn("το όνομά σου είναι Γιάννης", reply)
+        self.assertIn("η πόλη σου είναι Αθήνα", reply)
 
-    def test_never_speaks_a_stored_value(self) -> None:
-        # The stored value is normalized ("γιαννισ"), so saying it aloud
-        # would mispronounce the user's own name. See CLAUDE.md known gaps.
+    def test_speaks_the_name_the_way_it_was_said(self) -> None:
+        # The live failure this replaced: the value went in as "Γιάννης" and
+        # came back out as the folded "γιαννι", which is how it was spoken.
         self._save("Θυμήσου ότι με λένε Γιάννης")
         reply = memory.spoken_profile(self.conn)
+        self.assertIn("Γιάννης", reply)
         self.assertNotIn("γιαννισ", reply)
-        self.assertNotIn("=", reply)
+        self.assertNotIn("γιαννι ", reply)
 
-    def test_joins_three_labels_the_greek_way(self) -> None:
+    def test_it_is_a_sentence_not_a_digest(self) -> None:
+        # _profile_digest() feeds a prompt and may use key=value; this feeds
+        # a speaker and must not.
+        self._save("Θυμήσου ότι με λένε Γιάννης")
+        reply = memory.spoken_profile(self.conn)
+        self.assertNotIn("=", reply)
+        self.assertNotIn("ονομα", reply)
+        self.assertTrue(reply.endswith("."), reply)
+
+    def test_joins_three_facts_the_greek_way(self) -> None:
         self._save("Θυμήσου ότι με λένε Γιάννης")
         self._save("Θυμήσου ότι μένω στην Αθήνα")
         self._save("Θυμήσου ότι η σχολή μου είναι το ΕΚΠΑ")

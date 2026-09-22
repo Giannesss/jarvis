@@ -36,8 +36,9 @@ only falling back to the brain when a skill doesn't match (see "Skills").
 - `jarvis/brain.py` — Ollama chat call + conversation history + system prompt.
 - `jarvis/speaker.py` — Piper TTS + playback.
 - `jarvis/config.py` — loads `.env` (via `python-dotenv`) into `OLLAMA_MODEL` and `PIPER_MODEL_PATH`.
-- `jarvis/text.py` — Greek normalization (see "Normalization") and the phrase
-  data shared by `skills.py` and `memory.py` (see "Memory"). `skills.py`
+- `jarvis/text.py` — Greek normalization (see "Normalization"), the span map
+  that makes captures verbatim, and the phrase data shared by `skills.py` and
+  `memory.py` (see "Memory"). `skills.py`
   re-exports it under the old names, so `_normalize` and `SHUTDOWN_PHRASES`
   still work there.
 - `jarvis/db.py` — SQLite schema, connections, backups.
@@ -289,16 +290,25 @@ leaves no searchable token — every word is a stopword or too short to stem —
 so `stems_of()` comes back empty and there is nothing to match. Answering
 `"Δεν θυμάμαι κάτι σχετικό."` there reports an empty result for a search that
 was never run, so `_handle_memory_recall` routes that case to
-`memory.spoken_profile()` instead: *"Θυμάμαι το όνομά σου, τη σχολή σου και
-πού μένεις. Ρώτησέ με για κάτι συγκεκριμένο."*
+`memory.spoken_profile()` instead: *"Θυμάμαι ότι το όνομά σου είναι Γιάννης,
+η σχολή σου είναι το ΕΚΠΑ και η πόλη σου είναι Αθήνα."*
 
-It names the profile **keys** it holds and never reads a stored value aloud,
-which is the point — values come back normalized, so a name speaks as
-`γιαννι` (see "Known gaps" below). `_PROFILE_LABELS` maps each key
-`PROFILE_PATTERNS` can write to a spoken label; a test asserts the two stay in
-step, since a new pattern without a label would be stored and then silently
-left out of the answer. An empty profile invites a first save rather than
-listing nothing.
+It speaks the facts themselves — *"Θυμάμαι ότι το όνομά σου είναι Γιάννης
+και η πόλη σου είναι Αθήνα."* `_PROFILE_LABELS` maps each key
+`PROFILE_PATTERNS` can write to a spoken phrase with a `{value}` slot; a test
+asserts the two stay in step, since a new pattern without a phrase would be
+stored and then silently left out of the answer. An empty profile invites a
+first save rather than listing nothing.
+
+It used to name the keys and deliberately withhold every value, because
+values were captured out of the normalized string and a name spoke as
+`γιαννι`. That is fixed at the source (see "Verbatim captures"), so the
+constraint is gone.
+
+Each phrase is written so the value needs no agreement with it. The patterns
+consume the preposition — `μένω στην Αθήνα` stores `Αθήνα` — so `"μένεις
+{value}"` would be ungrammatical and `"μένεις στη {value}"` would be guessing
+the article's gender. `"η πόλη σου είναι {value}"` needs neither.
 
 The recall verbs themselves are in `_STOPWORDS` for the same reason — without
 `ειπες` there, *"Τι μου είπες;"* stems to the junk needle `ιπεσ`, runs a real
@@ -319,18 +329,42 @@ path.
    neither. Recall is noun/keyword-oriented, which covers most memory
    lookups, but verbs are a real gap.
 
-Also worth knowing: parsed fields are stored normalized, so they read back
-both accent-stripped **and** iotacism-folded — a course is `μαθιματικα`, a
-name is `γιαννισ`. The fold preserves pronunciation by construction, so TTS
-is unaffected (stress placement can still suffer from the missing accents),
-but it is one more step away from the written word for anything that is shown
-on screen or injected into the brain prompt. Only `notes.text` keeps the
-utterance verbatim; the rest are captured out of the normalized string.
+### Verbatim captures
 
-Making those captures verbatim would mean matching against the folded text
-while slicing the unfolded one — an offset map through `parse()`'s whole
-ladder. Not done: the fold's cost here is the same kind as the accent
-stripping that was already accepted.
+Every display column holds what the user actually said — accents, capitals
+and Whisper's own spelling included. `norm` beside it is still folded, and is
+the only thing search ever touches. The two are now different things on
+purpose; a test pins that.
+
+This was a real gap, not a theoretical one: `Γιάννης` was saved and spoken
+back as `Γιάννι`. Captures were being sliced out of the normalized string, so
+the folded form landed in the column meant to be readable, and `_PROFILE_LABELS`
+existed to avoid ever saying one out loud.
+
+The fix is `text.normalize_spans()`, which returns `normalize(text)` plus, for
+each output character, the `(start, end)` of the input that produced it.
+`memory.Norm` wraps the two: patterns match `.norm` exactly as before, and
+`.group(match, name)` reads the capture back out of `.raw`. Slicing a `Norm`
+(stripping the trigger) returns another `Norm` over the same raw text, so a
+capture taken afterwards still points at the right place.
+
+The map is needed because `normalize()` is **not length-preserving**.
+Lower-casing, accent stripping and the final sigma are one character in, one
+out; `fold_iotacism` is not, since `ει`/`οι`/`υι` each collapse to a single
+`ι`. A normalized index is therefore not an index into the raw text — the two
+cannot be sliced in parallel. This is the whole reason the map exists, and
+`test_text.py` pins both the digraph case and `normalize_spans()` never
+disagreeing with `normalize()`.
+
+No schema change was involved. The display columns (`profile.value`,
+`notes.text`, `courses.name`, `exams.course`/`topic`, `businesses.name`/`note`,
+`reminders.text`) already existed and already meant this; they were simply
+being filled from the wrong string. `SCHEMA_VERSION` stays at 2.
+
+Rows written *before* this hold folded values and cannot be repaired
+automatically — the fold is lossy, so `γιαννι` could have been η, ι, υ, ει, οι
+or υι. Re-save them, or fix them with `:mem edit` (which has always rebuilt
+`norm` from the display columns, so the CLI path was never affected).
 
 **Managing it.** `:mem <command>` at the Enter prompt and `python -m
 jarvis.mem <command>` share one dispatcher (`mem.run`). Commands: `list`,
@@ -356,6 +390,10 @@ name, and a coarser stamp let a pruned name be reused and overwritten.
 search key is compared through. It lower-cases, strips accents, folds the
 final `ς` to `σ`, and folds the **iotacism** vowels: η, ι, υ, ει, οι and υι
 are all pronounced /i/ in Modern Greek, so they are all folded to `ι`.
+
+`text.normalize_spans()` is the same transformation plus a map back to the
+input, for the callers that have to recover what was *said* rather than what
+was matched. See "Verbatim captures" under "Memory".
 
 The fold exists because Whisper transcribes sound, not spelling. A spoken
 "Θυμήσου ότι με λένε Γιάννη" came back as "Θυμ**ί**σου ...", missed

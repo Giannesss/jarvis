@@ -44,7 +44,10 @@ class DispatchTests(MemorySkillTestCase):
         reply = skills.handle("Θυμήσου ότι με λένε Γιάννης")
 
         self.assertEqual(reply, skills._SAVE_REPLIES["profile"])
-        self.assertEqual(self.rows("profile")[0]["value"], "γιαννισ")
+        row = self.rows("profile")[0]
+        # Verbatim in the display column, folded in the search key.
+        self.assertEqual(row["value"], "Γιάννης")
+        self.assertEqual(row["norm"], "ονομα γιαννισ")
 
     def test_handle_dispatches_each_table(self) -> None:
         cases = [
@@ -154,7 +157,7 @@ class InjectionTests(MemorySkillTestCase):
 
         ask.assert_called_once()
         memory_block = ask.call_args[0][1]
-        self.assertIn("γιαννισ", memory_block)
+        self.assertIn("Γιάννης", memory_block)
 
     def test_brain_ask_keeps_memory_out_of_history(self) -> None:
         # The block is rebuilt every turn, so it must never accumulate in

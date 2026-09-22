@@ -82,6 +82,73 @@ def normalize(text: str) -> str:
     return fold_iotacism(text.replace("ς", "σ"))
 
 
+def normalize_spans(text: str) -> tuple[str, list[tuple[int, int]]]:
+    """normalize(text), plus where each output character came from.
+
+    `spans[i]` is the `(start, end)` slice of `text` that produced
+    `norm[i]`, so a pattern can match against the normalized string and the
+    caller can still recover what the user actually said:
+
+        norm, spans = normalize_spans(text)
+        start, end = match.span("value")
+        raw = text[spans[start][0]:spans[end - 1][1]]     # "Γιάννης"
+
+    That indirection is needed because normalize() is not length-preserving.
+    Lower-casing, accent stripping and the final sigma are all one character
+    in, one out; fold_iotacism is not, since ει/οι/υι each collapse to a
+    single ι. A normalized index is therefore not an index into the original
+    text, which is what made every captured value read back folded (see
+    memory.Norm).
+
+    Kept separate from normalize() rather than replacing it: normalize() is
+    called on every phrase list at import and on every utterance, and has no
+    use for the map. test_text.py asserts the two never disagree.
+    """
+    offset = len(text) - len(text.lstrip())
+    stripped = text.strip()
+
+    # Done per character rather than over the whole string so the map stays
+    # honest even where a step is not 1:1 -- a decomposed input, where
+    # stripping a combining mark deletes a character outright.
+    soft: list[str] = []
+    origin: list[int] = []
+    for index, char in enumerate(stripped):
+        piece = strip_accents(char.lower()).replace("ς", "σ")
+        soft.extend(piece)
+        origin.extend([offset + index] * len(piece))
+
+    source = "".join(soft)
+    out: list[str] = []
+    spans: list[tuple[int, int]] = []
+    position = 0
+
+    for match in _IOTACISM_RE.finditer(source):
+        for i in range(position, match.start()):
+            out.append(source[i])
+            spans.append((origin[i], origin[i] + 1))
+
+        replacement = _IOTACISM_FOLD.get(match.group(), match.group())
+        if len(replacement) == 1:
+            # A fold: one character now stands for everything the match
+            # covered, so its span covers all of it -- that is what lets
+            # "Γιάννης" be recovered from the ι that its "η" folded into.
+            out.append(replacement)
+            spans.append((origin[match.start()], origin[match.end() - 1] + 1))
+        else:
+            # A kept digraph (ου, αυ, ευ, ηυ) passing through unchanged.
+            for shift, char in enumerate(replacement):
+                i = match.start() + shift
+                out.append(char)
+                spans.append((origin[i], origin[i] + 1))
+        position = match.end()
+
+    for i in range(position, len(source)):
+        out.append(source[i])
+        spans.append((origin[i], origin[i] + 1))
+
+    return "".join(out), spans
+
+
 def phrases(*items: str) -> list[str]:
     """Normalize a literal phrase list at import time.
 

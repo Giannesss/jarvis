@@ -94,5 +94,75 @@ class NormalizeTests(unittest.TestCase):
         self.assertEqual(text.strip_punctuation("τέλος."), "τέλος")
 
 
+class NormalizeSpansTests(unittest.TestCase):
+    """normalize_spans() is normalize() plus a map back to the input.
+
+    It exists because normalize() is not length-preserving: ει/οι/υι each
+    fold to one ι, so a normalized index cannot be used against the original
+    string. Everything that captures a value out of speech depends on this
+    staying exactly in step with normalize().
+    """
+
+    CORPUS = (
+        "Θυμήσου ότι με λένε Γιάννης",
+        "  η σχολή μου είναι το ΕΚΠΑ  ",
+        "μένω στη Θεσσαλονίκη",
+        "σπουδάζω Πληροφορική, είμαι 20 χρονών",
+        "οι ειδήσεις που είδα ευχάριστα υιοθετώ",
+        "Θυμί σου, ό,τι με λένε Γιάννη",
+        "ΟΙ ΕΙΔΗΣΕΙΣ",
+        "αυτό ούτε ηυξήθη",
+        "",
+        "   ",
+        "plain ascii 123",
+    )
+
+    def test_it_never_disagrees_with_normalize(self) -> None:
+        for source in self.CORPUS:
+            with self.subTest(source=source):
+                self.assertEqual(text.normalize_spans(source)[0], text.normalize(source))
+
+    def test_one_span_per_output_character(self) -> None:
+        for source in self.CORPUS:
+            with self.subTest(source=source):
+                norm, spans = text.normalize_spans(source)
+                self.assertEqual(len(norm), len(spans))
+
+    def test_spans_are_ordered_and_inside_the_input(self) -> None:
+        for source in self.CORPUS:
+            with self.subTest(source=source):
+                _, spans = text.normalize_spans(source)
+                previous = 0
+                for start, end in spans:
+                    self.assertLessEqual(previous, start)
+                    self.assertLess(start, end)
+                    self.assertLessEqual(end, len(source))
+                    previous = start
+
+    def test_a_folded_digraph_maps_back_to_both_characters(self) -> None:
+        # "ει" becomes one ι, so that ι has to stand for two input
+        # characters -- otherwise every capture after it slides by one.
+        source = "ειρήνη"
+        norm, spans = text.normalize_spans(source)
+        self.assertEqual(norm, "ιρινι")
+        self.assertEqual(spans[0], (0, 2))
+        self.assertEqual(source[spans[0][0] : spans[-1][1]], "ειρήνη")
+
+    def test_a_kept_digraph_maps_one_to_one(self) -> None:
+        # ου survives the fold, so its two characters stay two.
+        norm, spans = text.normalize_spans("ούτε")
+        self.assertEqual(norm, "ουτε")
+        self.assertEqual(spans, [(0, 1), (1, 2), (2, 3), (3, 4)])
+
+    def test_the_whole_string_round_trips(self) -> None:
+        for source in self.CORPUS:
+            with self.subTest(source=source):
+                norm, spans = text.normalize_spans(source)
+                if not norm:
+                    continue
+                recovered = source[spans[0][0] : spans[-1][1]]
+                self.assertEqual(recovered, source.strip())
+
+
 if __name__ == "__main__":
     unittest.main()

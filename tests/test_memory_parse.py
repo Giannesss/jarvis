@@ -6,10 +6,11 @@ parse()'s docstring: which table a spoken sentence lands in, and why.
 
 The fixed "now" is a Tuesday, so weekday and roll-forward cases are stable.
 
-Expected values look misspelled on purpose. Every field parse() captures
-comes out of text.normalize(), which strips accents *and* folds the iotacism
-vowels, so "Γιάννης" is stored as "γιαννισ" and "Βάσεις" as "βασισ". The fold
-preserves pronunciation, so this is invisible to TTS; see CLAUDE.md "Memory".
+Captured values are verbatim: patterns match against the normalized text,
+but Norm.group() reads each capture back out of the original, so "Γιάννης"
+is stored as "Γιάννης" and not as the folded "γιαννισ" the pattern saw. The
+`norm` field beside it is still folded -- that is the search key, and these
+tests pin the two staying different things.
 """
 
 from __future__ import annotations
@@ -74,7 +75,7 @@ class IotacismTests(unittest.TestCase):
                 self.assertIsNotNone(parsed, "fell through to the brain")
                 self.assertEqual(parsed.table, "profile")
                 self.assertEqual(parsed.fields["key"], "ονομα")
-                self.assertEqual(parsed.fields["value"], "γιαννι")
+                self.assertEqual(parsed.fields["value"], "Γιάννη")
 
     def test_every_spelling_of_the_other_triggers_still_saves(self) -> None:
         for phrase in (
@@ -107,7 +108,10 @@ class IotacismTests(unittest.TestCase):
         )
         self.assertEqual(parsed.table, "exams")
         self.assertEqual(parsed.fields["due_date"], "2027-06-12")
-        self.assertEqual(parsed.fields["course"], "μαθιματικα")
+        # Whisper's own misspelling is kept: the fold exists to make the
+        # pattern match, not to correct what was said. Only `norm` is folded.
+        self.assertEqual(parsed.fields["course"], "Μαθιματικά")
+        self.assertIn("μαθιματικα", parsed.fields["norm"])
 
         parsed = memory.parse("Θυμήσου ότι μου αρέσι ο καφές χωρίς ζάχαρη", NOW)
         self.assertEqual(parsed.table, "profile")
@@ -148,7 +152,7 @@ class WhisperPunctuationTests(unittest.TestCase):
         self.assertIsNotNone(parsed, "fell through to the brain")
         self.assertEqual(parsed.table, "profile")
         self.assertEqual(parsed.fields["key"], "ονομα")
-        self.assertEqual(parsed.fields["value"], "γιαννι")
+        self.assertEqual(parsed.fields["value"], "Γιάννη")
 
     def test_a_comma_after_the_trigger_verb(self) -> None:
         for phrase in (
@@ -159,7 +163,7 @@ class WhisperPunctuationTests(unittest.TestCase):
             with self.subTest(phrase=phrase):
                 parsed = memory.parse(phrase, NOW)
                 self.assertIsNotNone(parsed, "fell through to the brain")
-                self.assertEqual(parsed.fields["value"], "γιαννι")
+                self.assertEqual(parsed.fields["value"], "Γιάννη")
 
     def test_a_comma_inside_the_other_triggers(self) -> None:
         for phrase in (
@@ -205,14 +209,14 @@ class WhisperPunctuationTests(unittest.TestCase):
             "Θυμήσου ότι έχω εξετάσεις στα Μαθηματικά, στις 12 Ιουνίου", NOW
         )
         self.assertEqual(parsed.table, "exams")
-        self.assertEqual(parsed.fields["course"], "μαθιματικα")
+        self.assertEqual(parsed.fields["course"], "Μαθηματικά")
 
 
 class ReminderTests(unittest.TestCase):
     def test_relative_hours(self) -> None:
         parsed = memory.parse("Υπενθύμισέ μου σε 2 ώρες ότι έχω ραντεβού", NOW)
         self.assertEqual(parsed.table, "reminders")
-        self.assertEqual(parsed.fields["text"], "εχω ραντεβου")
+        self.assertEqual(parsed.fields["text"], "έχω ραντεβού")
         self.assertEqual(parsed.fields["due_at"], "2026-09-22T16:30:00")
         self.assertIsNone(parsed.fields["referent_date"])
         self.assertEqual(parsed.fields["status"], "pending")
@@ -232,7 +236,7 @@ class ReminderTests(unittest.TestCase):
 
     def test_absolute_afternoon_hour(self) -> None:
         parsed = memory.parse("Υπενθύμισέ μου στις 5 το απόγευμα να πάρω τη μαμά", NOW)
-        self.assertEqual(parsed.fields["text"], "παρω τι μαμα")
+        self.assertEqual(parsed.fields["text"], "πάρω τη μαμά")
         self.assertEqual(parsed.fields["due_at"], "2026-09-22T17:00:00")
 
     def test_absolute_hour_already_past_rolls_to_tomorrow(self) -> None:
@@ -253,7 +257,7 @@ class ExamTests(unittest.TestCase):
         self.assertEqual(parsed.table, "exams")
         # 12 June has already passed in September, so it rolls to next year.
         self.assertEqual(parsed.fields["due_date"], "2027-06-12")
-        self.assertEqual(parsed.fields["course"], "μαθιματικα")
+        self.assertEqual(parsed.fields["course"], "Μαθηματικά")
 
     def test_exam_date_later_this_year_does_not_roll(self) -> None:
         parsed = memory.parse(
@@ -273,8 +277,8 @@ class CourseTests(unittest.TestCase):
             "Θυμήσου ότι κάνω το μάθημα Βάσεις Δεδομένων αυτό το εξάμηνο", NOW
         )
         self.assertEqual(parsed.table, "courses")
-        self.assertEqual(parsed.fields["name"], "βασισ δεδομενων")
-        self.assertEqual(parsed.fields["semester"], "αυτο το εξαμινο")
+        self.assertEqual(parsed.fields["name"], "Βάσεις Δεδομένων")
+        self.assertEqual(parsed.fields["semester"], "αυτό το εξάμηνο")
 
     def test_gate_keeps_non_courses_out(self) -> None:
         # No "μάθημα", no "εξάμηνο" -- this must stay a note rather than
@@ -288,29 +292,29 @@ class ProfileTests(unittest.TestCase):
         parsed = memory.parse("Θυμήσου ότι με λένε Γιάννης", NOW)
         self.assertEqual(parsed.table, "profile")
         self.assertEqual(parsed.fields["key"], "ονομα")
-        self.assertEqual(parsed.fields["value"], "γιαννισ")
+        self.assertEqual(parsed.fields["value"], "Γιάννης")
 
     def test_job(self) -> None:
         parsed = memory.parse("Θυμήσου ότι δουλεύω ως προγραμματιστής", NOW)
         self.assertEqual(parsed.fields["key"], "δουλεια")
-        self.assertEqual(parsed.fields["value"], "προγραμματιστισ")
+        self.assertEqual(parsed.fields["value"], "προγραμματιστής")
 
     def test_studies(self) -> None:
         parsed = memory.parse("Θυμήσου ότι σπουδάζω Πληροφορική", NOW)
         self.assertEqual(parsed.fields["key"], "σπουδεσ")
-        self.assertEqual(parsed.fields["value"], "πλιροφορικι")
+        self.assertEqual(parsed.fields["value"], "Πληροφορική")
 
     def test_preferences(self) -> None:
         parsed = memory.parse("Θυμήσου ότι μου αρέσει ο καφές χωρίς ζάχαρη", NOW)
         self.assertEqual(parsed.fields["key"], "προτιμησεισ")
-        self.assertEqual(parsed.fields["value"], "ο καφεσ χωρισ ζαχαρι")
+        self.assertEqual(parsed.fields["value"], "ο καφές χωρίς ζάχαρη")
 
     def test_school_value_keeps_its_article_verbatim(self) -> None:
         # Values are stored exactly as captured, articles included, for
         # consistency across every profile pattern. No article stripping.
         parsed = memory.parse("Θυμήσου ότι η σχολή μου είναι το ΕΚΠΑ", NOW)
         self.assertEqual(parsed.fields["key"], "σχολη")
-        self.assertEqual(parsed.fields["value"], "το εκπα")
+        self.assertEqual(parsed.fields["value"], "το ΕΚΠΑ")
 
 
 class BusinessTests(unittest.TestCase):
@@ -325,21 +329,21 @@ class BusinessTests(unittest.TestCase):
         self.assertEqual(parsed.table, "businesses")
         self.assertIsNone(parsed.fields["name"])
         self.assertNotEqual(parsed.fields["name"], "")
-        self.assertEqual(parsed.fields["note"], "καινουριο λογιστι")
+        self.assertEqual(parsed.fields["note"], "καινούριο λογιστή")
 
     def test_named_business_keeps_the_captured_name(self) -> None:
         parsed = memory.parse(
             "Θυμήσου ότι η επιχείρησή μου Καφέ Αθηνά θέλει καινούριο μενού", NOW
         )
         self.assertEqual(parsed.table, "businesses")
-        self.assertEqual(parsed.fields["name"], "καφε αθινα")
-        self.assertEqual(parsed.fields["note"], "καινουριο μενου")
+        self.assertEqual(parsed.fields["name"], "Καφέ Αθηνά")
+        self.assertEqual(parsed.fields["note"], "καινούριο μενού")
 
     def test_business_without_a_need_verb(self) -> None:
         parsed = memory.parse("Θυμήσου ότι το μαγαζί μου πάει καλά φέτος", NOW)
         self.assertEqual(parsed.table, "businesses")
         self.assertIsNone(parsed.fields["name"])
-        self.assertEqual(parsed.fields["note"], "παι καλα φετοσ")
+        self.assertEqual(parsed.fields["note"], "πάει καλά φέτος")
 
 
 class FallbackTests(unittest.TestCase):
@@ -385,6 +389,100 @@ class DateHelperTests(unittest.TestCase):
 
     def test_impossible_date_is_rejected(self) -> None:
         self.assertIsNone(self._on("32/13"))
+
+
+class VerbatimCaptureTests(unittest.TestCase):
+    """Every display column holds what was said; every `norm` stays folded.
+
+    The gap this closes showed up in a live session: "Γιάννης" was saved and
+    then spoken back as "Γιάννι". Captures were being sliced out of the
+    normalized string, so the folded form was what reached the column meant
+    to be readable. Norm.group() reads them out of the original instead.
+    """
+
+    def _fields(self, text: str) -> dict:
+        parsed = memory.parse(text, NOW)
+        self.assertIsNotNone(parsed, "fell through to the brain")
+        return parsed.fields
+
+    def test_accents_and_capitals_survive_every_table(self) -> None:
+        for text, column, expected in (
+            ("Θυμήσου ότι με λένε Γιάννης", "value", "Γιάννης"),
+            ("Θυμήσου ότι η σχολή μου είναι το ΕΚΠΑ", "value", "το ΕΚΠΑ"),
+            (
+                "Θυμήσου ότι κάνω το μάθημα Βάσεις Δεδομένων αυτό το εξάμηνο",
+                "name",
+                "Βάσεις Δεδομένων",
+            ),
+            (
+                "Θυμήσου ότι έχω εξετάσεις στις 12 Ιουνίου στα Μαθηματικά",
+                "course",
+                "Μαθηματικά",
+            ),
+            (
+                "Θυμήσου ότι η επιχείρησή μου Καφέ Αθηνά θέλει νέο μενού",
+                "name",
+                "Καφέ Αθηνά",
+            ),
+            ("Υπενθύμισέ μου σε 2 ώρες ότι έχω ραντεβού", "text", "έχω ραντεβού"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self._fields(text)[column], expected)
+
+    def test_the_folded_digraph_does_not_shift_the_capture(self) -> None:
+        # ει/οι/υι are the only characters normalize() collapses, so a value
+        # containing one is exactly where an off-by-one would show up: the
+        # naive slice would start a character late for each one before it.
+        for text, expected in (
+            ("Θυμήσου ότι με λένε Ειρήνη", "Ειρήνη"),
+            ("Θυμήσου ότι μένω στοι Ποικίλοι Οικισμοί", "Ποικίλοι Οικισμοί"),
+            ("Θυμήσου ότι μου αρέσει το ουίσκι", "το ουίσκι"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self._fields(text)["value"], expected)
+
+    def test_norm_is_still_folded_and_searchable(self) -> None:
+        # The display column changed; the search key did not. A question
+        # asked with a different spelling of the same sound still hits it.
+        fields = self._fields("Θυμήσου ότι σπουδάζω Πληροφορική")
+        self.assertEqual(fields["value"], "Πληροφορική")
+        self.assertEqual(fields["norm"], "σπουδεσ πλιροφορικι")
+        self.assertIn(memory.stems_of("πλιροφορικι")[0], fields["norm"])
+
+    def test_whisper_noise_still_yields_a_clean_value(self) -> None:
+        # The transcription that failed by hand, end to end: a split verb, a
+        # comma inside it, and "ό,τι" for "ότι". The name still comes back
+        # spelled the way Whisper spelled it, not the way the fold saw it.
+        fields = self._fields("Θυμί σου, ό,τι με λένε Γιάννη")
+        self.assertEqual(fields["value"], "Γιάννη")
+        self.assertEqual(fields["norm"], "ονομα γιαννι")
+
+    def test_notes_are_unchanged(self) -> None:
+        # Notes always stored the raw utterance; nothing here should move.
+        fields = self._fields("Θυμήσου ότι το συνέδριο ήταν βαρετό")
+        self.assertEqual(fields["text"], "Θυμήσου ότι το συνέδριο ήταν βαρετό")
+
+
+class NormViewTests(unittest.TestCase):
+    """The span map itself, at the level parse() uses it."""
+
+    def test_a_slice_still_points_into_the_original(self) -> None:
+        view = memory.Norm.of("Θυμήσου ότι με λένε Γιάννης")
+        body = view.slice(view.norm.index("με")).strip()
+        self.assertEqual(body.norm, "με λενε γιαννισ")
+        self.assertEqual(body.original(0, len(body.norm)), "με λένε Γιάννης")
+
+    def test_a_group_that_did_not_match_is_empty_not_an_error(self) -> None:
+        # RE_BIZ_NEED's name group is optional; an absent group's span is
+        # (-1, -1), which has to read as "no value" rather than raising.
+        view = memory.Norm.of("η επιχείρησή μου χρειάζεται λογιστή")
+        m = memory.RE_BIZ_NEED.search(view.norm)
+        self.assertEqual(view.group(m, "name"), "")
+
+    def test_leading_whitespace_does_not_shift_the_map(self) -> None:
+        view = memory.Norm.of("   με λένε Γιάννης")
+        start = view.norm.index("γιαννισ")
+        self.assertEqual(view.original(start, start + len("γιαννισ")), "Γιάννης")
 
 
 if __name__ == "__main__":

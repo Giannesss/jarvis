@@ -17,7 +17,13 @@ from datetime import date, datetime, timedelta
 
 from jarvis import db
 from jarvis.config import MEMORY_TOKEN_BUDGET
-from jarvis.text import NUMBER_WORDS, fold_iotacism, normalize, strip_accents
+from jarvis.text import (
+    NUMBER_WORDS,
+    fold_iotacism,
+    normalize,
+    normalize_spans,
+    strip_accents,
+)
 
 
 def _re(pattern: str) -> re.Pattern:
@@ -45,6 +51,58 @@ class Parsed:
 
 
 REJECTED = "rejected"
+
+
+@dataclass(frozen=True)
+class Norm:
+    """A normalized utterance that remembers where each character came from.
+
+    Patterns match against `.norm`, exactly as they always have. What changed
+    is what a capture yields: `.group()` reads the match back out of the
+    *original* text, so a display column stores what the user actually said
+    rather than the folded form the pattern matched.
+
+    This is needed because normalize() is not length-preserving -- ει/οι/υι
+    each fold to a single ι -- so a normalized index is not an index into the
+    raw text, and the two cannot just be sliced in parallel. Before this,
+    "με λένε Γιάννης" stored the name as "γιαννισ" and recall spoke it that
+    way.
+
+    Slicing returns another Norm over the same `raw`, so a capture taken
+    after the trigger has been stripped still points into the original.
+    """
+
+    raw: str
+    norm: str
+    spans: tuple[tuple[int, int], ...]
+
+    @classmethod
+    def of(cls, text: str) -> "Norm":
+        norm, spans = normalize_spans(text)
+        return cls(text, norm, tuple(spans))
+
+    def slice(self, start: int, end: int | None = None) -> "Norm":
+        end = len(self.norm) if end is None else end
+        return Norm(self.raw, self.norm[start:end], self.spans[start:end])
+
+    def strip(self) -> "Norm":
+        start = len(self.norm) - len(self.norm.lstrip())
+        return self.slice(start, max(start, len(self.norm.rstrip())))
+
+    def original(self, start: int, end: int) -> str:
+        """The raw text behind a span of `.norm`."""
+        if start < 0 or end <= start:
+            return ""
+        return self.raw[self.spans[start][0] : self.spans[end - 1][1]]
+
+    def group(self, match: re.Match, name: str) -> str:
+        """The raw text behind a named capture, stripped.
+
+        Returns "" for a group that did not participate in the match -- its
+        span is (-1, -1) -- so callers keep using `or None` to tell "no
+        value" from a value, exactly as they did with match[name].
+        """
+        return self.original(*match.span(name)).strip()
 
 
 # --- Things we never store -------------------------------------------------
@@ -355,25 +413,32 @@ def parse(text: str, now: datetime | None = None) -> Parsed | None:
     we refuse to store.
     """
     now = now or datetime.now()
-    norm = normalize(text)
+    view = Norm.of(text)
 
     if is_sensitive(text):
         return Parsed(REJECTED)
 
     # Step 0: reminder verbs are their own trigger -- no "θυμήσου" needed.
-    if reminder := _parse_reminder(norm, now):
+    if reminder := _parse_reminder(view, now):
         return reminder
 
     # Step 1: without a trigger this is not a save request.
-    trigger = RE_TRIGGER.match(norm)
+    trigger = RE_TRIGGER.match(view.norm)
     if trigger is None:
         return None
     # "Θυμήσου ότι" with nothing after it backtracks: the optional "ότι" in
     # RE_TRIGGER gives way so the mandatory \s+ can match, leaving "οτι" as
     # the body. Strip a stranded particle so that reads as "no body" rather
     # than being stored as a note saying "οτι".
-    body = RE_STRANDED_PARTICLE.sub("", norm[trigger.end():].strip()).strip()
-    if not body:
+    #
+    # Sliced rather than sub()'d because the body has to stay a Norm: the
+    # sub-parsers below capture out of it and need the map back into `text`.
+    # RE_STRANDED_PARTICLE is ^-anchored, so matching it and slicing past it
+    # is the same edit.
+    body = view.slice(trigger.end()).strip()
+    if particle := RE_STRANDED_PARTICLE.match(body.norm):
+        body = body.slice(particle.end()).strip()
+    if not body.norm:
         return None
 
     # Steps 2-6: first match wins.
@@ -388,20 +453,27 @@ def parse(text: str, now: datetime | None = None) -> Parsed | None:
 
     # Step 7: always taken. Stored verbatim, not normalized, so it reads back
     # the way it was said.
-    return Parsed("notes", {"text": text.strip(), "norm": norm})
+    return Parsed("notes", {"text": text.strip(), "norm": view.norm})
 
 
-def _parse_reminder(norm: str, now: datetime) -> Parsed | None:
-    if m := RE_REMIND_REL.search(norm):
+def _parse_reminder(view: Norm, now: datetime) -> Parsed | None:
+    # The body is read back through the view, so a reminder is announced the
+    # way it was said. "when" stays normalized: it is parsed, never shown.
+    if m := RE_REMIND_REL.search(view.norm):
         number = _number(m["num"])
         seconds = _unit_seconds(m["unit"])
         if number is not None and seconds is not None:
-            return _reminder(m["body"], now + timedelta(seconds=number * seconds))
+            return _reminder(
+                view.group(m, "body"), now + timedelta(seconds=number * seconds)
+            )
 
-    if m := RE_REMIND_FRAC.search(norm):
-        return _reminder(m["body"], now + timedelta(seconds=_FRAC_SECONDS[m["frac"]]))
+    if m := RE_REMIND_FRAC.search(view.norm):
+        return _reminder(
+            view.group(m, "body"),
+            now + timedelta(seconds=_FRAC_SECONDS[m["frac"]]),
+        )
 
-    if m := RE_REMIND_ABS.search(norm):
+    if m := RE_REMIND_ABS.search(view.norm):
         when = _parse_clock(m["when"], now)
         if when is None:
             day = _parse_date(m["when"], now.date())
@@ -413,12 +485,14 @@ def _parse_reminder(norm: str, now: datetime) -> Parsed | None:
                 else None
             )
         if when is not None:
-            return _reminder(m["body"], when)
+            return _reminder(view.group(m, "body"), when)
 
     return None
 
 
 def _reminder(body: str, due: datetime) -> Parsed:
+    """`body` is raw text now rather than a slice of the normalized string,
+    so the stored `norm` is derived from it instead of being it."""
     body = body.strip()
     return Parsed(
         "reminders",
@@ -433,22 +507,22 @@ def _reminder(body: str, due: datetime) -> Parsed:
     )
 
 
-def _parse_exam(body: str, now: datetime) -> Parsed | None:
-    if not RE_EXAM_WORD.search(body):
+def _parse_exam(body: Norm, now: datetime) -> Parsed | None:
+    if not RE_EXAM_WORD.search(body.norm):
         return None
-    due = _parse_date(body, now.date())
+    due = _parse_date(body.norm, now.date())
     if due is None:
         return None
 
     course = ""
-    if m := RE_COURSE_OF_ALT.search(body):
-        course = m["course"].strip()
-    elif m := RE_COURSE_OF.search(body):
-        course = m["course"].strip()
+    if m := RE_COURSE_OF_ALT.search(body.norm):
+        course = body.group(m, "course")
+    elif m := RE_COURSE_OF.search(body.norm):
+        course = body.group(m, "course")
 
     topic = None
-    if m := RE_TOPIC_OF.search(body):
-        topic = m["topic"].strip()
+    if m := RE_TOPIC_OF.search(body.norm):
+        topic = body.group(m, "topic")
 
     return Parsed(
         "exams",
@@ -456,25 +530,25 @@ def _parse_exam(body: str, now: datetime) -> Parsed | None:
             "due_date": due.isoformat(),
             "course": course,
             "topic": topic,
-            "norm": normalize(f"{course} {topic or ''} {body}"),
+            "norm": normalize(f"{course} {topic or ''} {body.norm}"),
         },
     )
 
 
-def _parse_course(body: str) -> Parsed | None:
+def _parse_course(body: Norm) -> Parsed | None:
     # Gated: without "μάθημα" or "εξάμηνο" this pattern would swallow
     # "κάνω γυμναστική" as a university course.
-    if not RE_COURSE_GATE.search(body):
+    if not RE_COURSE_GATE.search(body.norm):
         return None
-    m = RE_COURSE.search(body)
+    m = RE_COURSE.search(body.norm)
     if m is None:
         return None
 
-    name = m["course"].strip()
+    name = body.group(m, "course")
     if not name:
         return None
 
-    semester = m["sem"].strip() if m["sem"] else None
+    semester = body.group(m, "sem") or None
     return Parsed(
         "courses",
         {
@@ -487,10 +561,10 @@ def _parse_course(body: str) -> Parsed | None:
     )
 
 
-def _parse_profile(body: str) -> Parsed | None:
+def _parse_profile(body: Norm) -> Parsed | None:
     for pattern, key in PROFILE_PATTERNS:
-        if m := pattern.search(body):
-            value = m["value"].strip()
+        if m := pattern.search(body.norm):
+            value = body.group(m, "value")
             if value:
                 return Parsed(
                     "profile", {"key": key, "value": value, "norm": normalize(f"{key} {value}")}
@@ -498,19 +572,19 @@ def _parse_profile(body: str) -> Parsed | None:
     return None
 
 
-def _parse_business(body: str) -> Parsed | None:
-    m = RE_BIZ_NEED.search(body)
+def _parse_business(body: Norm) -> Parsed | None:
+    m = RE_BIZ_NEED.search(body.norm)
     if m is not None:
         # An empty capture means no business was named. Stored as None, never
         # "": NULL says "no name given" unambiguously.
-        name = (m["name"] or "").strip() or None
-        note = m["note"].strip()
+        name = body.group(m, "name") or None
+        note = body.group(m, "note")
     else:
-        m = RE_BIZ_PLAIN.search(body)
+        m = RE_BIZ_PLAIN.search(body.norm)
         if m is None:
             return None
         name = None
-        note = m["note"].strip()
+        note = body.group(m, "note")
 
     if not note:
         return None
@@ -673,21 +747,30 @@ def _profile_digest(conn: sqlite3.Connection) -> str:
     return f"Προφίλ: {pairs}"
 
 
-# Spoken labels for the keys PROFILE_PATTERNS writes. These name the *key*
-# and never the stored value: values come back normalized -- accent-stripped
-# and iotacism-folded, so "Γιάννη" reads back as "γιαννι" -- which is fine
-# inside a prompt but wrong out loud. See CLAUDE.md "Memory" > known gaps.
+# How each key PROFILE_PATTERNS writes is spoken, with its stored value.
+#
+# These used to name the key alone ("το όνομά σου") and deliberately withhold
+# the value, because values were captured out of the normalized string and
+# came back folded -- "Γιάννης" stored as "γιαννισ", which is wrong out loud.
+# Norm.group() fixed that at the source, so the value can be spoken now.
+#
+# Each phrase is built so the value needs no agreement with it: the pattern
+# consumes the preposition ("μένω *στην* Αθήνα" stores "Αθήνα"), so a
+# template like "μένεις {value}" would be ungrammatical and "μένεις στη
+# {value}" would guess the article's gender. "η πόλη σου είναι {value}"
+# needs neither.
+#
 # Listed most- to least-identifying; that is the order they are spoken in,
 # not the order the rows come out of the table.
 # test_memory_recall.py asserts every PROFILE_PATTERNS key appears here.
 _PROFILE_LABELS = (
-    ("ονομα", "το όνομά σου"),
-    ("σχολη", "τη σχολή σου"),
-    ("σπουδεσ", "τι σπουδάζεις"),
-    ("δουλεια", "τη δουλειά σου"),
-    ("πολη", "πού μένεις"),
-    ("ηλικια", "την ηλικία σου"),
-    ("προτιμησεισ", "τι σου αρέσει"),
+    ("ονομα", "το όνομά σου είναι {value}"),
+    ("σχολη", "η σχολή σου είναι {value}"),
+    ("σπουδεσ", "σπουδάζεις {value}"),
+    ("δουλεια", "η δουλειά σου είναι {value}"),
+    ("πολη", "η πόλη σου είναι {value}"),
+    ("ηλικια", "είσαι {value} χρονών"),
+    ("προτιμησεισ", "σου αρέσει {value}"),
 )
 
 
@@ -706,20 +789,32 @@ def spoken_profile(conn: sqlite3.Connection) -> str:
     keyword-match and "δεν θυμάμαι κάτι σχετικό" would be reporting a search
     that was never run.
 
-    Unlike _profile_digest(), which feeds a prompt, this feeds a speaker: it
-    names which facts are on file and asks for a narrower question instead of
-    reciting normalized values aloud.
-    """
-    held = {row["key"] for row in conn.execute("SELECT key FROM profile")}
-    labels = [label for key, label in _PROFILE_LABELS if key in held]
+    Speaks the stored values, not just the keys they are filed under. That
+    was not possible while values were captured out of the normalized string
+    -- saying a name back as "γιαννισ" is worse than not saying it -- so this
+    listed the keys and asked for a narrower question instead. Norm.group()
+    stores them verbatim now, so the answer can simply be the facts.
 
-    if not labels:
+    Still distinct from _profile_digest(), which feeds the same rows to a
+    prompt as key=value pairs: this one has to be a Greek sentence.
+    """
+    held = {
+        row["key"]: row["value"]
+        for row in conn.execute("SELECT key, value FROM profile")
+    }
+    facts = [
+        template.format(value=held[key])
+        for key, template in _PROFILE_LABELS
+        if key in held
+    ]
+
+    if not facts:
         return (
             "Δεν έχω κρατήσει ακόμα κάτι για σένα. "
             "Πες μου «θυμήσου ότι…» και θα το κρατήσω."
         )
 
-    return f"Θυμάμαι {_join_greek(labels)}. Ρώτησέ με για κάτι συγκεκριμένο."
+    return f"Θυμάμαι ότι {_join_greek(facts)}."
 
 
 def _due_today(conn: sqlite3.Connection, now: datetime) -> list[str]:
