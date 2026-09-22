@@ -1,0 +1,249 @@
+"""SQLite storage for Jarvis's persistent memory. See CLAUDE.md "Memory".
+
+One file, data/jarvis.db, opened in WAL mode so the running assistant and a
+second terminal's `python -m jarvis.mem` can use it at the same time -- that
+is what makes the CLI usable while wake-word mode is holding the microphone.
+
+Timestamps are local ISO-8601 to second precision throughout. This is a
+single-user, single-machine assistant that reasons about "today" and "στις 5
+το απόγευμα"; storing UTC would mean converting on every read for no benefit.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from datetime import datetime
+from pathlib import Path
+
+from jarvis.config import BACKUP_DIR, BACKUP_KEEP, DB_PATH
+from jarvis.text import fold_iotacism
+
+# 2: text.normalize() began folding the iotacism vowels, so every stored
+# `norm` written before that has to be refolded -- see _migrate().
+SCHEMA_VERSION = 2
+
+# Tables carrying free text also carry a `norm` column: text.normalize() of
+# whatever should be searchable in that row. Recall matches against it with
+# LIKE, so the stored text stays readable while the search stays
+# accent/case-insensitive. See memory.recall().
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS schema_version (
+    version INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS profile (
+    id         INTEGER PRIMARY KEY,
+    key        TEXT NOT NULL UNIQUE,
+    value      TEXT NOT NULL,
+    norm       TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS notes (
+    id         INTEGER PRIMARY KEY,
+    text       TEXT NOT NULL,
+    norm       TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS semesters (
+    id         INTEGER PRIMARY KEY,
+    name       TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS courses (
+    id          INTEGER PRIMARY KEY,
+    name        TEXT NOT NULL,
+    semester    TEXT,
+    norm        TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS exams (
+    id         INTEGER PRIMARY KEY,
+    due_date   TEXT NOT NULL,
+    course     TEXT NOT NULL,
+    topic      TEXT,
+    norm       TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+-- name is deliberately nullable: "η επιχείρησή μου χρειάζεται λογιστή" names
+-- no business, and NULL says "no name given" unambiguously where "" would be
+-- indistinguishable from a name that happens to be empty.
+CREATE TABLE IF NOT EXISTS businesses (
+    id         INTEGER PRIMARY KEY,
+    name       TEXT,
+    note       TEXT NOT NULL,
+    norm       TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS reminders (
+    id            INTEGER PRIMARY KEY,
+    text          TEXT NOT NULL,
+    norm          TEXT NOT NULL,
+    due_at        TEXT NOT NULL,
+    kind          TEXT NOT NULL,
+    referent_date TEXT,
+    status        TEXT NOT NULL,
+    fired_at      TEXT,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
+);
+
+-- Deliberately minimal: timestamp, what was attempted, what was decided, and
+-- a short fixed reason code. Never a transcript of what was said.
+CREATE TABLE IF NOT EXISTS audit (
+    id       INTEGER PRIMARY KEY,
+    ts       TEXT NOT NULL,
+    action   TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    reason   TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders (status, due_at);
+CREATE INDEX IF NOT EXISTS idx_exams_due ON exams (due_date);
+CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit (ts);
+"""
+
+# Tables the CLI and recall are allowed to touch, and the column holding each
+# one's human-readable text. Anything not listed here is not addressable by
+# name from the outside -- which is what keeps `:mem del <table> <id>` from
+# being pointed at schema_version.
+CONTENT_TABLES = {
+    "profile": "value",
+    "notes": "text",
+    "courses": "name",
+    "exams": "course",
+    "businesses": "note",
+    "reminders": "text",
+}
+
+
+def now_iso() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def connect(path: str | Path | None = None) -> sqlite3.Connection:
+    """Open (creating if needed) the memory database, schema applied.
+
+    WAL mode plus a busy timeout is what lets a second process run
+    `python -m jarvis.mem` against the same file while Jarvis is running.
+    """
+    db_path = Path(path) if path is not None else Path(DB_PATH)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    conn = sqlite3.connect(db_path, timeout=5)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    _init(conn)
+    return conn
+
+
+def _init(conn: sqlite3.Connection) -> None:
+    conn.executescript(_SCHEMA)
+    row = conn.execute("SELECT version FROM schema_version").fetchone()
+    if row is None:
+        # A database created right now is already at the current version:
+        # every table is empty, so there is nothing to migrate.
+        conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
+    elif row["version"] < SCHEMA_VERSION:
+        _migrate(conn, row["version"])
+    conn.commit()
+
+
+def _migrate(conn: sqlite3.Connection, version: int) -> None:
+    """Bring an existing database up to SCHEMA_VERSION, in place.
+
+    Runs inside connect(), so it happens on the next start after an upgrade
+    rather than needing a command of its own.
+    """
+    if version < 2:
+        # normalize() now folds the iotacism vowels (text.fold_iotacism), so
+        # a query stemmed from speech is folded while these stored search
+        # keys are not, and the LIKE match silently stops finding them.
+        #
+        # Refolding the stored `norm` is exact rather than approximate:
+        # folding is the only step added to normalize(), so
+        # fold(old_norm) == the new normalize() of the same source text.
+        # That matters because a row's `norm` is often built from more than
+        # the columns kept beside it (an exam's includes the whole
+        # utterance), and so cannot be rebuilt from the row itself.
+        for table in CONTENT_TABLES:
+            rows = conn.execute(f"SELECT id, norm FROM {table}").fetchall()
+            conn.executemany(
+                f"UPDATE {table} SET norm = ? WHERE id = ?",
+                [(fold_iotacism(row["norm"]), row["id"]) for row in rows],
+            )
+
+    conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
+
+
+def backup(
+    source: str | Path | None = None,
+    backup_dir: str | Path | None = None,
+    keep: int | None = None,
+) -> Path | None:
+    """Copy the database with SQLite's backup API, then prune to the newest
+    `keep` files. Returns the new backup's path, or None if there is no
+    database to copy yet.
+
+    The backup API is used rather than a file copy because it is safe against
+    a concurrent writer -- the whole point of running this at startup while
+    the previous session may not have shut down cleanly.
+    """
+    src = Path(source) if source is not None else Path(DB_PATH)
+    if not src.exists():
+        return None
+
+    dest_dir = Path(backup_dir) if backup_dir is not None else Path(BACKUP_DIR)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    dest = _unique_backup_path(dest_dir)
+
+    source_conn = sqlite3.connect(src, timeout=5)
+    try:
+        target_conn = sqlite3.connect(dest)
+        try:
+            source_conn.backup(target_conn)
+        finally:
+            target_conn.close()
+    finally:
+        source_conn.close()
+
+    _prune(dest_dir, keep if keep is not None else BACKUP_KEEP)
+    return dest
+
+
+def _unique_backup_path(dest_dir: Path) -> Path:
+    """Microsecond-stamped, so names are unique and sort chronologically.
+
+    Two coarser schemes were tried and are wrong. A second-precision stamp
+    collides outright (startup plus an immediate ":mem backup"). Adding a
+    "first free counter" fixes the collision but reintroduces the bug from
+    the other side: _prune deletes the oldest files, freeing low counters
+    that the next backup in the same second then reuses, overwriting a
+    backup and scrambling the ordering _prune depends on. A stamp that never
+    repeats avoids both.
+    """
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    return dest_dir / f"jarvis-{stamp}.db"
+
+
+def _prune(dest_dir: Path, keep: int) -> None:
+    # Names start with a zero-padded timestamp, so lexical order is
+    # chronological order.
+    backups = sorted(dest_dir.glob("jarvis-*.db"))
+    for stale in backups[: max(0, len(backups) - keep)]:
+        try:
+            stale.unlink()
+        except OSError:
+            pass  # a locked or already-removed backup must not break startup

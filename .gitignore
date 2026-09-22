@@ -4,3 +4,6 @@ __pycache__/
 .venv/
 models/
 clips/
+# Persistent memory: what you've told Jarvis about yourself, plus its
+# backups. Never belongs in the repo.
+data/

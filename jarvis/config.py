@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -61,6 +62,21 @@ WAKE_RETRIGGER_COOLDOWN = 1.0
 # CONVERSATION_TIMEOUT seconds with no speech, or on shutdown.
 CONVERSATION_MODE = os.environ.get("CONVERSATION_MODE", "true").lower() == "true"
 CONVERSATION_TIMEOUT = float(os.environ.get("CONVERSATION_TIMEOUT", "6"))
+
+# --- Persistent memory (jarvis/db.py, jarvis/memory.py). Everything lives
+# under data/, which is gitignored: it holds what you've told Jarvis about
+# yourself, so it never belongs in the repo.
+DATA_DIR = Path(os.environ.get("JARVIS_DATA_DIR", "data"))
+DB_PATH = Path(os.environ.get("JARVIS_DB_PATH", DATA_DIR / "jarvis.db"))
+
+# Startup and ":mem backup" copy the database here via SQLite's backup API,
+# keeping only the newest BACKUP_KEEP files.
+BACKUP_DIR = Path(os.environ.get("BACKUP_DIR", DATA_DIR / "backups"))
+BACKUP_KEEP = int(os.environ.get("BACKUP_KEEP", "5"))
+
+# Hard cap on how much remembered context is injected into a brain call.
+# Estimated at len(text)/3, which is conservative for Greek.
+MEMORY_TOKEN_BUDGET = int(os.environ.get("MEMORY_TOKEN_BUDGET", "300"))
 
 # Skill: websites openable via "άνοιξε το ..." (jarvis/skills.py). Keys are
 # matched as accent/case-insensitive substrings of the spoken text, so they

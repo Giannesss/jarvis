@@ -33,6 +33,13 @@ FEW_SHOT_EXAMPLES: list[dict] = [
     },
 ]
 
+# Prefixed to the recalled memory block so the model treats it as background
+# it already knows, rather than as something the user just said.
+MEMORY_PREAMBLE = (
+    "Τι θυμάσαι για αυτόν που σου μιλάει (χρησιμοποίησέ το μόνο αν βοηθάει, "
+    "μην το απαριθμείς):"
+)
+
 # Keep the model resident in Ollama between requests instead of unloading
 # after the default 5-minute idle timeout.
 KEEP_ALIVE = "30m"
@@ -74,6 +81,21 @@ def _trim_to_last_sentence(text: str) -> str:
     return trimmed.strip() + "."
 
 
+def _stage(response, count_key: str, duration_key: str) -> str:
+    """One Ollama stage as "<n> tok / <s>s", tolerant of missing fields.
+
+    Counters are reported per stage because a slow turn is either a large
+    prompt being re-prefilled or a long generation, and the two have
+    different fixes. Prefill is the one that grows silently: brain.ask()
+    splices a fresh memory block in after the frozen prefix every turn, so
+    everything after it misses Ollama's KV cache and is prefilled again.
+    """
+    count = response.get(count_key)
+    tokens = f"{count} tok" if count is not None else "? tok"
+    ns = response.get(duration_key)
+    return f"{tokens} / {ns / 1e9:.2f}s" if ns else tokens
+
+
 def _ask_ollama(messages: list[dict]) -> str:
     t0 = time.perf_counter()
     response = ollama.chat(
@@ -83,7 +105,11 @@ def _ask_ollama(messages: list[dict]) -> str:
         keep_alive=KEEP_ALIVE,
         options={"num_predict": MAX_REPLY_TOKENS, "temperature": TEMPERATURE},
     )
-    print(f"[timing] Ollama response: {time.perf_counter() - t0:.2f}s")
+    print(
+        f"[timing] Ollama response: {time.perf_counter() - t0:.2f}s "
+        f"(prompt {_stage(response, 'prompt_eval_count', 'prompt_eval_duration')}"
+        f", gen {_stage(response, 'eval_count', 'eval_duration')})"
+    )
     reply = response["message"]["content"]
     if response.get("done_reason") == "length":
         reply = _trim_to_last_sentence(reply)
@@ -102,10 +128,25 @@ if BRAIN_PROVIDER not in _PROVIDERS:
     )
 
 
-def ask(user_text: str) -> str:
+def ask(user_text: str, memory_block: str | None = None) -> str:
+    """memory_block is what jarvis/memory.py recalled for this turn.
+
+    It is injected as a transient system message just after the frozen
+    prefix, and deliberately never appended to _history: remembered context
+    is rebuilt fresh every turn, so stale recalls can't pile up and the
+    history trim can't silently drop half of one.
+    """
     _history.append({"role": "user", "content": user_text})
 
-    reply = _PROVIDERS[BRAIN_PROVIDER](_history)
+    messages = _history
+    if memory_block:
+        messages = (
+            _history[:_PREFIX_LEN]
+            + [{"role": "system", "content": f"{MEMORY_PREAMBLE}\n{memory_block}"}]
+            + _history[_PREFIX_LEN:]
+        )
+
+    reply = _PROVIDERS[BRAIN_PROVIDER](messages)
 
     _history.append({"role": "assistant", "content": reply})
     _history[:] = _history[:_PREFIX_LEN] + _history[_PREFIX_LEN:][-MAX_HISTORY_MESSAGES:]

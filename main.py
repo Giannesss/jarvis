@@ -1,4 +1,6 @@
-from jarvis import brain, listener, skills, speaker, wakeword
+import shlex
+
+from jarvis import brain, db, listener, mem, memory, skills, speaker, wakeword
 from jarvis.config import (
     CONVERSATION_MODE,
     CONVERSATION_TIMEOUT,
@@ -16,7 +18,9 @@ def _reply_to(text: str) -> str | None:
         return reply
 
     try:
-        return brain.ask(text)
+        # recall_safe never raises: a broken or locked database means no
+        # memory this turn, not a failed reply.
+        return brain.ask(text, memory.recall_safe(text))
     except Exception as e:
         print(f"Σφάλμα κατά την κλήση στο τοπικό μοντέλο: {e}")
         return None
@@ -76,7 +80,40 @@ def _converse(preroll: bytes) -> bool:
         listener.flush()
 
 
+def _startup_backup() -> None:
+    """Snapshot the memory database before this session can touch it.
+
+    Wrapped whole: a failed backup is worth reporting but must never stop
+    Jarvis from starting.
+    """
+    try:
+        path = db.backup()
+        if path is not None:
+            print(f"[memory] Αντίγραφο ασφαλείας: {path}")
+    except Exception as e:
+        print(f"Σφάλμα αντιγράφου μνήμης: {e}")
+
+
+def _run_mem_command(command: str) -> None:
+    """`:mem ...` at the Enter prompt, sharing jarvis/mem.py's dispatcher with
+    the standalone `python -m jarvis.mem`."""
+    try:
+        argv = shlex.split(command)[1:]
+    except ValueError as e:
+        print(f"Σφάλμα εντολής: {e}")
+        return
+
+    if not argv:
+        argv = ["--help"]
+
+    try:
+        mem.run(argv)
+    except Exception as e:
+        print(f"Σφάλμα μνήμης: {e}")
+
+
 def main() -> None:
+    _startup_backup()
     listener.preload()
 
     wake_word_active = WAKE_WORD_ENABLED
@@ -112,6 +149,12 @@ def main() -> None:
             command = input("> ")
             if command.strip().lower() in ("exit", "quit"):
                 break
+
+            # Typed memory admin, so the database is reachable without a
+            # second terminal. Never recorded, never sent to the brain.
+            if command.strip().startswith(":mem"):
+                _run_mem_command(command.strip())
+                continue
 
             text = listener.listen()
             if not text:
