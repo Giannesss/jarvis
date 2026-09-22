@@ -59,6 +59,11 @@ top of `jarvis/listener.py`.
   Only `"edge"` is implemented there; `"piper"` (or any unrecognized value)
   isn't in the dict and is used directly as the always-available fallback.
   `"elevenlabs"` is a placeholder for later, added the same way.
+  The Piper voice itself is a lazy singleton (`_get_voice()`), loaded on first
+  use rather than at import — with `TTS_ENGINE=edge` it is only ever needed if
+  Edge synthesis fails, and importing `speaker.py` (which `skills.py` does
+  transitively) must stay cheap. Same idiom as `listener._get_model()` and
+  `wakeword._get_model()`; the `piper` import is deferred alongside the load.
 - Wake word: `WAKE_WORD_ENGINE` selects from `_ENGINES` in
   `jarvis/wakeword.py`. Only `"openwakeword"` is implemented; an unknown
   value raises `ValueError` at import time, same as `BRAIN_PROVIDER`.

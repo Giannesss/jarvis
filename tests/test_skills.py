@@ -2,12 +2,12 @@
 conversation-end detection. See CLAUDE.md "Skills" for the matching rules
 these exercise (accent/case-insensitive substring matching).
 
-Importing jarvis.skills pulls in jarvis.speaker, which loads the local Piper
-voice model from disk at import time (see speaker.py) -- that's local file
-I/O, not a mic/ffmpeg/audio-playback/network call, so it's within the hard
-constraints for this suite. webbrowser.open, subprocess.Popen and
-threading.Timer are mocked in every test that could reach them so nothing
-ever opens on screen or schedules a real callback.
+Importing jarvis.skills pulls in jarvis.speaker, but that no longer touches
+the disk: the Piper voice is a lazy singleton (speaker._get_voice), loaded on
+first use rather than at import, so this suite costs nothing to start and
+needs no model file present. See tests/test_speaker_lazy.py. webbrowser.open,
+subprocess.Popen and threading.Timer are mocked in every test that could
+reach them so nothing ever opens on screen or schedules a real callback.
 """
 
 from __future__ import annotations

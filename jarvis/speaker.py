@@ -9,19 +9,40 @@ import winsound
 from pathlib import Path
 
 import edge_tts
-from piper import PiperVoice
 
 from jarvis.config import PIPER_MODEL_PATH, TTS_ENGINE, TTS_VOICE
 from jarvis.listener import FFMPEG_PATH
 
-_voice = PiperVoice.load(Path(PIPER_MODEL_PATH))
+# Loaded on first use, not at import: the model is ~63MB off disk, and with
+# TTS_ENGINE=edge it is only ever needed if Edge synthesis fails. Importing
+# this module (which jarvis/skills.py does, transitively) must stay cheap.
+# Same lazy-singleton idiom as listener._get_model and wakeword._get_model.
+_voice = None
+
+
+def _get_voice():
+    global _voice
+
+    if _voice is None:
+        # Deferred with the load for the same reason: importing this module
+        # shouldn't require the piper package when Piper is never used.
+        from piper import PiperVoice
+
+        print("Φόρτωση Piper...")
+        t0 = time.perf_counter()
+        _voice = PiperVoice.load(Path(PIPER_MODEL_PATH))
+        print(f"[timing] Piper load: {time.perf_counter() - t0:.2f}s")
+
+    return _voice
 
 
 def _speak_piper(text: str) -> None:
+    voice = _get_voice()
+
     t0 = time.perf_counter()
     buffer = io.BytesIO()
     with wave.open(buffer, "wb") as wav_file:
-        _voice.synthesize_wav(text, wav_file)
+        voice.synthesize_wav(text, wav_file)
     print(f"[timing] Piper synthesis: {time.perf_counter() - t0:.2f}s")
     winsound.PlaySound(buffer.getvalue(), winsound.SND_MEMORY)
 
