@@ -224,7 +224,8 @@ patterns, first match wins.
 4. course — gated on `μάθημα`/`εξάμηνο`, or `κάνω γυμναστική` becomes a course
 5. profile fact (name, studies, job, city, age, school, preferences)
 6. business (`η επιχείρησή μου…`)
-7. **fallback to a plain note — always taken**
+7. **fallback to a plain note — always taken, unless the trigger itself was
+   fuzzy** (see "Endings are tolerated, stems are not")
 
 Nothing is ever discarded or guessed into the wrong table. Profile rows are
 keyed, so saying your name twice updates it; every other table appends.
@@ -459,6 +460,68 @@ matched against speech should be `_GAP`, not `\s+`.
 `IotacismTests` pins the fold. Its strings are written as transcriptions,
 not as sentences anyone would type — testing this with clean text is how the
 bug survived in the first place.
+
+### Endings are tolerated, stems are not
+
+The same spoken "Θυμήσου ότι με λένε Γιάννη" has now failed three times in
+three different ways: `Θυμίσου` (another spelling of the same sound),
+`Θυμί σου` (a word break nobody spoke), and `Θυμήσω` — a different ending
+outright, which neither earlier fix caught.
+
+The pattern underneath all three: **Whisper reproduces the stressed stem and
+improvises the unstressed ending.** `θυμ` survived every one. A fourth
+spelling of the ending was always going to come, so the ending is matched by
+edit distance now instead of by enumeration, while the stem stays exact.
+
+`text.edit_distance()` is a plain two-row Levenshtein — stdlib only, no new
+dependency. `difflib` was measured and rejected: `SequenceMatcher.ratio()`
+is length-normalized and rewards a long clean prefix, so it scores every
+false trigger *above* the true one (`κρατάω`/`κράτα` 0.909, `θυμάσαι`/`να
+θυμάσαι` 0.875, `σημειώσεις`/`σημείωσε` 0.800, against `θυμήσω`/`θυμήσου`
+0.769). No cutoff separates those. An edit count does, and reads as "one
+character" rather than as a tuned constant.
+
+`memory._FUZZY_TRIGGERS` holds each trigger as an **exact core plus an
+ending budget**. Three separate guards keep the looseness honest, and only
+one of them is a number:
+
+1. **The core is mandatory and exact.** `"να θυμ"` keeps its `να`, so a
+   recall question (`"Θυμάσαι τι σου είπα;"`) can never reach the save path
+   however wide the budget gets. This matters because the live miss needs a
+   budget of 2, and `θυμάσαι` is *also* exactly 2 from `να θυμάσαι` — no
+   threshold could separate them, so what protects recall is the shape of
+   the match, not its size. That removes the load-bearing weight the
+   save-before-recall ordering in `handle()` was carrying alone.
+2. **It only runs when `RE_TRIGGER` misses.** Every utterance that matches
+   today keeps its exact path, so no pinned behaviour can regress.
+3. **A fuzzy trigger may not reach the note fallback.** `parse()` threads
+   `notes_ok`; a guessed trigger earns only the *structured* rungs, and must
+   be confirmed by a second, independent pattern (profile/exam/course/
+   business) before anything is written. Reaching step 7 on a guessed verb
+   would be guessing twice, so it falls through to the brain — which is what
+   that utterance did before the fuzzy layer existed. The worst case is
+   therefore unchanged behaviour, never a wrong row, and a wrong row is the
+   expensive one: nobody sees it until a recall reads it back.
+
+Budgets are per phrase, because how much room a verb has depends on what
+lives next to it: `θυμήσου`, `να θυμάσαι` and `μην ξεχάσεις` get 2;
+`σημείωσε` gets 1, because `σημειώσεις` is an ordinary noun sitting 2 away;
+`κράτα` gets none and stays exact-only in `RE_TRIGGER`, since at five
+characters `κρατάω` is a single edit from it.
+
+Two consequences to carry forward:
+
+- **A fuzzy-triggered plain note is not saved.** `"Θυμήσω να πάρω ψωμί"` —
+  mangled verb *and* unstructured body — still goes to the brain. That is
+  guard 3 working, not a gap to close.
+- **The reminder rung running first is now load-bearing.** `"Θύμισέ μου"` is
+  2 edits from `θυμήσου`, so the fuzzy trigger would claim it; step 0 of the
+  ladder gets there first.
+
+`MangledTriggerEndingTests` and `FuzzyTriggerNegativeTests` pin this. The
+negatives are the ones that matter — eight sentences that must keep reaching
+the brain — because loosening a trigger trades a missed save for the risk of
+a silent wrong one.
 
 ## Language
 

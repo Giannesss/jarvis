@@ -19,6 +19,7 @@ from jarvis import db
 from jarvis.config import MEMORY_TOKEN_BUDGET
 from jarvis.text import (
     NUMBER_WORDS,
+    edit_distance,
     fold_iotacism,
     normalize,
     normalize_spans,
@@ -331,6 +332,113 @@ RE_TRIGGER = _re(
 # a stored note as a stray "ο,τι".
 RE_STRANDED_PARTICLE = _re(rf"^(?:{_OTI}|πωσ)\b[\s,.·]*")
 
+
+# --- The fuzzy trigger, for an ending the recognizer invented --------------
+#
+# Whisper reproduces the stressed *stem* of the trigger verb and improvises
+# the unstressed ending. Three separate hand tests of one spoken "Θυμήσου"
+# produced "Θυμίσου" (another spelling of the same sound), "Θυμί σου" (a word
+# break that was never spoken) and "Θυμήσω" (a different ending outright).
+# The fold and _JOIN handle the first two; enumerating the third would only
+# lose to a fourth, so the ending is matched by edit distance instead of by
+# spelling -- while the stem stays exact.
+#
+# Three things keep that from becoming a licence to save anything vaguely
+# trigger-shaped, and none of them is a tuned threshold:
+#
+#   1. **The stem is mandatory and matched exactly.** "να θυμ" keeps its
+#      "να", so "Θυμάσαι τι σου είπα;" -- a recall question, and only 2 edits
+#      from "να θυμάσαι" -- can never reach the save path however loose the
+#      ending budget gets. A single global distance of 2 (which the live miss
+#      needs) would turn every such question into a save, so what protects
+#      recall here is the shape of the match, not its budget.
+#   2. **This runs only when RE_TRIGGER misses**, so nothing that matches
+#      today changes path.
+#   3. **A fuzzy match may not reach the plain-note rung** -- see `notes_ok`
+#      in parse(). A guessed trigger has to be confirmed by a second,
+#      independent pattern before anything is written.
+#
+# The budget is per phrase rather than global, because how much room a verb
+# has depends entirely on what lives next to it in the language.
+_SEPARATORS = " ,.·"
+
+_JARVIS = normalize("Τζάρβις")
+
+_FUZZY_TRIGGERS = tuple(
+    (normalize(core), tuple(normalize(end) for end in endings), budget)
+    for core, endings, budget in (
+        # The failure site itself. Nearest negative is "θύμωσα", 3 away.
+        ("θυμ", ("ήσου",), 2),
+        # The "να" is the guard described above, not decoration.
+        ("να θυμ", ("άσαι",), 2),
+        # 1, not 2: "σημειώσεις" (an ordinary noun that opens a sentence) is
+        # exactly 2 from "σημείωσε".
+        ("σημείωσ", ("ε",), 1),
+        ("μην ξεχ", ("άσεις",), 2),
+    )
+)
+# "κράτα" is deliberately absent: at 5 characters it has no room at all --
+# "κρατάω" is a single edit away, so even a budget of 1 would claim
+# "Κρατάω σημειώσεις στο μάθημα". It stays exact-only, in RE_TRIGGER.
+
+
+def _core_end(norm: str, core: str, start: int) -> int | None:
+    """Index just past an exact match of `core` at `start`, or None.
+
+    Separators are free on both sides -- skipped in the input, ignored in the
+    core -- so a verb the recognizer split ("θυμ ήσου") still matches, and a
+    two-word core ("να θυμ") needs no separator pattern of its own.
+    """
+    i = start
+    for char in core:
+        if char in _SEPARATORS:
+            continue
+        while i < len(norm) and norm[i] in _SEPARATORS:
+            i += 1
+        if i >= len(norm) or norm[i] != char:
+            return None
+        i += 1
+    return i
+
+
+def fuzzy_trigger(norm: str) -> int | None:
+    """Where the body starts when the trigger's ending was mangled, or None.
+
+    Matched against normalize()d text like RE_TRIGGER, and returning an index
+    into it, so the caller keeps slicing a Norm and reading captures back out
+    of the raw utterance exactly as it does on the exact path.
+    """
+    start = 0
+    if norm.startswith(_JARVIS):
+        rest = norm[len(_JARVIS):]
+        start = len(norm) - len(rest.lstrip(_SEPARATORS))
+
+    for core, endings, budget in _FUZZY_TRIGGERS:
+        after_core = _core_end(norm, core, start)
+        if after_core is None:
+            continue
+
+        # The rest of that word is the ending. Taken whole rather than capped
+        # at some length, so the body can only ever start at a word boundary
+        # -- a truncated tail would slice a word in half. A long word simply
+        # scores a distance far past its budget.
+        end = after_core
+        while end < len(norm) and norm[end] not in _SEPARATORS:
+            end += 1
+
+        tail = norm[after_core:end]
+        if min(edit_distance(tail, ending) for ending in endings) > budget:
+            continue
+
+        # Consume the gap after the verb, as RE_TRIGGER's trailing _GAP does,
+        # so the body starts where RE_STRANDED_PARTICLE expects it to.
+        while end < len(norm) and norm[end] in _SEPARATORS:
+            end += 1
+        return end
+
+    return None
+
+
 _REMIND_VERB = rf"(?:υπενθυμισε|θυμισε){_GAP}μου"
 
 RE_REMIND_REL = _re(
@@ -423,8 +531,16 @@ def parse(text: str, now: datetime | None = None) -> Parsed | None:
         return reminder
 
     # Step 1: without a trigger this is not a save request.
+    #
+    # `notes_ok` records how certain that trigger was. An exact match earns
+    # the whole ladder, unconditional fallback included. A fuzzy one -- the
+    # recognizer having invented an ending -- earns only the structured
+    # rungs: see the note above step 7.
     trigger = RE_TRIGGER.match(view.norm)
-    if trigger is None:
+    notes_ok = trigger is not None
+    if trigger is not None:
+        start = trigger.end()
+    elif (start := fuzzy_trigger(view.norm)) is None:
         return None
     # "Θυμήσου ότι" with nothing after it backtracks: the optional "ότι" in
     # RE_TRIGGER gives way so the mandatory \s+ can match, leaving "οτι" as
@@ -435,7 +551,7 @@ def parse(text: str, now: datetime | None = None) -> Parsed | None:
     # sub-parsers below capture out of it and need the map back into `text`.
     # RE_STRANDED_PARTICLE is ^-anchored, so matching it and slicing past it
     # is the same edit.
-    body = view.slice(trigger.end()).strip()
+    body = view.slice(start).strip()
     if particle := RE_STRANDED_PARTICLE.match(body.norm):
         body = body.slice(particle.end()).strip()
     if not body.norm:
@@ -451,8 +567,20 @@ def parse(text: str, now: datetime | None = None) -> Parsed | None:
     if business := _parse_business(body):
         return business
 
-    # Step 7: always taken. Stored verbatim, not normalized, so it reads back
-    # the way it was said.
+    # Step 7: always taken -- when the trigger was certain.
+    #
+    # A fuzzy trigger that reaches here was confirmed by nothing: no pattern
+    # above recognized the body either, so the only evidence that this was a
+    # save request at all is a verb ending the recognizer may simply have
+    # invented. Writing a note on that would be guessing twice. Falling
+    # through to the brain is what this utterance did before the fuzzy layer
+    # existed, so the worst case is unchanged behaviour rather than a wrong
+    # row -- and a wrong row is the expensive one, since nobody sees it until
+    # a recall reads it back.
+    if not notes_ok:
+        return None
+
+    # Stored verbatim, not normalized, so it reads back the way it was said.
     return Parsed("notes", {"text": text.strip(), "norm": view.norm})
 
 

@@ -19,7 +19,7 @@ import unittest
 from datetime import date, datetime
 
 from jarvis import memory
-from jarvis.text import normalize
+from jarvis.text import edit_distance, normalize
 
 NOW = datetime(2026, 9, 22, 14, 30, 0)  # Tuesday 22 September 2026
 
@@ -210,6 +210,158 @@ class WhisperPunctuationTests(unittest.TestCase):
         )
         self.assertEqual(parsed.table, "exams")
         self.assertEqual(parsed.fields["course"], "Μαθηματικά")
+
+
+class MangledTriggerEndingTests(unittest.TestCase):
+    """The third way Whisper broke one spoken "Θυμήσου", and the last one.
+
+    Companion to IotacismTests (wrong spelling of a sound) and
+    WhisperPunctuationTests (commas and word breaks): this one covers the
+    recognizer inventing a different *ending* altogether. A spoken "Θυμήσου
+    ότι με λένε Γιάννη" came back as "Θυμήσω τι με λένε Γιάννη" -- "ω" for
+    "ου", which is neither a respelling nor a split, so neither earlier fix
+    caught it and the save fell through to the brain again.
+
+    The ending is matched by edit distance now (see _FUZZY_TRIGGERS), so the
+    interesting tests are the negatives below, not these.
+    """
+
+    def test_the_transcription_that_failed_by_hand(self) -> None:
+        parsed = memory.parse("Θυμήσω τι με λένε Γιάννη", NOW)
+        self.assertIsNotNone(parsed, "fell through to the brain")
+        self.assertEqual(parsed.table, "profile")
+        self.assertEqual(parsed.fields["key"], "ονομα")
+        # Verbatim as ever: the fuzzy path slices the same Norm as the exact
+        # one, so a capture taken after it still points into the original.
+        self.assertEqual(parsed.fields["value"], "Γιάννη")
+
+    def test_other_invented_endings_of_the_same_verb(self) -> None:
+        for spelling in ("Θυμήσω", "Θυμίσω", "Θυμήσε", "Θυμίσε", "Θυμήσο"):
+            with self.subTest(spelling=spelling):
+                parsed = memory.parse(f"{spelling} ότι με λένε Γιάννης", NOW)
+                self.assertIsNotNone(parsed, "fell through to the brain")
+                self.assertEqual(parsed.fields["value"], "Γιάννης")
+
+    def test_the_wake_name_may_still_come_first(self) -> None:
+        parsed = memory.parse("Τζάρβις, θυμήσω ότι με λένε Γιάννης", NOW)
+        self.assertIsNotNone(parsed, "fell through to the brain")
+        self.assertEqual(parsed.fields["value"], "Γιάννης")
+
+    def test_the_other_triggers_tolerate_an_ending_too(self) -> None:
+        # "Σημείωσα" is one edit, not two, on purpose: that trigger's budget
+        # is 1, because "Σημειώσεις" -- an ordinary noun that can open a
+        # sentence -- sits exactly 2 away. Each budget is only as wide as its
+        # verb's neighbourhood allows.
+        for phrase, key in (
+            ("Να θυμάσε ότι με λένε Γιάννης", "ονομα"),
+            ("Σημείωσα ότι με λένε Γιάννης", "ονομα"),
+            ("Μην ξεχάσης ότι με λένε Γιάννης", "ονομα"),
+        ):
+            with self.subTest(phrase=phrase):
+                parsed = memory.parse(phrase, NOW)
+                self.assertIsNotNone(parsed, "fell through to the brain")
+                self.assertEqual(parsed.fields["key"], key)
+
+    def test_a_tighter_budget_really_is_tighter(self) -> None:
+        # The flip side of the case above, pinned so the budget cannot be
+        # widened to 2 without a test noticing: at 2, "Σημειώσεις για το
+        # μάθημα" becomes a save.
+        self.assertIsNone(memory.parse("Σημείωσαι ότι με λένε Γιάννης", NOW))
+
+    def test_a_fuzzy_trigger_needs_a_confirmed_body(self) -> None:
+        # The confirmation rule, stated directly. The same body saves fine
+        # behind an exact trigger and is refused behind a guessed one,
+        # because nothing except the mangled verb suggests it was a save.
+        self.assertEqual(
+            memory.parse("Θυμήσου ότι το συνέδριο ήταν βαρετό", NOW).table, "notes"
+        )
+        self.assertIsNone(memory.parse("Θυμήσω ότι το συνέδριο ήταν βαρετό", NOW))
+
+    def test_a_confirmed_body_reaches_every_structured_table(self) -> None:
+        for phrase, table in (
+            ("Θυμήσω ότι με λένε Γιάννης", "profile"),
+            ("Θυμήσω ότι έχω εξετάσεις στις 12 Ιουνίου στα Μαθηματικά", "exams"),
+            ("Θυμήσω ότι κάνω το μάθημα Βάσεις Δεδομένων", "courses"),
+            ("Θυμήσω ότι η επιχείρησή μου χρειάζεται λογιστή", "businesses"),
+        ):
+            with self.subTest(phrase=phrase):
+                parsed = memory.parse(phrase, NOW)
+                self.assertIsNotNone(parsed, "fell through to the brain")
+                self.assertEqual(parsed.table, table)
+
+    def test_sensitive_content_is_still_refused_on_the_fuzzy_path(self) -> None:
+        # is_sensitive() runs before the trigger is even looked at, so a
+        # mangled verb must not become a way around it.
+        parsed = memory.parse("Θυμήσω ότι ο κωδικός μου είναι abc12345", NOW)
+        self.assertEqual(parsed.table, memory.REJECTED)
+
+
+class FuzzyTriggerNegativeTests(unittest.TestCase):
+    """The eight sentences that must keep reaching the brain.
+
+    Loosening the trigger buys a miss back and risks false saves, so these
+    are the tests that matter: each is within edit distance 2 of some trigger
+    under some measure, and each must still be refused. A wrong save is worse
+    than a missed one -- nobody notices it until a recall reads it back, and
+    "Θυμάσαι τι σου είπα;" answering "Το θυμάμαι." would break recall
+    outright, since handle() tries the save before the recall.
+    """
+
+    def test_none_of_these_is_a_save(self) -> None:
+        for phrase, why in (
+            ("Θυμάσαι τι σου είπα;", "recall question, 2 edits from 'να θυμάσαι'"),
+            ("Τι θυμάσαι;", "recall question with no topic"),
+            ("Θυμάσαι πού μένω στην Αθήνα;", "recall question with a parseable body"),
+            ("Θυμάμαι το καλοκαίρι", "a statement, not an instruction"),
+            ("Θύμωσα με τον αδερφό μου", "different verb, same stem"),
+            ("Θυμήθηκα ότι έχω εξετάσεις", "different verb, and an exam body"),
+            ("Κρατάω σημειώσεις στο μάθημα", "1 edit from 'κράτα', hence exact-only"),
+            ("Σημειώσεις για το μάθημα", "2 edits from 'σημείωσε', hence a budget of 1"),
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIsNone(memory.parse(phrase, NOW), why)
+
+    def test_the_na_guard_is_what_protects_the_recall_question(self) -> None:
+        # Pinned explicitly because it is a property of the match's *shape*,
+        # not of its budget: "θυμάσαι" is 2 edits from "να θυμάσαι", which is
+        # exactly the budget "θυμήσου" needs, so no threshold could separate
+        # them. Requiring the "να" exactly is what does.
+        self.assertIsNone(memory.parse("Θυμάσαι ότι με λένε Γιάννης", NOW))
+        self.assertIsNotNone(memory.parse("Να θυμάσαι ότι με λένε Γιάννης", NOW))
+
+    def test_a_bare_reminder_verb_is_still_a_reminder(self) -> None:
+        # "Θύμισέ μου" is 2 edits from "θυμήσου", so the fuzzy trigger would
+        # claim it -- but the reminder rung runs first, at step 0, and still
+        # does. That ordering is load-bearing now.
+        parsed = memory.parse("Θύμισέ μου σε 2 ώρες ότι έχω ραντεβού", NOW)
+        self.assertEqual(parsed.table, "reminders")
+        self.assertEqual(parsed.fields["due_at"], "2026-09-22T16:30:00")
+
+
+class EditDistanceTests(unittest.TestCase):
+    """text.edit_distance(), at the cases the trigger budgets rest on."""
+
+    def test_the_real_transcriptions(self) -> None:
+        for spoken, canonical, expected in (
+            ("θυμήσου", "θυμήσου", 0),
+            ("θυμίσου", "θυμήσου", 0),   # the fold already collapses this one
+            ("θυμήσω", "θυμήσου", 2),    # ω is a third letter: substitute + delete
+            ("θύμωσα", "θυμήσου", 3),
+            ("θυμήθηκα", "θυμήσου", 4),
+        ):
+            with self.subTest(spoken=spoken):
+                self.assertEqual(
+                    edit_distance(normalize(spoken), normalize(canonical)), expected
+                )
+
+    def test_empty_and_identical(self) -> None:
+        self.assertEqual(edit_distance("", ""), 0)
+        self.assertEqual(edit_distance("", "ισου"), 4)
+        self.assertEqual(edit_distance("ισου", ""), 4)
+        self.assertEqual(edit_distance("ισου", "ισου"), 0)
+
+    def test_it_is_symmetric(self) -> None:
+        self.assertEqual(edit_distance("κρατα", "κραταω"), edit_distance("κραταω", "κρατα"))
 
 
 class ReminderTests(unittest.TestCase):

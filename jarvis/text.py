@@ -149,6 +149,43 @@ def normalize_spans(text: str) -> tuple[str, list[tuple[int, int]]]:
     return "".join(out), spans
 
 
+def edit_distance(a: str, b: str) -> int:
+    """Levenshtein distance: how many single-character insertions, deletions
+    or substitutions separate two strings.
+
+    Here for memory's fuzzy trigger matching, which has to decide whether a
+    spoken verb ending is a mangling of one it knows. An edit *count* rather
+    than difflib's similarity ratio, because the ratio is length-normalized
+    and rewards a long clean prefix -- on the real cases it scores every false
+    trigger above the true one:
+
+        κρατάω  vs κράτα     ratio 0.909, distance 1   (false)
+        θυμάσαι vs ναθυμάσαι ratio 0.875, distance 2   (false)
+        σημειώσεις vs σημείωσε ratio 0.800, distance 2 (false)
+        θυμήσω  vs θυμήσου   ratio 0.769, distance 2   (true)
+
+    No ratio cutoff separates those; a per-phrase edit budget does, and reads
+    as "one character" rather than as a tuned constant.
+
+    Two rows rather than a full matrix -- these are single Greek words.
+    """
+    if a == b:
+        return 0
+    previous = list(range(len(b) + 1))
+    for i, char_a in enumerate(a, 1):
+        current = [i]
+        for j, char_b in enumerate(b, 1):
+            current.append(
+                min(
+                    previous[j] + 1,                     # drop char_a
+                    current[j - 1] + 1,                  # add char_b
+                    previous[j - 1] + (char_a != char_b),  # substitute
+                )
+            )
+        previous = current
+    return previous[-1]
+
+
 def phrases(*items: str) -> list[str]:
     """Normalize a literal phrase list at import time.
 
