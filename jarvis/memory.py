@@ -242,16 +242,38 @@ def _unit_seconds(token: str) -> int | None:
 
 # --- The trigger, and the pattern families ---------------------------------
 
+# Whisper punctuates what it transcribes, and sometimes splits a word in two.
+# A real hand test of "Θυμήσου ότι με λένε Γιάννη" came back as "Θυμί σου,
+# ό,τι με λένε Γιάννη": a space dropped into the verb, a comma after it, and
+# "ό,τι" for "ότι". Each of those defeated a separator written as a plain
+# \s+, so the save fell through to the brain -- which role-played having
+# saved it, and only the next recall showed that nothing had been. The
+# separators below tolerate what the recognizer actually emits.
+#
+# Stripping punctuation in normalize() instead would be the wrong fix twice
+# over: commas and periods are load-bearing further down this ladder (see
+# RE_COURSE_OF, which uses them to find where a course name ends), and every
+# stored `norm` would change, needing another migration.
+_GAP = r"[\s,.·]+"     # between two words of the trigger phrase
+_JOIN = r"[\s,]*"      # inside one word the recognizer may have split
+_OTI = rf"ο{_JOIN}τι"  # "ότι" and "ό,τι" both normalize into this
+
 RE_TRIGGER = _re(
-    r"^(?:τζαρβισ[,\s]+)?"
-    r"(?:θυμησου(?:\s+οτι|\s+πωσ)?"
-    r"|να\s+θυμασαι(?:\s+οτι)?"
-    r"|κρατα(?:\s+οτι)?"
-    r"|σημειωσε(?:\s+οτι)?"
-    r"|μην\s+ξεχασεισ(?:\s+οτι)?)\s+"
+    rf"^(?:τζαρβισ{_GAP})?"
+    rf"(?:θυμη{_JOIN}σου(?:{_GAP}{_OTI}|{_GAP}πωσ)?"
+    rf"|να{_GAP}θυμασαι(?:{_GAP}{_OTI})?"
+    rf"|κρατα(?:{_GAP}{_OTI})?"
+    rf"|σημειωσε(?:{_GAP}{_OTI})?"
+    rf"|μην{_GAP}ξεχασεισ(?:{_GAP}{_OTI})?)"
+    rf"{_GAP}"
 )
 
-_REMIND_VERB = r"(?:υπενθυμισε|θυμισε)\s+μου"
+# The particle the trigger may have left behind, stripped from the body in
+# parse(). Punctuation-tolerant for the same reason, or "ό,τι" survives into
+# a stored note as a stray "ο,τι".
+RE_STRANDED_PARTICLE = _re(rf"^(?:{_OTI}|πωσ)\b[\s,.·]*")
+
+_REMIND_VERB = rf"(?:υπενθυμισε|θυμισε){_GAP}μου"
 
 RE_REMIND_REL = _re(
     rf"{_REMIND_VERB}\s+σε\s+(?P<num>{_NUM_RE})\s+(?P<unit>{_UNIT_RE})"
@@ -350,7 +372,7 @@ def parse(text: str, now: datetime | None = None) -> Parsed | None:
     # RE_TRIGGER gives way so the mandatory \s+ can match, leaving "οτι" as
     # the body. Strip a stranded particle so that reads as "no body" rather
     # than being stored as a note saying "οτι".
-    body = re.sub(r"^(?:οτι|πωσ)\b\s*", "", norm[trigger.end():].strip()).strip()
+    body = RE_STRANDED_PARTICLE.sub("", norm[trigger.end():].strip()).strip()
     if not body:
         return None
 

@@ -131,6 +131,83 @@ class IotacismTests(unittest.TestCase):
         self.assertEqual(normalize("ευχαριστώ"), "ευχαριστω")
 
 
+class WhisperPunctuationTests(unittest.TestCase):
+    """The recognizer punctuates and splits; the trigger has to survive it.
+
+    Companion to IotacismTests: that one covers Whisper picking the wrong
+    *spelling* of a sound, this one covers Whisper inserting commas and word
+    breaks that were never spoken. The strings below are transcriptions, not
+    sentences anyone would type -- a spoken "Θυμήσου ότι με λένε Γιάννη" came
+    back as "Θυμί σου, ό,τι με λένε Γιάννη" and missed RE_TRIGGER entirely,
+    so the save fell through to the brain, which answered as though it had
+    stored the name while the database stayed empty.
+    """
+
+    def test_the_transcription_that_failed_by_hand(self) -> None:
+        parsed = memory.parse("Θυμί σου, ό,τι με λένε Γιάννη", NOW)
+        self.assertIsNotNone(parsed, "fell through to the brain")
+        self.assertEqual(parsed.table, "profile")
+        self.assertEqual(parsed.fields["key"], "ονομα")
+        self.assertEqual(parsed.fields["value"], "γιαννι")
+
+    def test_a_comma_after_the_trigger_verb(self) -> None:
+        for phrase in (
+            "Θυμίσου, ότι με λένε Γιάννη",
+            "Θυμήσου, ό,τι με λένε Γιάννη",
+            "Τζάρβις, θυμί σου, ό,τι με λένε Γιάννη.",
+        ):
+            with self.subTest(phrase=phrase):
+                parsed = memory.parse(phrase, NOW)
+                self.assertIsNotNone(parsed, "fell through to the brain")
+                self.assertEqual(parsed.fields["value"], "γιαννι")
+
+    def test_a_comma_inside_the_other_triggers(self) -> None:
+        for phrase in (
+            "Να θυμάσαι, ότι ο Κώστας μετακόμισε",
+            "Να, θυμάσαι ό,τι ο Κώστας μετακόμισε",
+            "Σημείωσε, ό,τι ο Κώστας μετακόμισε",
+            "Κράτα, ότι ο Κώστας μετακόμισε",
+            "Μην, ξεχάσεις ό,τι ο Κώστας μετακόμισε",
+        ):
+            with self.subTest(phrase=phrase):
+                parsed = memory.parse(phrase, NOW)
+                self.assertIsNotNone(parsed, "fell through to the brain")
+                self.assertEqual(parsed.table, "notes")
+
+    def test_a_comma_in_the_reminder_verb(self) -> None:
+        parsed = memory.parse("Υπενθύμισέ, μου σε 2 ώρες ότι έχω ραντεβού", NOW)
+        self.assertIsNotNone(parsed, "fell through to the brain")
+        self.assertEqual(parsed.table, "reminders")
+        self.assertEqual(parsed.fields["due_at"], "2026-09-22T16:30:00")
+
+    def test_a_punctuated_particle_is_still_not_a_body(self) -> None:
+        # "ό,τι" normalizes to "ο,τι". A trigger with nothing after it
+        # backtracks -- the optional particle gives way so the mandatory gap
+        # can match -- leaving the particle as the body. It has to be
+        # stripped with its comma, or "Θυμήσου ό,τι" is stored as a note
+        # whose entire content is "ο,τι".
+        for phrase in ("Θυμήσου ό,τι", "Θυμίσου, ό,τι", "Να θυμάσαι, ό,τι"):
+            with self.subTest(phrase=phrase):
+                self.assertIsNone(memory.parse(phrase, NOW))
+
+    def test_punctuation_tolerance_does_not_invent_a_trigger(self) -> None:
+        # The gap is permissive about separators, not about the words
+        # themselves: a sentence that merely contains them is still a
+        # question for the brain.
+        for phrase in ("Τι θυμάσαι;", "Θυμάσαι, τι ώρα είναι;", "Θυμήσου,"):
+            with self.subTest(phrase=phrase):
+                self.assertIsNone(memory.parse(phrase, NOW))
+
+    def test_a_comma_still_ends_a_course_name(self) -> None:
+        # The fix stayed out of normalize() precisely so this keeps working:
+        # the comma is what tells RE_COURSE_OF where the course stops.
+        parsed = memory.parse(
+            "Θυμήσου ότι έχω εξετάσεις στα Μαθηματικά, στις 12 Ιουνίου", NOW
+        )
+        self.assertEqual(parsed.table, "exams")
+        self.assertEqual(parsed.fields["course"], "μαθιματικα")
+
+
 class ReminderTests(unittest.TestCase):
     def test_relative_hours(self) -> None:
         parsed = memory.parse("Υπενθύμισέ μου σε 2 ώρες ότι έχω ραντεβού", NOW)

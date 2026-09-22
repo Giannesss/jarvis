@@ -383,6 +383,45 @@ Two consequences worth knowing:
   produce, since folding is the only step added, which matters because a
   row's `norm` often can't be rebuilt from the row's own columns.
 
+### Punctuation is *not* normalized away
+
+Whisper also punctuates what it hears, and sometimes splits one word into
+two. The same hand test that produced "Θυμίσου" later produced "Θυμί σου,
+ό,τι με λένε Γιάννη" — a space inside the verb, a comma after it, and "ό,τι"
+for "ότι". `RE_TRIGGER` missed all three, the utterance fell through to the
+brain, and Ollama role-played having saved the name; only the next recall
+showed the database was empty.
+
+`normalize()` does **not** strip punctuation, and the fix for that did not
+change it. The asymmetry with the iotacism fold is deliberate:
+
+- **Iotacism is folded globally**, in `normalize()`, because the spelling it
+  destroys carries no information anyone downstream uses. η and ι are the
+  same sound; nothing in the ladder needs to tell them apart, so folding
+  once at the entry point is strictly simpler than teaching every pattern
+  about it.
+- **Punctuation is tolerated locally**, in the trigger patterns only,
+  because commas and periods *are* load-bearing further down the same
+  ladder. `RE_COURSE_OF` uses them as the boundary marking where a course
+  name ends (`[^,.]+?`, plus `,` and `.` in its lookahead); stripping them
+  in `normalize()` would run "στα Μαθηματικά, στις 12 Ιουνίου" together into
+  one course name. Stripping them would also rewrite every stored `norm`
+  column, needing a schema version 3 migration for no gain.
+
+So the tolerance lives where the recognizer's noise actually lands: three
+named separators in `memory.py` — `_GAP` (`[\s,.·]+`, between two words of a
+trigger phrase), `_JOIN` (`[\s,]*`, inside one word that may have been
+split) and `_OTI` (`ο[\s,]*τι`, matching "ότι" and "ό,τι" alike) — replace
+every hand-written `\s+` in `RE_TRIGGER`, in `RE_STRANDED_PARTICLE` (the
+particle strip in `parse()`, which missed `ο,τι` for the same reason), and
+in `_REMIND_VERB`. The rule to carry forward: a separator inside a phrase
+matched against speech should be `_GAP`, not `\s+`.
+
+`WhisperPunctuationTests` in `tests/test_memory_parse.py` pins this, as
+`IotacismTests` pins the fold. Its strings are written as transcriptions,
+not as sentences anyone would type — testing this with clean text is how the
+bug survived in the first place.
+
 ## Language
 
 The user speaks Greek. Jarvis should answer in Greek by default.
