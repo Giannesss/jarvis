@@ -556,10 +556,13 @@ class RegistryTests(PolicyTestCase):
                 self.assertIs(skill.permission, Permission.SAFE)
 
     def test_registry_order_is_unchanged(self) -> None:
+        # agenda sits before memory_recall on purpose: «τι έχω σήμερα» is the
+        # narrower question, and the generic recall would answer it with a
+        # keyword search that knows nothing about dates.
         self.assertEqual(
             [skill.name for skill in skills.SKILLS],
-            ["shutdown", "memory_save", "memory_recall", "timer", "time", "date",
-             "open_site_or_app"],
+            ["shutdown", "memory_save", "agenda", "memory_recall", "timer",
+             "time", "date", "open_site_or_app"],
         )
 
     def test_skills_reexports_the_policy_types(self) -> None:

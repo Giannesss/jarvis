@@ -122,6 +122,26 @@ SCHEDULER_CATCHUP_LIMIT = int(os.environ.get("SCHEDULER_CATCHUP_LIMIT", "3"))
 # Estimated at len(text)/3, which is conservative for Greek.
 MEMORY_TOKEN_BUDGET = int(os.environ.get("MEMORY_TOKEN_BUDGET", "300"))
 
+# The life areas a saved row can belong to, so "τι έχω σήμερα" can pull across
+# every table at once instead of needing you to know which one holds what.
+#
+# A closed set on purpose: these are *your* areas, nobody else can guess them,
+# and a fixed list means a typo cannot invent a tag that nothing will ever
+# search for. Values are the spoken words implying the tag, matched as
+# substrings of a row's already-normalized `norm` -- so write stems where the
+# ending varies ("πελατ" covers πελάτης and πελάτες), and spell them naturally:
+# they go through text.normalize() at import like every other phrase list.
+#
+# Tagging is additive and never gates a save: a row nothing matches simply has
+# no tag and is still found by keyword search exactly as before.
+MEMORY_TAGS = {
+    "cafe": ("καφέ", "καφετέρια", "μπαρίστα", "εσπρέσο", "καφεκοπτ"),
+    "restaurant": ("εστιατόριο", "ταβέρνα", "μενού", "σερβιτόρ", "κουζίνα"),
+    "university": ("μάθημα", "εξάμηνο", "σχολή", "πανεπιστήμιο", "εξέταση", "πτυχίο"),
+    "ai_marketing": ("μάρκετινγκ", "καμπάνια", "πελατ", "διαφήμισ", "μπράντα"),
+    "business": ("επιχείρηση", "μαγαζί", "εταιρεία", "κατάστημα"),
+}
+
 # Skill: websites openable via "άνοιξε το ..." (jarvis/skills.py). Keys are
 # matched as accent/case-insensitive substrings of the spoken text, so they
 # can be spelled naturally here.

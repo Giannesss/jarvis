@@ -16,7 +16,10 @@ already built.
 registry (done), the policy layer and kill switch (done — see "Policy"), a
 durable scheduler for reminders and timers that survive a restart (done — see
 "Scheduler"), and a tag/category column across the memory tables so "τι έχω
-σήμερα" can pull from every area at once.
+σήμερα" can pull from every area at once (done — see "Tags"). All four are
+built; the phase pointer moves to Phase 5 once they have been hand-tested on
+live audio, which is the roadmap's own rule and the one thing tests cannot
+stand in for.
 
 Phase 1 closed on 2026-09-23 (`docs/PHASE1_STATUS.md`): the beep-reset bug and
 the too-high silence floor are fixed and confirmed live, and the remaining
@@ -563,7 +566,9 @@ write costs a log row, never a turn, same discipline as `memory.recall_safe()`.
 every statement in `_SCHEMA` is `CREATE ... IF NOT EXISTS` and `_init()` runs
 the whole script on every connect, so an existing database picks up a new
 table on its next start. That version tracks *data* migrations (the norm
-refold), and bumping it would re-run that for nothing.
+refold, and later the tags column), and bumping it for a new table would
+re-run those for nothing. A new *column* is the case that cannot ride in this
+way — see "Tags".
 
 ## Diagnostics
 
@@ -788,6 +793,80 @@ The recall verbs themselves are in `_STOPWORDS` for the same reason — without
 search, finds nothing, and answers "nothing found" instead of taking this
 path.
 
+### Tags
+
+Every content table carries a `tags` column: the row's life area, so
+«τι έχω σήμερα» can pull from every table at once instead of needing to
+know which table holds what. `MEMORY_TAGS` in `config.py` is the
+vocabulary — a closed set, because these are *your* areas and a fixed list
+means a typo cannot invent a tag nothing will ever search for.
+
+A tag comes from two sources, in order: **the table**, which is exact and
+free (a course or exam is `university` by construction, a business row is
+`business`), then **keywords** matched against the row's already-folded
+`norm`. `memory.tags_for()` is called from `save()` — the one place every
+write passes through, and the point at which `norm` is finished.
+
+This is `_TABLE_KEYWORDS`' idea done properly. That one keeps a row
+findable by the generic word that filed it, by stuffing the word into the
+search key; a tag is the same classification in a column of its own, where
+it can be *selected on* rather than only matched.
+
+Three things are deliberate:
+
+- **Tagging is additive and never gates a save.** A row nothing matches
+  keeps no tag (`NULL`, not `""`), lands in the same table as before, and
+  is still found by keyword search. Matching is exact-substring, not fuzzy:
+  the asymmetry that justified edit distance for the kill switch — a miss
+  means the safety feature didn't work — does not hold here, where a missed
+  tag only means the row is found the way it was found before tags existed.
+- **The stored form is comma-delimited *and* comma-terminated**
+  (`,cafe,university,`). The sentinels are what let `LIKE '%,cafe,%'` match
+  a whole tag rather than a prefix of another one — without them
+  `marketing` matches `ai_marketing`. `memory.tag_like()` builds the
+  pattern; a test pins that exact pair.
+- **A query naming two areas filters by neither.** `tag_of_query()` returns
+  `None` on ambiguity, because filtering by one of two named areas answers
+  a question nobody asked, and showing everything is the recoverable
+  direction.
+
+**The migration is the first that needed a real `ALTER`.** `_SCHEMA` is all
+`CREATE TABLE IF NOT EXISTS`, which is how `audit` and `policy_state`
+arrived without a version bump — but `IF NOT EXISTS` skips the *whole*
+statement for a table that already exists, so nothing in `_SCHEMA` can ever
+reach an existing one. A new column needs `ALTER TABLE ... ADD COLUMN`,
+and needing it is exactly what earns `SCHEMA_VERSION = 3`. The `ALTER` is
+guarded by `db._has_column()`, because `_migrate()` is not transactional
+across its steps: a crash between the `ALTER` and the version stamp would
+otherwise make every later start fail on a duplicate column, with no way
+back short of editing the database by hand. Existing rows are backfilled
+from their stored `norm`, so tags work on the first run rather than only
+for rows saved afterwards.
+
+### The agenda
+
+`memory.agenda(conn, day, tag=None)` returns `(kind, text)` for everything
+dated that day, from every table that carries a date. `_due_today()` is now
+a rendering of it for the brain's memory block, and the `agenda` skill
+speaks it for «τι έχω σήμερα» / «αύριο» / «μεθαύριο», optionally narrowed
+to one area («τι έχω σήμερα για το μαγαζί»). Day words come from
+`memory.RELDAY`, so σήμερα/αύριο/μεθαύριο are spelled in one place.
+
+It is registered **before** `memory_recall`: «τι έχω σήμερα» is the
+narrower question, and the generic recall would answer it with a keyword
+search that knows nothing about dates. The phrases are whole («τι έχω
+σήμερα»), never a bare «τι έχω», which would swallow ordinary questions.
+
+**A reminder appears whatever its status**, with a fired one marked
+«(έγινε)» and a missed one «(χάθηκε)». The question is what the day holds,
+not what is still queued — and since the scheduler began claiming rows,
+filtering on `pending` would have made a 9am reminder invisible by 10am.
+That is the loose end the scheduler left, closed here.
+
+Known boundary: the agenda is *dated* items only. A café note with no date
+is tagged `cafe` and found by keyword search, but «τι έχω σήμερα για τον
+καφέ» will not list it, because it is not on for today.
+
 ### Known gaps
 
 1. **Words under 5 characters don't stem.** `πόλη` → `πολι` is 4 characters;
@@ -846,9 +925,10 @@ requires an explicit yes — anything unrecognised, including silence, is a no.
 `edit` refuses `id`/`created_at`/`norm`, re-runs the sensitivity check, and
 refreshes `norm` so an edited row stays findable under its new wording.
 
-**Schema.** `SCHEMA_VERSION` is 2. `db.connect()` migrates an older database
+**Schema.** `SCHEMA_VERSION` is 3. `db.connect()` migrates an older database
 in place on the next start (`db._migrate`); version 2 refolds every stored
-`norm`, see "Normalization".
+`norm` (see "Normalization"), version 3 adds and backfills `tags` (see
+"Tags").
 
 **Backups.** `db.backup()` uses SQLite's backup API (safe against a
 concurrent writer) into `BACKUP_DIR` (`data/backups/`), keeping the newest

@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 
 from jarvis import db
-from jarvis.config import MEMORY_TOKEN_BUDGET
+from jarvis.config import MEMORY_TAGS, MEMORY_TOKEN_BUDGET
 from jarvis.text import (
     NUMBER_WORDS,
     fold_iotacism,
@@ -479,6 +479,91 @@ _TABLE_KEYWORDS = {
 }
 
 
+# --- Tags ------------------------------------------------------------------
+#
+# A row's life area, so "τι έχω σήμερα" can pull across every table at once
+# instead of needing to know which table holds what. Two sources, in order:
+# the table itself, which is exact and free (a course is university by
+# construction), and then the MEMORY_TAGS keywords matched against the row's
+# already-folded `norm`.
+#
+# This is _TABLE_KEYWORDS' idea done properly. That one keeps a row findable
+# by the generic word that filed it, by stuffing the word into the search key;
+# a tag is the same classification in a column of its own, where it can be
+# selected on rather than only matched.
+#
+# Matching is exact-substring, deliberately not fuzzy. The asymmetry that
+# justified edit distance for the kill switch -- a miss means the safety
+# feature did not work -- does not hold here: a missed tag only means the row
+# is found the way it was found before tags existed. Tagging is additive and
+# never gates a save.
+_TAG_KEYWORDS = {
+    tag: tuple(normalize(word) for word in words)
+    for tag, words in MEMORY_TAGS.items()
+}
+
+# Tags a table implies on its own, whatever its text happens to say.
+_TABLE_TAGS = {
+    "courses": "university",
+    "exams": "university",
+    "businesses": "business",
+}
+
+# Stored comma-delimited *and* comma-terminated: ",cafe,university,". The
+# sentinels are what let LIKE '%,cafe,%' match a whole tag rather than a
+# prefix of another one -- without them "marketing" matches "ai_marketing".
+TAG_SEP = ","
+
+
+def pack_tags(tags: list[str]) -> str | None:
+    """The stored form, or None for a row nothing matched. NULL rather than
+    "" says "no tag" unambiguously, the same choice businesses.name makes."""
+    if not tags:
+        return None
+    return TAG_SEP + TAG_SEP.join(tags) + TAG_SEP
+
+
+def unpack_tags(value: str | None) -> list[str]:
+    return [tag for tag in (value or "").split(TAG_SEP) if tag]
+
+
+def tag_like(tag: str) -> str:
+    """The LIKE pattern matching one whole tag inside a packed column."""
+    return f"%{TAG_SEP}{tag}{TAG_SEP}%"
+
+
+def tags_in(norm: str) -> list[str]:
+    """Tags the normalized text itself implies, in MEMORY_TAGS order."""
+    return [
+        tag
+        for tag, words in _TAG_KEYWORDS.items()
+        if any(word in norm for word in words)
+    ]
+
+
+def tags_for(table: str, norm: str) -> str | None:
+    """The packed tags for one row: what its table implies, then what its text
+    does. Called from save(), so every write path tags the same way."""
+    tags = []
+    if implied := _TABLE_TAGS.get(table):
+        tags.append(implied)
+    for tag in tags_in(norm):
+        if tag not in tags:
+            tags.append(tag)
+    return pack_tags(tags)
+
+
+def tag_of_query(text: str) -> str | None:
+    """The one area a spoken question is about («τι έχω σήμερα για το μαγαζί»).
+
+    None when nothing matched *or* when two areas did: filtering an agenda by
+    one of two named areas would answer a question nobody asked, and showing
+    everything is the recoverable direction.
+    """
+    found = tags_in(normalize(text))
+    return found[0] if len(found) == 1 else None
+
+
 def parse(text: str, now: datetime | None = None) -> Parsed | None:
     """Decide what a spoken sentence should become.
 
@@ -704,14 +789,20 @@ def save(parsed: Parsed, conn: sqlite3.Connection) -> int:
     ts = db.now_iso()
     fields = dict(parsed.fields)
 
+    # Tagged here rather than in parse(), because save() is the one place
+    # every write passes through -- and because the tag is derived from the
+    # finished `norm`, which parse() is still assembling.
+    fields["tags"] = tags_for(parsed.table, fields.get("norm", ""))
+
     if parsed.table == "profile":
         # One row per key: saying your name twice updates it rather than
         # accumulating contradictory rows.
         conn.execute(
-            "INSERT INTO profile (key, value, norm, created_at, updated_at)"
-            " VALUES (:key, :value, :norm, :ts, :ts)"
+            "INSERT INTO profile (key, value, norm, tags, created_at, updated_at)"
+            " VALUES (:key, :value, :norm, :tags, :ts, :ts)"
             " ON CONFLICT(key) DO UPDATE SET"
-            " value=excluded.value, norm=excluded.norm, updated_at=excluded.updated_at",
+            " value=excluded.value, norm=excluded.norm, tags=excluded.tags,"
+            " updated_at=excluded.updated_at",
             {**fields, "ts": ts},
         )
         conn.commit()
@@ -912,23 +1003,59 @@ def spoken_profile(conn: sqlite3.Connection) -> str:
     return f"Θυμάμαι ότι {_join_greek(facts)}."
 
 
-def _due_today(conn: sqlite3.Connection, now: datetime) -> list[str]:
-    today = now.date().isoformat()
-    lines = []
+# How a reminder that is no longer pending is spoken in an agenda. The row
+# still belongs to the day; what changed is only whether it still awaits you.
+_STATUS_SUFFIX = {"fired": " (έγινε)", "missed": " (χάθηκε)"}
 
-    for row in conn.execute(
-        "SELECT course, topic FROM exams WHERE due_date = ?", (today,)
-    ):
+
+def agenda(
+    conn: sqlite3.Connection, day: date, tag: str | None = None
+) -> list[tuple[str, str]]:
+    """Everything dated `day`, as (kind, text), from every table with a date.
+
+    This is what «τι έχω σήμερα» answers and the reason tags exist: the caller
+    no longer has to know which table holds what. `tag` narrows it to one life
+    area («τι έχω σήμερα για το μαγαζί»).
+
+    Reminders are included whatever their status, with a fired or missed one
+    marked. The question is what the day holds, not what is still queued --
+    and since the scheduler began claiming rows, filtering on `pending` would
+    make a 9am reminder invisible by 10am.
+    """
+    stamp = day.isoformat()
+    items: list[tuple[str, str]] = []
+
+    exam_sql = "SELECT course, topic FROM exams WHERE due_date = ?"
+    exam_params: list = [stamp]
+    reminder_sql = "SELECT text, status FROM reminders WHERE due_at LIKE ?"
+    reminder_params: list = [f"{stamp}%"]
+
+    if tag:
+        # The sentinels in tag_like() are what keep this from matching a tag
+        # that merely contains the one asked for.
+        exam_sql += " AND tags LIKE ?"
+        exam_params.append(tag_like(tag))
+        reminder_sql += " AND tags LIKE ?"
+        reminder_params.append(tag_like(tag))
+
+    for row in conn.execute(exam_sql, exam_params):
         topic = f" ({row['topic']})" if row["topic"] else ""
-        lines.append(f"Σήμερα εξέταση: {row['course']}{topic}")
+        items.append(("exam", f"{row['course']}{topic}"))
 
-    for row in conn.execute(
-        "SELECT text FROM reminders WHERE status = 'pending' AND due_at LIKE ?",
-        (f"{today}%",),
-    ):
-        lines.append(f"Σήμερα: {row['text']}")
+    for row in conn.execute(reminder_sql, reminder_params):
+        items.append(
+            ("reminder", f"{row['text']}{_STATUS_SUFFIX.get(row['status'], '')}")
+        )
 
-    return lines
+    return items
+
+
+def _due_today(conn: sqlite3.Connection, now: datetime) -> list[str]:
+    """Today's agenda, rendered for the brain's memory block."""
+    return [
+        f"Σήμερα εξέταση: {text}" if kind == "exam" else f"Σήμερα: {text}"
+        for kind, text in agenda(conn, now.date())
+    ]
 
 
 # Each searchable table: how to render a hit, and its recency column.

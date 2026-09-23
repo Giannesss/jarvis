@@ -246,6 +246,64 @@ def _handle_memory_save(raw_text: str) -> str | None:
     return _SAVE_REPLIES.get(parsed.table, "Το θυμάμαι.")
 
 
+# Asked as whole phrases rather than a bare "τι έχω", which would swallow
+# ordinary questions ("τι έχω να κάνω με αυτό"). The day words come from
+# memory.RELDAY, so σήμερα/αύριο/μεθαύριο are spelled in exactly one place.
+AGENDA_PHRASES = text.phrases(
+    "τι έχω σήμερα", "τι έχω αύριο", "τι έχω μεθαύριο",
+    "τι έχω για σήμερα", "τι έχω για αύριο", "τι έχω για μεθαύριο",
+    "το πρόγραμμά μου", "το πρόγραμμα της ημέρας",
+)
+
+# How each offset is spoken back. Keyed the same way memory.RELDAY is valued.
+_AGENDA_DAY_WORDS = {0: "Σήμερα", 1: "Αύριο", 2: "Μεθαύριο"}
+
+
+def _agenda_day(norm: str) -> int:
+    """Which day was asked about, defaulting to today."""
+    for word, offset in memory.RELDAY.items():
+        if word in norm:
+            return offset
+    return 0
+
+
+def _handle_agenda(raw_text: str) -> str | None:
+    """«Τι έχω σήμερα» -- the day's items from every table at once.
+
+    Registered before memory_recall: this is a narrower question than the
+    generic "what do you remember", and its phrases would otherwise be
+    answered by a keyword search that knows nothing about dates.
+    """
+    norm = _normalize(raw_text)
+    if not any(phrase in norm for phrase in AGENDA_PHRASES):
+        return None
+
+    offset = _agenda_day(norm)
+    day_word = _AGENDA_DAY_WORDS[offset]
+    # None when nothing matched or when two areas did -- see tag_of_query.
+    tag = memory.tag_of_query(raw_text)
+
+    try:
+        conn = db.connect()
+        try:
+            items = memory.agenda(
+                conn, (datetime.now() + timedelta(days=offset)).date(), tag
+            )
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"Σφάλμα μνήμης: {e}")
+        return "Δεν μπόρεσα να δω τη μνήμη μου."
+
+    if not items:
+        return f"Δεν έχεις τίποτα {day_word.lower()}."
+
+    spoken = [
+        f"εξέταση {value}" if kind == "exam" else value for kind, value in items
+    ]
+    return f"{day_word} έχεις: {', '.join(spoken)}."
+
+
 def _handle_memory_recall(raw_text: str) -> str | None:
     norm = _normalize(raw_text)
     if not any(phrase in norm for phrase in MEMORY_RECALL_PHRASES):
@@ -303,6 +361,14 @@ SKILLS: list[Skill] = [
             "ladder, not here."
         ),
         handler=_handle_memory_save,
+        permission=Permission.SAFE,
+        input="raw",
+    ),
+    Skill(
+        name="agenda",
+        phrases=AGENDA_PHRASES,
+        description="Says what is on for today (or tomorrow), across every table.",
+        handler=_handle_agenda,
         permission=Permission.SAFE,
         input="raw",
     ),

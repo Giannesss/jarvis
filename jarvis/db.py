@@ -26,7 +26,7 @@ from jarvis.text import fold_iotacism
 # runs the whole script on every connect, so an existing database picks up a
 # new table on its next start (that is how `audit` and `policy_state` both
 # arrived). Bumping it would only re-run the refold above for nothing.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Tables carrying free text also carry a `norm` column: text.normalize() of
 # whatever should be searchable in that row. Recall matches against it with
@@ -43,7 +43,8 @@ CREATE TABLE IF NOT EXISTS profile (
     value      TEXT NOT NULL,
     norm       TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    tags       TEXT
 );
 
 CREATE TABLE IF NOT EXISTS notes (
@@ -51,7 +52,8 @@ CREATE TABLE IF NOT EXISTS notes (
     text       TEXT NOT NULL,
     norm       TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    tags       TEXT
 );
 
 CREATE TABLE IF NOT EXISTS semesters (
@@ -66,7 +68,8 @@ CREATE TABLE IF NOT EXISTS courses (
     semester    TEXT,
     norm        TEXT NOT NULL,
     created_at  TEXT NOT NULL,
-    updated_at  TEXT NOT NULL
+    updated_at  TEXT NOT NULL,
+    tags        TEXT
 );
 
 CREATE TABLE IF NOT EXISTS exams (
@@ -76,7 +79,8 @@ CREATE TABLE IF NOT EXISTS exams (
     topic      TEXT,
     norm       TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    tags       TEXT
 );
 
 -- name is deliberately nullable: "η επιχείρησή μου χρειάζεται λογιστή" names
@@ -88,7 +92,8 @@ CREATE TABLE IF NOT EXISTS businesses (
     note       TEXT NOT NULL,
     norm       TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    tags       TEXT
 );
 
 CREATE TABLE IF NOT EXISTS reminders (
@@ -101,7 +106,8 @@ CREATE TABLE IF NOT EXISTS reminders (
     status        TEXT NOT NULL,
     fired_at      TEXT,
     created_at    TEXT NOT NULL,
-    updated_at    TEXT NOT NULL
+    updated_at    TEXT NOT NULL,
+    tags          TEXT
 );
 
 -- Deliberately minimal: timestamp, what was attempted, what was decided, and
@@ -179,6 +185,13 @@ def _init(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    return any(
+        row["name"] == column
+        for row in conn.execute(f"PRAGMA table_info({table})")
+    )
+
+
 def _migrate(conn: sqlite3.Connection, version: int) -> None:
     """Bring an existing database up to SCHEMA_VERSION, in place.
 
@@ -201,6 +214,37 @@ def _migrate(conn: sqlite3.Connection, version: int) -> None:
             conn.executemany(
                 f"UPDATE {table} SET norm = ? WHERE id = ?",
                 [(fold_iotacism(row["norm"]), row["id"]) for row in rows],
+            )
+
+    if version < 3:
+        # A new *table* rides in on _SCHEMA's CREATE ... IF NOT EXISTS -- that
+        # is how audit and policy_state arrived without a version bump. A new
+        # *column* cannot: IF NOT EXISTS skips the entire statement for a
+        # table that already exists, so nothing in _SCHEMA can ever reach an
+        # existing one. An ALTER is the only way, and needing it is exactly
+        # what earns this step a version of its own.
+        #
+        # ALTER TABLE ... ADD COLUMN is cheap in SQLite (no table rewrite) and
+        # leaves existing rows NULL, so the backfill below is what makes tags
+        # useful on the first run rather than only for rows saved afterwards.
+        #
+        # The import is deferred because memory.py imports db.py at module
+        # level. It runs once, inside connect(), and only for a database
+        # written before tags existed.
+        from jarvis.memory import tags_for
+
+        for table in CONTENT_TABLES:
+            # Conditional, because _migrate() is not transactional across its
+            # steps: a crash between the ALTER and the version stamp would
+            # otherwise make every later start fail on a duplicate column,
+            # with the database unreachable and no way back short of editing
+            # it by hand.
+            if not _has_column(conn, table, "tags"):
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN tags TEXT")
+            rows = conn.execute(f"SELECT id, norm FROM {table}").fetchall()
+            conn.executemany(
+                f"UPDATE {table} SET tags = ? WHERE id = ?",
+                [(tags_for(table, row["norm"]), row["id"]) for row in rows],
             )
 
     conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
