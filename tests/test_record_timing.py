@@ -29,6 +29,7 @@ import array
 import contextlib
 import io
 import queue
+import threading
 import re
 import time
 import unittest
@@ -537,6 +538,117 @@ class WakeWordGapTests(unittest.TestCase):
         self.run_wake_word(frames)
 
         self.assertEqual(self.wakeword.reset.call_count, 2)  # entry + firing
+
+
+class WakeWordStallTests(unittest.TestCase):
+    """The wake-word wait must not hang on a stream that stopped feeding it.
+
+    The live failure: ffmpeg alive, its stdout pipe open, and the DirectShow
+    device delivering nothing. _stream_audio_reader blocked in stdout.read(),
+    so the EOF sentinel never came, and the loop sat in its queue.Empty
+    branch for 200+ seconds printing a heartbeat with frozen counters --
+    "258 frames, 20.6s audio" unchanged, gated unchanged, evicted unchanged.
+
+    record_command() got a wall-clock backstop when the 43-second bug was
+    fixed, for exactly this reason; this wait never got one, because waiting
+    indefinitely is what it is *for*. The distinction it was missing is
+    between waiting for someone to speak and waiting for audio that is never
+    coming, and _stream_frames_read is what tells those apart.
+    """
+
+    def setUp(self) -> None:
+        self.audio_queue: queue.Queue = queue.Queue()
+        for name, value in (
+            ("_stream_audio_queue", self.audio_queue),
+            ("_stream_stderr_queue", queue.Queue()),
+            ("_capture_floor", 0.0),
+            ("_stream_origin", None),
+            ("_stream_frames_read", 0),
+            # Short enough to test, long enough that the 0.2s queue poll
+            # still runs a few times inside it.
+            ("STREAM_STALL_TIMEOUT", 0.6),
+        ):
+            patcher = mock.patch.object(listener, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+        self.wakeword = mock.MagicMock()
+        self.wakeword.detect.return_value = False
+        for name, value in (("wakeword", self.wakeword),):
+            patcher = mock.patch.object(listener, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+        patcher = mock.patch.object(listener, "_drain")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def wait(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            return listener.listen_for_wake_word()
+
+    def test_a_starved_stream_raises_instead_of_hanging(self) -> None:
+        # Nothing in the queue and the frame counter frozen: exactly the
+        # state the live session sat in. No sentinel is ever put, so if the
+        # watchdog does not fire this test hangs -- which is the bug.
+        started = time.perf_counter()
+        with self.assertRaises(listener.StreamStalled):
+            self.wait()
+        elapsed = time.perf_counter() - started
+        self.assertLess(elapsed, 5.0, "should give up promptly, not hang")
+
+    def test_frames_that_never_reach_the_queue_still_count_as_alive(self) -> None:
+        """The false-positive guard, and the reason the watchdog reads
+        _stream_frames_read rather than the queue.
+
+        While Jarvis is audible the capture gate drops every frame, so the
+        queue is empty exactly as it is during a stall. The counter the
+        reader thread advances for *every* frame it pulls off ffmpeg --
+        gated or not -- is what separates the two, and only it may arm this.
+        """
+        alive_for = listener.STREAM_STALL_TIMEOUT * 3
+        stop = threading.Event()
+
+        def feed_the_counter() -> None:
+            deadline = time.perf_counter() + alive_for
+            while time.perf_counter() < deadline and not stop.is_set():
+                listener._stream_frames_read += 1
+                time.sleep(0.02)
+
+        pump = threading.Thread(target=feed_the_counter, daemon=True)
+        pump.start()
+        self.addCleanup(stop.set)
+
+        started = time.perf_counter()
+        with self.assertRaises(listener.StreamStalled):
+            self.wait()
+        elapsed = time.perf_counter() - started
+
+        # It fired only after the counter stopped moving, not while the
+        # queue was empty but the stream was healthy.
+        self.assertGreaterEqual(elapsed, alive_for)
+
+    def test_the_eof_sentinel_still_raises_the_plain_error(self) -> None:
+        # A process that actually ended is a different failure: no restart
+        # will fix it, and main() must be able to tell the two apart.
+        self.audio_queue.put(None)
+        with self.assertRaises(RuntimeError) as caught:
+            self.wait()
+        self.assertNotIsInstance(caught.exception, listener.StreamStalled)
+
+    def test_a_wake_word_still_fires_normally(self) -> None:
+        # The watchdog must be invisible on the happy path.
+        cooldown = int(listener.WAKE_RETRIGGER_COOLDOWN / FRAME)
+        frames = stream(0.0, "." * (cooldown + 4))
+        for item in frames:
+            self.audio_queue.put(item)
+        listener._stream_frames_read = len(frames)
+
+        fire_at = len(frames) - 1
+        self.wakeword.detect.side_effect = [i == fire_at for i in range(len(frames))]
+
+        self.assertIsInstance(self.wait(), bytes)
 
 
 if __name__ == "__main__":

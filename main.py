@@ -31,6 +31,12 @@ from jarvis.text import is_yes
 GAP_REPLY = "Δεν σε άκουσα καλά, πες το ξανά."
 MAX_GAP_RETRIES = 2
 
+# How many times a stalled microphone stream is restarted before giving up
+# on wake-word mode. A DirectShow device that goes quiet under a live ffmpeg
+# usually comes back when the capture is reopened; one that does not is a
+# problem no further restart will fix, and the Enter prompt still works.
+MAX_STREAM_RESTARTS = 2
+
 # Said when the brain call itself fails (Ollama down, or the intermittent
 # CUDA error). Spoken, not just printed: in wake-word mode nobody is
 # watching the terminal, so a print-only failure is indistinguishable from
@@ -218,6 +224,7 @@ def main() -> None:
     scheduler.start(speaker.speak)
 
     _wake_word_active = WAKE_WORD_ENABLED
+    stream_restarts = 0
     if _wake_word_active:
         try:
             wakeword.preload()
@@ -237,6 +244,32 @@ def main() -> None:
             if _wake_word_active:
                 try:
                     preroll = listener.listen_for_wake_word()
+                except listener.StreamStalled as e:
+                    # ffmpeg is still alive; the device stopped feeding it.
+                    # Reopening the capture is the one thing that actually
+                    # fixes that, and it is cheap -- so try before falling
+                    # back to a prompt the user has to be at a keyboard for.
+                    if stream_restarts >= MAX_STREAM_RESTARTS:
+                        print(f"Η ροή μικροφώνου κόλλησε ξανά ({e}), "
+                              f"πάτα Enter αντ' αυτού.")
+                        listener.stop_stream()
+                        _wake_word_active = False
+                        continue
+
+                    stream_restarts += 1
+                    diag.log(
+                        f"[wake] stream stalled ({e}); restart "
+                        f"{stream_restarts}/{MAX_STREAM_RESTARTS}"
+                    )
+                    print("Η ροή μικροφώνου κόλλησε, επανεκκίνηση...")
+                    try:
+                        listener.stop_stream()
+                        listener.start_stream()
+                    except Exception as restart_error:
+                        print(f"Απέτυχε ({restart_error}), πάτα Enter αντ' αυτού.")
+                        listener.stop_stream()
+                        _wake_word_active = False
+                    continue
                 except Exception as e:
                     print(f"Σφάλμα ανίχνευσης ({e}), πάτα Enter αντ' αυτού.")
                     listener.stop_stream()  # tear down before listen() opens the mic

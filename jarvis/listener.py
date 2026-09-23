@@ -103,8 +103,36 @@ DEBUG_LEVEL_INTERVAL = 1.0
 # this line exists to be skimmed across one, not read frame by frame.
 WAIT_HEARTBEAT_SECONDS = 5.0
 
+# How long the wake-word wait tolerates ffmpeg producing nothing at all
+# before giving up on the stream.
+#
+# The failure this exists for: ffmpeg alive, its stdout pipe open, and the
+# DirectShow device delivering no audio. _stream_audio_reader blocks in
+# stdout.read() forever, so the EOF sentinel that signals "the stream ended"
+# is never sent, and listen_for_wake_word() waits for a frame that is never
+# coming. Measured live: frames stopped at 20.6s into a wait and the loop sat
+# there for 200+ seconds, printing a heartbeat with frozen counters.
+#
+# Generous on purpose. ffmpeg's dshow input hands over ~1s of audio at a time
+# (max measured inter-frame gap 1.008s) and the device takes ~1.4s to produce
+# its first frame, so 15s is roughly 15x the worst gap normal operation
+# produces. It cannot fire on jitter; it only turns an unbounded hang into a
+# bounded one.
+STREAM_STALL_TIMEOUT = 15.0
+
 # dB reported for a completely silent frame (log10(0) is undefined).
 SILENT_DB = -90.0
+
+
+class StreamStalled(RuntimeError):
+    """ffmpeg is still alive but has stopped producing audio.
+
+    Distinct from the plain RuntimeError raised on the EOF sentinel: that
+    one means the process ended, which is unambiguous and unrecoverable
+    here. This one means the device went quiet under a live process, which
+    a restart of the stream can genuinely fix -- so main() gets to tell the
+    two apart and retry this one before falling back to the Enter prompt.
+    """
 
 _model: WhisperModel | None = None
 
@@ -758,10 +786,36 @@ def listen_for_wake_word() -> bytes:
     first_ts: float | None = None
     last_heartbeat = entry_wall
 
+    # The starvation watchdog. It watches _stream_frames_read -- the counter
+    # the reader thread advances for *every* frame ffmpeg produces, gated or
+    # not -- rather than the queue, because those are different questions.
+    # An empty queue is the ordinary state while nobody is speaking, and it
+    # is also what the capture gate produces while Jarvis is audible. A
+    # frozen _stream_frames_read means the audio itself stopped arriving,
+    # which is the only one of the three that no amount of waiting fixes.
+    last_read = _stream_frames_read
+    last_progress = entry_wall
+    entry_read = _stream_frames_read
+
     print("Πες «Hey Jarvis»...")
 
     while True:
         now = time.perf_counter()
+
+        # Checked every pass and before the get(), for the same reason
+        # record_command()'s wall-clock backstop is: the queue.Empty branch
+        # is exactly where a starved stream lives, so a check reachable only
+        # from elsewhere is a check that never runs when it is needed.
+        # Deliberately not gated on WAKE_DEBUG -- the hang happens either way.
+        if _stream_frames_read != last_read:
+            last_read = _stream_frames_read
+            last_progress = now
+        elif now - last_progress >= STREAM_STALL_TIMEOUT:
+            raise StreamStalled(
+                f"Το μικρόφωνο σταμάτησε να στέλνει ήχο "
+                f"({now - last_progress:.0f}s χωρίς καρέ)."
+            )
+
         if WAKE_DEBUG and now - last_heartbeat >= WAIT_HEARTBEAT_SECONDS:
             # Checked before the get(), so it still prints when the queue has
             # starved entirely — "audio stopped arriving" is one of the
@@ -773,7 +827,11 @@ def listen_for_wake_word() -> bytes:
                 f"[wake] waiting {now - entry_wall:.0f}s: {frames_seen} frames, "
                 f"{audio:.1f}s audio, {gaps_seen} gaps, "
                 f"{_frames_gated - since_gated} gated, "
-                f"{_frames_evicted - since_evicted} evicted"
+                f"{_frames_evicted - since_evicted} evicted, "
+                # The one number that separates "nobody is speaking" from
+                # "no audio is arriving". Reconstructing it by hand from a
+                # frozen frame count is what this line now saves.
+                f"{_stream_frames_read - entry_read} read"
             )
 
         try:

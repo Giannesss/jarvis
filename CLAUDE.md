@@ -328,6 +328,45 @@ changes:
   so it cannot re-fire on its own either. Restarting it bought no protection
   and cost another ~1s on top of the reset's.
 
+**A stream can also stop feeding the wait entirely, and that is not a
+hole.** ffmpeg alive, its stdout pipe open, and the DirectShow device
+delivering nothing: `_stream_audio_reader` blocks in `stdout.read()`, so
+the EOF sentinel that means "the stream ended" is never sent, and
+`listen_for_wake_word()` waits for a frame that is never coming. Measured
+live — frames stopped at 20.6s into a wait and the loop sat there for 200+
+seconds, printing a heartbeat with frozen counters.
+
+`record_command()` got a wall-clock backstop when the 43-second bug was
+fixed; this wait never did, because waiting indefinitely is what it is
+*for*. The distinction it was missing is between waiting for someone to
+speak and waiting for audio that will never arrive.
+
+`STREAM_STALL_TIMEOUT` (15s) is that backstop, and it watches
+**`_stream_frames_read`** — the counter the reader thread advances for
+every frame it pulls off ffmpeg, gated or not — rather than the queue. An
+empty queue is the ordinary state while nobody is speaking, and it is also
+what the capture gate produces while Jarvis is audible; a frozen
+`_stream_frames_read` is the only one of the three that no amount of
+waiting fixes. It was also the discriminator in the live log: `gated` stayed
+constant too, which is what ruled out a stuck capture gate. The heartbeat
+now carries that counter for the same reason.
+
+Checked every pass and before the `get()`, for the reason the recording
+backstop is: the `queue.Empty` branch is exactly where a starved stream
+lives. Not gated on `WAKE_DEBUG` — the hang happens either way. It raises
+`StreamStalled`, distinct from the plain `RuntimeError` on the EOF
+sentinel, so `main()` can tell "the device went quiet under a live process"
+(which reopening the capture genuinely fixes) from "the process ended"
+(which it does not): it restarts the stream up to `MAX_STREAM_RESTARTS` (2)
+before falling back to the Enter prompt. 15s is ~15x the worst inter-frame
+gap normal operation produces, so it cannot fire on jitter; it only turns
+an unbounded hang into a bounded one.
+
+Still unlogged: the persistent stream's stderr, which
+`_stream_stderr_reader` enqueues and only ever `_drain`s — so whatever
+ffmpeg said as the device stalled was discarded. Routing it through
+`diag.log()` is the obvious next diagnostic.
+
 If a structural hole ever comes back, the fallback is to skip the reset when
 `_frames_gated` fully accounts for the missing frames — keyed to that
 counter, never to a duration, which drifts the moment `ECHO_PAD` or a beep
@@ -701,7 +740,9 @@ patterns, first match wins.
 4. course — gated on `μάθημα`/`εξάμηνο`, or `κάνω γυμναστική` becomes a course
 5. profile fact (name, studies, job, city, age, school, preferences)
 6. business (`η επιχείρησή μου…`)
-7. **fallback to a plain note — always taken, unless the trigger itself was
+7. **relative delay in the body** (`θυμήσου να με ρωτήσεις σε 2 λεπτά…`) —
+   see "A delay inside the body" below
+8. **fallback to a plain note — always taken, unless the trigger itself was
    fuzzy** (see "Endings are tolerated, stems are not")
 
 `RE_TRIGGER` is anchored at the start of the utterance, so which phrases may
@@ -803,6 +844,55 @@ The recall verbs themselves are in `_STOPWORDS` for the same reason — without
 `ειπες` there, *"Τι μου είπες;"* stems to the junk needle `ιπεσ`, runs a real
 search, finds nothing, and answers "nothing found" instead of taking this
 path.
+
+### A delay inside the body
+
+Steps 1-2 are gated on the **reminder verb** — `θύμισέ μου`,
+`υπενθύμισέ μου` — and step 0 only ever sees the whole utterance. So
+«Θυμήσου να με ρωτήσεις **σε 2 λεπτά** αν έφαγα» matched neither: `θυμήσου`
+is `RE_TRIGGER`'s *save* verb, the delay sat in the body, and the sentence
+was filed as a plain note. It was stored correctly and then never
+announced, because a note has no `due_at` for the scheduler to find — a
+live test lost four minutes waiting for it. The audible tell was there and
+easy to miss: a reminder answers «Εντάξει, θα σου το θυμίσω.», and that
+turn answered «Το θυμάμαι.»
+
+`RE_DELAY` + `_parse_delay()` close it, reading the *body* — the string
+left after the trigger is stripped, which step 0 never sees. Three things
+are deliberate:
+
+- **It runs last among the structured rungs, and that placement is the
+  whole safety argument.** Every rung above returns before reaching it, so
+  nothing it diverts was ever anything but a plain note. No currently
+  structured save can change table, which is an invariant the existing
+  suite checks by passing unchanged.
+- **The preposition is the gate.** A bare duration is a fact («το μάθημα
+  διαρκεί 2 ώρες»); `σε` in front of it is what makes it a delay. What
+  this deliberately accepts in exchange: «θυμήσου ότι θα γυρίσω σε 2 ώρες»
+  now announces itself. The row is still stored and still searchable, so
+  the cost is one spoken line; the cost of the miss was a reminder that
+  never fired at all.
+- **It sits above the `notes_ok` check, so a fuzzy trigger may reach it.**
+  `σε` + number + unit is a second, independent pattern, which is exactly
+  what guard 3 asks a guessed verb to be confirmed by (see "Endings are
+  tolerated, stems are not"). «Θυμήσω να πάρω ψωμί» still goes to the
+  brain; «Θυμήσω να πάρω ψωμί σε 10 λεπτά» saves.
+
+The delay phrase is **cut out of the stored text** — the same thing
+`RE_REMIND_REL` does by keeping only what follows the unit — so the
+announcement two minutes later is «Υπενθύμιση: να με ρωτήσεις αν έφαγα»
+rather than one carrying a stale countdown. Both halves are read back out
+of `raw`, so the text stays verbatim; `Norm.slice()` only yields a
+contiguous piece, hence the join. A delay with nothing else in the body
+(«Θυμήσου σε 2 λεπτά») says when but never what, and falls through to the
+note fallback.
+
+Two known boundaries. **Absolute times mid-body** («…να με ρωτήσεις στις 5
+αν έφαγα») are *not* on this rung: `στις 5` is more often a fact about a
+schedule than an alarm, so widening there needs its own argument. And the
+three original `RE_REMIND_*` patterns still separate their words with
+`\s+` rather than `_GAP`, predating that rule — so «Υπενθύμισέ μου σε 2,
+λεπτά…» misses where the new pattern would not.
 
 ### Tags
 

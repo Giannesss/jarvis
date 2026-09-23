@@ -431,6 +431,34 @@ _FRAC_SECONDS = _folded(
     {"μισή ώρα": 1800, "ένα τέταρτο": 900, "μιάμιση ώρα": 5400}
 )
 
+
+def _frac_seconds(token: str) -> int | None:
+    """Look a fraction up regardless of what separated its two words.
+
+    _FRAC_SECONDS is keyed on single-spaced normalized text, but RE_DELAY
+    matches with _GAP between the words -- so a transcribed "μισή, ώρα"
+    captures with the comma still in it and would miss the table.
+    """
+    return _FRAC_SECONDS.get(re.sub(_GAP, " ", token).strip())
+
+
+# A relative delay sitting anywhere in a body, rather than straight after a
+# reminder verb. "Θυμήσου να με ρωτήσεις σε 2 λεπτά αν έφαγα" is a reminder
+# that no reminder verb introduces: "θυμήσου" is RE_TRIGGER's, a save, so
+# _parse_reminder's "θύμισέ μου" never matched and the whole sentence was
+# filed as a plain note -- stored correctly, and then never announced,
+# because a note has no due_at for the scheduler to find.
+#
+# The preposition is the gate. A bare duration is a fact ("το μάθημα
+# διαρκεί 2 ώρες"); "σε" in front of it is what makes it a delay.
+# Searched rather than anchored, since the phrase sits mid-sentence, and the
+# fraction alternative comes first so "σε μιάμιση ώρα" is not read as the
+# number word "μία" followed by a unit that isn't there.
+RE_DELAY = _re(
+    rf"\bσε{_GAP}(?:(?P<frac>μιαμιση{_GAP}ωρα|μιση{_GAP}ωρα|ενα{_GAP}τεταρτο)"
+    rf"|(?P<num>{_NUM_RE}){_GAP}(?P<unit>{_UNIT_RE}))\b"
+)
+
 RE_EXAM_WORD = _re(
     r"(?:εξετασ\w*|διαγωνισμ\w*|τελικ[ηεσ]\w*|προοδ\w*|παραδοση|προθεσμια|deadline)"
 )
@@ -625,6 +653,18 @@ def parse(text: str, now: datetime | None = None) -> Parsed | None:
     if business := _parse_business(body):
         return business
 
+    # The last structured rung. It runs on the *body*, which is the string
+    # step 0 never sees: a save trigger has been stripped by now, so a delay
+    # that "θυμήσου" introduced instead of "θύμισέ μου" finally gets read.
+    #
+    # Above the notes_ok check on purpose: "σε" + number + unit is a second,
+    # independent pattern, which is exactly what guard 3 asks a fuzzy trigger
+    # to be confirmed by before it may write anything. A mangled verb with an
+    # unstructured body still reaches the brain; a mangled verb with a delay
+    # in it does not.
+    if delay := _parse_delay(body, now):
+        return delay
+
     # Step 7: always taken -- when the trigger was certain.
     #
     # A fuzzy trigger that reaches here was confirmed by nothing: no pattern
@@ -691,6 +731,52 @@ def _reminder(body: str, due: datetime) -> Parsed:
             "status": "pending",
         },
     )
+
+
+def _parse_delay(body: Norm, now: datetime) -> Parsed | None:
+    """A reminder whose delay is buried in the body of a save request.
+
+    Runs last among the structured rungs, which is the whole safety
+    argument: every rung above returns before reaching this one, so nothing
+    this diverts was ever anything but a plain note. That bounds the change
+    to exactly the utterances that used to be stored and never announced.
+
+    The delay phrase is cut out of the stored text rather than left in it --
+    the same thing RE_REMIND_REL does by keeping only what follows the unit.
+    "να με ρωτήσεις σε 2 λεπτά αν έφαγα" is announced two minutes later as
+    "να με ρωτήσεις αν έφαγα", with the stale countdown gone. Both halves
+    are read back out of `raw`, so the text stays verbatim (see "Verbatim
+    captures"); Norm.slice() only yields a contiguous piece, hence the join.
+    """
+    m = RE_DELAY.search(body.norm)
+    if m is None:
+        return None
+
+    if m["frac"]:
+        seconds = _frac_seconds(m["frac"])
+    else:
+        number = _number(m["num"])
+        unit = _unit_seconds(m["unit"])
+        seconds = None if number is None or unit is None else number * unit
+    if seconds is None:
+        return None
+
+    start, end = m.span()
+    remainder = " ".join(
+        part
+        for part in (
+            body.original(0, start).strip(),
+            body.original(end, len(body.norm)).strip(),
+        )
+        if part
+    )
+    # A delay and nothing else ("Θυμήσου σε 2 λεπτά") says when but never
+    # what, so there is nothing to announce. Falls through to the note
+    # fallback, which is where it went before.
+    if not remainder:
+        return None
+
+    return _reminder(remainder, now + timedelta(seconds=seconds))
 
 
 def _parse_exam(body: Norm, now: datetime) -> Parsed | None:

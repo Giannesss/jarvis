@@ -697,5 +697,143 @@ class NormViewTests(unittest.TestCase):
         self.assertEqual(view.original(start, start + len("γιαννισ")), "Γιάννης")
 
 
+class BodyDelayReminderTests(unittest.TestCase):
+    """A reminder whose delay sits in the body of a save request.
+
+    The live failure: "Θυμήσου να με ρωτήσεις σε 2 λεπτά αν έφαγα" was
+    acknowledged with "Το θυμάμαι." and never fired. It was stored
+    correctly -- as a *note*, which has no due_at, so the scheduler had
+    nothing to find. "θυμήσου" is RE_TRIGGER's save verb, not
+    _parse_reminder's "θύμισέ μου", and step 0 only ever looked at the
+    whole utterance, never at the body left after the trigger was stripped.
+    """
+
+    def test_the_utterance_that_failed_by_hand(self) -> None:
+        parsed = memory.parse("Θυμήσου να με ρωτήσεις σε 2 λεπτά αν έφαγα", NOW)
+        self.assertEqual(parsed.table, "reminders")
+        self.assertEqual(parsed.fields["due_at"], "2026-09-22T14:32:00")
+        self.assertEqual(parsed.fields["status"], "pending")
+        self.assertEqual(parsed.fields["kind"], "reminder")
+
+    def test_the_delay_phrase_is_cut_out_of_what_is_announced(self) -> None:
+        # Announced two minutes later, so the countdown in it is stale. The
+        # rest stays verbatim -- both halves are read back out of `raw`.
+        parsed = memory.parse("Θυμήσου να με ρωτήσεις σε 2 λεπτά αν έφαγα", NOW)
+        self.assertEqual(parsed.fields["text"], "να με ρωτήσεις αν έφαγα")
+        self.assertNotIn("λεπτ", parsed.fields["text"])
+
+    def test_a_trailing_delay_leaves_the_head_alone(self) -> None:
+        parsed = memory.parse("Θυμήσου να πάρω ψωμί σε 10 λεπτά", NOW)
+        self.assertEqual(parsed.table, "reminders")
+        self.assertEqual(parsed.fields["text"], "να πάρω ψωμί")
+        self.assertEqual(parsed.fields["due_at"], "2026-09-22T14:40:00")
+
+    def test_a_leading_delay_leaves_the_tail_alone(self) -> None:
+        parsed = memory.parse("Θυμήσου ότι σε 2 ώρες έχω ραντεβού", NOW)
+        self.assertEqual(parsed.fields["text"], "έχω ραντεβού")
+        self.assertEqual(parsed.fields["due_at"], "2026-09-22T16:30:00")
+
+    def test_number_words_and_fractions(self) -> None:
+        for phrase, due in (
+            ("Θυμήσου να με ρωτήσεις σε δέκα λεπτά αν διάβασα", "2026-09-22T14:40:00"),
+            ("Θυμήσου να με ξυπνήσεις σε μισή ώρα", "2026-09-22T15:00:00"),
+            ("Θυμήσου να με ρωτήσεις σε ένα τέταρτο αν έφαγα", "2026-09-22T14:45:00"),
+            ("Θυμήσου να με ρωτήσεις σε μιάμιση ώρα αν έφαγα", "2026-09-22T16:00:00"),
+        ):
+            with self.subTest(phrase=phrase):
+                parsed = memory.parse(phrase, NOW)
+                self.assertEqual(parsed.table, "reminders")
+                self.assertEqual(parsed.fields["due_at"], due)
+
+    def test_seconds_stem_still_beats_minutes_stem(self) -> None:
+        # "δευτερόλεπτα" contains "λεπτ"; UNITS checks the longer stem first,
+        # and this rung reads it through the same _unit_seconds().
+        parsed = memory.parse("Θυμήσου να με ρωτήσεις σε 30 δευτερόλεπτα αν έφαγα", NOW)
+        self.assertEqual(parsed.fields["due_at"], "2026-09-22T14:30:30")
+
+    def test_the_other_save_triggers_reach_it_too(self) -> None:
+        for phrase in (
+            "Να θυμάσαι να με ρωτήσεις σε 2 λεπτά αν έφαγα",
+            "Θέλω να θυμάσαι να με ρωτήσεις σε 2 λεπτά αν έφαγα",
+            "Μην ξεχάσεις να με ρωτήσεις σε 2 λεπτά αν έφαγα",
+            "Τζάρβις, θυμήσου να με ρωτήσεις σε 2 λεπτά αν έφαγα",
+        ):
+            with self.subTest(phrase=phrase):
+                parsed = memory.parse(phrase, NOW)
+                self.assertEqual(parsed.table, "reminders")
+                self.assertEqual(parsed.fields["due_at"], "2026-09-22T14:32:00")
+
+    def test_a_separator_inside_the_delay_is_tolerated(self) -> None:
+        # Whisper punctuates mid-phrase; the rule from CLAUDE.md is that a
+        # separator inside a spoken phrase is _GAP, never \s+.
+        parsed = memory.parse("Θυμήσου να με ρωτήσεις σε 2, λεπτά αν έφαγα", NOW)
+        self.assertEqual(parsed.table, "reminders")
+        self.assertEqual(parsed.fields["due_at"], "2026-09-22T14:32:00")
+
+
+class BodyDelayNegativeTests(unittest.TestCase):
+    """What the delay rung must not claim.
+
+    The preposition is the gate: "σε 2 ώρες" is a delay, a bare "2 ώρες"
+    is a fact. And the rung runs *last* among the structured ones, so
+    nothing it diverts was ever anything but a plain note.
+    """
+
+    def test_a_bare_duration_is_still_a_note(self) -> None:
+        parsed = memory.parse("Θυμήσου ότι το μάθημα διαρκεί 2 ώρες", NOW)
+        self.assertEqual(parsed.table, "notes")
+
+    def test_a_delay_with_nothing_to_announce_is_still_a_note(self) -> None:
+        # Says when, never what. Falls through to where it went before.
+        parsed = memory.parse("Θυμήσου σε 2 λεπτά", NOW)
+        self.assertEqual(parsed.table, "notes")
+
+    def test_the_structured_rungs_still_win(self) -> None:
+        # The placement invariant: every rung above returns first, so a body
+        # one of them claims keeps its own table even with a delay in it.
+        for phrase, table in (
+            ("Θυμήσου ότι με λένε Γιάννης και φεύγω σε 2 ώρες", "profile"),
+            ("Θυμήσου ότι έχω εξετάσεις στις 12 Ιουνίου και φεύγω σε 2 ώρες", "exams"),
+            ("Θυμήσου ότι η επιχείρησή μου χρειάζεται λογιστή σε 2 ώρες", "businesses"),
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertEqual(memory.parse(phrase, NOW).table, table)
+
+    def test_the_reminder_verb_still_takes_step_zero(self) -> None:
+        # _parse_reminder runs before the trigger is even looked for, so the
+        # new rung cannot change what "υπενθύμισέ μου" already did.
+        parsed = memory.parse("Υπενθύμισέ μου σε 2 ώρες ότι έχω ραντεβού", NOW)
+        self.assertEqual(parsed.table, "reminders")
+        self.assertEqual(parsed.fields["text"], "έχω ραντεβού")
+
+    def test_it_does_not_loosen_the_fuzzy_negatives(self) -> None:
+        # The eight sentences that must keep reaching the brain, each now
+        # carrying a delay phrase: no trigger means no body, and no body
+        # means this rung is never reached.
+        for phrase in (
+            "Θυμάσαι τι σου είπα σε 2 ώρες;",
+            "Θυμάμαι το καλοκαίρι σε 2 ώρες",
+            "Θύμωσα με τον αδερφό μου σε 2 ώρες",
+            "Κρατάω σημειώσεις στο μάθημα σε 2 ώρες",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIsNone(memory.parse(phrase, NOW))
+
+    def test_a_fuzzy_trigger_still_needs_the_delay_to_confirm_it(self) -> None:
+        # Guard 3, unchanged in spirit: a guessed verb earns the structured
+        # rungs only. "σε" + number + unit is the second, independent pattern
+        # that confirms it -- an unstructured body still is not.
+        self.assertIsNone(memory.parse("Θυμήσω να πάρω ψωμί", NOW))
+        parsed = memory.parse("Θυμήσω να πάρω ψωμί σε 10 λεπτά", NOW)
+        self.assertEqual(parsed.table, "reminders")
+        self.assertEqual(parsed.fields["due_at"], "2026-09-22T14:40:00")
+
+    def test_sensitive_content_is_still_refused_on_this_path(self) -> None:
+        parsed = memory.parse(
+            "Θυμήσου να μου πεις σε 2 λεπτά ότι ο κωδικός μου είναι abc12345", NOW
+        )
+        self.assertEqual(parsed.table, memory.REJECTED)
+
+
 if __name__ == "__main__":
     unittest.main()
