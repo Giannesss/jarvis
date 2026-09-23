@@ -14,6 +14,7 @@ from pathlib import Path
 
 import edge_tts
 
+from jarvis import diag
 from jarvis.config import PIPER_MODEL_PATH, TTS_ENGINE, TTS_VOICE
 from jarvis.listener import FFMPEG_PATH
 
@@ -35,7 +36,7 @@ def _get_voice():
         print("Φόρτωση Piper...")
         t0 = time.perf_counter()
         _voice = PiperVoice.load(Path(PIPER_MODEL_PATH))
-        print(f"[timing] Piper load: {time.perf_counter() - t0:.2f}s")
+        diag.log(f"[timing] Piper load: {time.perf_counter() - t0:.2f}s")
 
     return _voice
 
@@ -47,7 +48,7 @@ def _speak_piper(text: str) -> None:
     buffer = io.BytesIO()
     with wave.open(buffer, "wb") as wav_file:
         voice.synthesize_wav(text, wav_file)
-    print(f"[timing] Piper synthesis: {time.perf_counter() - t0:.2f}s")
+    diag.log(f"[timing] Piper synthesis: {time.perf_counter() - t0:.2f}s")
     with _playing():
         winsound.PlaySound(buffer.getvalue(), winsound.SND_MEMORY)
 
@@ -76,7 +77,7 @@ def _speak_edge(text: str) -> bool:
         mp3_path.unlink(missing_ok=True)
         wav_path.unlink(missing_ok=True)
 
-    print(f"[timing] Edge TTS synthesis: {time.perf_counter() - t0:.2f}s")
+    diag.log(f"[timing] Edge TTS synthesis: {time.perf_counter() - t0:.2f}s")
     with _playing():
         winsound.PlaySound(wav_bytes, winsound.SND_MEMORY)
     return True

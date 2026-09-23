@@ -2,6 +2,7 @@ import time
 
 import ollama
 
+from jarvis import diag
 from jarvis.config import BRAIN_PROVIDER, OLLAMA_MODEL
 
 SYSTEM_PROMPT = (
@@ -105,7 +106,7 @@ def _ask_ollama(messages: list[dict]) -> str:
         keep_alive=KEEP_ALIVE,
         options={"num_predict": MAX_REPLY_TOKENS, "temperature": TEMPERATURE},
     )
-    print(
+    diag.log(
         f"[timing] Ollama response: {time.perf_counter() - t0:.2f}s "
         f"(prompt {_stage(response, 'prompt_eval_count', 'prompt_eval_duration')}"
         f", gen {_stage(response, 'eval_count', 'eval_duration')})"

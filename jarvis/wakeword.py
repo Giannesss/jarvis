@@ -12,6 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from jarvis import diag
 from jarvis.config import (
     WAKE_DEBUG,
     WAKE_MODEL_PATH,
@@ -90,7 +91,7 @@ def _detect_openwakeword(frame: bytes) -> bool:
 
     if WAKE_DEBUG and score >= WAKE_SCORE_FLOOR:
         hit = "HIT" if score >= WAKE_THRESHOLD else "   "
-        print(
+        diag.log(
             f"[wake] {hit} {_score_key}={score:.4f} "
             f"f{_frames_since_reset} (threshold {WAKE_THRESHOLD})"
         )

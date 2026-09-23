@@ -80,6 +80,9 @@ only falling back to the brain when a skill doesn't match (see "Skills").
   re-exports it under the old names, so `_normalize` and `SHUTDOWN_PHRASES`
   still work there.
 - `jarvis/db.py` — SQLite schema, connections, backups.
+- `jarvis/diag.py` — the diagnostic log: every `[timing]`/`[rec]`/`[wake]`
+  line the terminal prints, timestamped into `data/jarvis.log`. See
+  "Diagnostics".
 - `jarvis/memory.py` — parsing speech into rows, and recalling rows as context.
 - `jarvis/mem.py` — `python -m jarvis.mem`, also backing `:mem` at the prompt.
 - `tools/wake_score_probe.py` — standalone wake-word diagnostic, not part of
@@ -532,6 +535,43 @@ every statement in `_SCHEMA` is `CREATE ... IF NOT EXISTS` and `_init()` runs
 the whole script on every connect, so an existing database picks up a new
 table on its next start. That version tracks *data* migrations (the norm
 refold), and bumping it would re-run that for nothing.
+
+## Diagnostics
+
+`jarvis/diag.py` mirrors the terminal's diagnostic lines into
+`data/jarvis.log`, timestamped. Every hard bug in this project has been a
+timing one, and every one was diagnosed from a `[timing]` or `[rec]` line —
+twice the line that would have settled a question was in a scrollback
+nobody still had, so the question could only be reopened by reproducing the
+fault live.
+
+`diag.log()` is a drop-in for the `print()` calls that carried those lines,
+and `_debug()` in `listener.py` now routes through it too. Four things
+about it are deliberate:
+
+- **It mirrors stdout rather than replacing it.** Callers keep their own
+  gating, so a line printed only under `WAKE_DEBUG` is logged only under
+  `WAKE_DEBUG`. That is what keeps the file comparable to a pasted
+  scrollback — it is a record of the session *as it was shown*.
+- **Nothing is written until `diag.start_session()` is called**, which only
+  `main()` does. The log records runs of Jarvis, not imports of the package;
+  without that, the test suite — which imports `speaker`, `skills` and
+  `listener` freely — wrote fake `[timing] Piper load` lines into the real
+  log. A `tests/__init__.py` guard was tried first and rejected: `unittest
+  discover -s tests` doesn't import the package `__init__`, so it worked
+  under one invocation and not the other.
+- **It never costs a turn.** Every filesystem call is wrapped and failures
+  are swallowed, same discipline as `db.backup()` at startup and
+  `memory.recall_safe()`. The first failure sets a flag so a broken path
+  costs one failed syscall per run rather than one per frame.
+- **It holds no transcribed text** — timings, mic levels, stop reasons and
+  wake scores only, the same rule the audit log follows. It still lands
+  under `data/` (gitignored), because levels and timings describe someone's
+  room even when the words are absent.
+
+Rotated at `LOG_MAX_BYTES` (2MB), keeping `LOG_KEEP` (3) old files, and
+each run opens with a `--- session start ---` banner so one session's lines
+can be told from the last one's. `LOG_ENABLED=false` turns it off entirely.
 
 ## Memory
 

@@ -14,6 +14,7 @@ import webbrowser
 from datetime import datetime
 
 from jarvis import db, memory, policy, speaker, text
+from jarvis import diag
 from jarvis.config import SKILL_APPS, SKILL_SITES
 
 # Defined in policy.py, which owns them because dispatch() has to call a
@@ -389,6 +390,6 @@ def handle(text: str) -> str | None:
                 break
 
     if reply is not None:
-        print(f"[timing] Skill match: {time.perf_counter() - t0:.3f}s")
+        diag.log(f"[timing] Skill match: {time.perf_counter() - t0:.3f}s")
 
     return reply

@@ -97,6 +97,17 @@ DB_PATH = Path(os.environ.get("JARVIS_DB_PATH", DATA_DIR / "jarvis.db"))
 BACKUP_DIR = Path(os.environ.get("BACKUP_DIR", DATA_DIR / "backups"))
 BACKUP_KEEP = int(os.environ.get("BACKUP_KEEP", "5"))
 
+# Diagnostics (jarvis/diag.py). Every [timing]/[rec]/[wake] line printed to
+# the terminal is mirrored here with a timestamp, because the answer to
+# "why was that turn wrong" has repeatedly been a scrollback nobody still
+# had. Rotated at LOG_MAX_BYTES, keeping LOG_KEEP old files; under data/,
+# so it is gitignored like the rest -- transcribed text never reaches it,
+# but mic levels and timings still describe someone's room.
+LOG_PATH = Path(os.environ.get("JARVIS_LOG_PATH", DATA_DIR / "jarvis.log"))
+LOG_ENABLED = os.environ.get("LOG_ENABLED", "true").lower() == "true"
+LOG_MAX_BYTES = int(os.environ.get("LOG_MAX_BYTES", str(2 * 1024 * 1024)))
+LOG_KEEP = int(os.environ.get("LOG_KEEP", "3"))
+
 # Hard cap on how much remembered context is injected into a brain call.
 # Estimated at len(text)/3, which is conservative for Greek.
 MEMORY_TOKEN_BUDGET = int(os.environ.get("MEMORY_TOKEN_BUDGET", "300"))

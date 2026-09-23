@@ -16,6 +16,7 @@ from pathlib import Path
 from faster_whisper import WhisperModel
 
 from jarvis import wakeword
+from jarvis import diag
 from jarvis.config import (
     DATA_DIR,
     MAX_RECORD_SECONDS,
@@ -119,7 +120,7 @@ def _get_model() -> WhisperModel:
             device="cpu",
             compute_type="int8",
         )
-        print(f"[timing] Whisper load: {time.perf_counter() - t0:.2f}s")
+        diag.log(f"[timing] Whisper load: {time.perf_counter() - t0:.2f}s")
 
     return _model
 
@@ -274,7 +275,7 @@ def listen() -> str | None:
         if line is not None:
             stderr_lines.append(line)
 
-    print(f"[timing] Recording: {time.perf_counter() - t0:.2f}s")
+    diag.log(f"[timing] Recording: {time.perf_counter() - t0:.2f}s")
 
     if stop_reason == "eof" and process.returncode != 0:
         error = "".join(stderr_lines).strip()
@@ -302,7 +303,7 @@ def listen() -> str | None:
             for segment in segments
             if segment.text.strip()
         ).strip()
-        print(f"[timing] Transcription: {time.perf_counter() - t0:.2f}s")
+        diag.log(f"[timing] Transcription: {time.perf_counter() - t0:.2f}s")
 
         if not text:
             print("Δεν κατάλαβα τι είπες.")
@@ -615,8 +616,10 @@ def stop_stream() -> None:
 
 
 def _debug(message: str) -> None:
+    # diag.log() mirrors to the log file, so a debug line is recorded only
+    # when it was also shown -- the file stays comparable to a scrollback.
     if WAKE_DEBUG:
-        print(message)
+        diag.log(message)
 
 
 def _frame_db(frame: bytes) -> float:
@@ -989,7 +992,7 @@ def _report_empty_transcription(info, audio: bytes) -> None:
             wav_file.setsampwidth(2)
             wav_file.setframerate(SAMPLE_RATE)
             wav_file.writeframes(audio)
-        print(f"[rec] saved the audio to {path}")
+        diag.log(f"[rec] saved the audio to {path}")
     except OSError as e:
         _debug(f"[rec] could not save the audio: {e}")
 
@@ -1113,7 +1116,7 @@ def record_command(
 
     # Both clocks, always: the wall-clock number on its own is what hid this
     # whole class of bug.
-    print(f"[timing] Recording: {wall:.2f}s wall / {decider.audio_seconds:.2f}s audio")
+    diag.log(f"[timing] Recording: {wall:.2f}s wall / {decider.audio_seconds:.2f}s audio")
 
     # The invariant, split so it means something. Waiting for ffmpeg's buffer
     # to reach the new floor is a fixed ~1s cost at the start of every turn
@@ -1166,7 +1169,7 @@ def record_command(
             for segment in segments
             if segment.text.strip()
         ).strip()
-        print(f"[timing] Transcription: {time.perf_counter() - t0:.2f}s")
+        diag.log(f"[timing] Transcription: {time.perf_counter() - t0:.2f}s")
 
         if not text:
             print("Δεν κατάλαβα τι είπες.")

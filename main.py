@@ -1,7 +1,7 @@
 import shlex
 from typing import Callable
 
-from jarvis import brain, db, listener, mem, memory, policy, skills, speaker, wakeword
+from jarvis import brain, db, diag, listener, mem, memory, policy, skills, speaker, wakeword
 from jarvis.config import (
     CONVERSATION_MODE,
     CONVERSATION_TIMEOUT,
@@ -187,6 +187,10 @@ def _run_admin_command(command: str, runner: Callable[[list[str]], int]) -> None
 
 def main() -> None:
     global _wake_word_active
+
+    # First line of the run, so one session's diagnostics can be told from
+    # the previous one's when the log spans several restarts.
+    diag.start_session(f"session start (wake word {WAKE_WORD_ENABLED})")
 
     _startup_backup()
     # A restart is one of the two documented ways out of the kill switch, and
