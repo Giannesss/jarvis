@@ -96,6 +96,11 @@ MAX_LOST_SECONDS = 1.0
 # How often WAKE_DEBUG prints the current level while waiting for speech.
 DEBUG_LEVEL_INTERVAL = 1.0
 
+# How often WAKE_DEBUG reports that the wake-word wait is still healthy.
+# Longer than DEBUG_LEVEL_INTERVAL because a wait can run for minutes and
+# this line exists to be skimmed across one, not read frame by frame.
+WAIT_HEARTBEAT_SECONDS = 5.0
+
 # dB reported for a completely silent frame (log10(0) is undefined).
 SILENT_DB = -90.0
 
@@ -386,16 +391,25 @@ def _should_capture(stream_time: float) -> bool:
     return not speaker.was_speaking(origin + stream_time)
 
 
-def _enqueue_bounded(item_queue: "queue.Queue", item) -> None:
+def _enqueue_bounded(item_queue: "queue.Queue", item) -> int:
     """Put item on a bounded queue, dropping the oldest entry to make room
-    instead of blocking if full — a sliding window of recent data."""
+    instead of blocking if full — a sliding window of recent data.
+
+    Returns how many old entries were evicted, which is 0 in normal
+    operation. That count is the only evidence this ever happened: an
+    eviction is otherwise completely silent, and downstream it is
+    indistinguishable from a frame the capture gate refused or one the
+    driver never produced. See _gap_blame.
+    """
+    evicted = 0
     while True:
         try:
             item_queue.put_nowait(item)
-            return
+            return evicted
         except queue.Full:
             try:
                 item_queue.get_nowait()
+                evicted += 1
             except queue.Empty:
                 pass
 
@@ -416,6 +430,23 @@ _stream_stderr_queue: "queue.Queue[tuple[float, str] | None] | None" = None
 _stream_frames_read = 0
 _stream_lock = threading.Lock()
 
+# --- Where frames go when they don't reach a consumer. A hole in the stream
+# has exactly three possible causes and they call for three different fixes,
+# but they are identical by the time a consumer notices one: the frames are
+# simply not there. These monotonic counters (reset per stream) are what
+# tells them apart -- see _gap_blame and listen_for_wake_word's gap line.
+#
+#   _frames_gated   -- _should_capture refused them: Jarvis was audible at
+#                      the time they were recorded (his voice, or a beep,
+#                      plus speaker.ECHO_PAD). Deliberate.
+#   _frames_evicted -- the queue was full and _enqueue_bounded dropped the
+#                      oldest to make room. A genuine overrun.
+#
+# Neither one moving during a hole means ffmpeg or the driver never produced
+# that audio at all.
+_frames_gated = 0
+_frames_evicted = 0
+
 
 def _stream_audio_reader(
     stdout, audio_queue: "queue.Queue[tuple[float, bytes] | None]"
@@ -428,7 +459,7 @@ def _stream_audio_reader(
     entirely, not just filtered later. Each frame is tagged with the
     stream_time at which it was *recorded*, which is the only clock its
     consumers may reason with."""
-    global _stream_frames_read
+    global _stream_frames_read, _frames_gated, _frames_evicted
 
     buffer = b""
     try:
@@ -444,7 +475,9 @@ def _stream_audio_reader(
             _stream_frames_read += 1
             _note_origin(stream_time + FRAME_SECONDS, time.perf_counter())
             if _should_capture(stream_time):
-                _enqueue_bounded(audio_queue, (stream_time, frame))
+                _frames_evicted += _enqueue_bounded(audio_queue, (stream_time, frame))
+            else:
+                _frames_gated += 1
     except Exception:
         pass
     finally:
@@ -478,7 +511,7 @@ def start_stream() -> None:
     if already running. Raises on failure to start ffmpeg (caller decides
     how to fall back)."""
     global _stream_process, _stream_threads, _stream_audio_queue, _stream_stderr_queue, _stream_frames_read
-    global _stream_origin, _capture_floor
+    global _stream_origin, _capture_floor, _frames_gated, _frames_evicted
 
     with _stream_lock:
         if _stream_process is not None:
@@ -520,6 +553,8 @@ def start_stream() -> None:
         _stream_origin = None
         _origin_samples.clear()
         _capture_floor = 0.0
+        _frames_gated = 0
+        _frames_evicted = 0
 
         audio_queue: "queue.Queue[tuple[float, bytes] | None]" = queue.Queue(
             maxsize=AUDIO_QUEUE_MAXSIZE
@@ -641,6 +676,22 @@ def acknowledge() -> None:
     flush()
 
 
+def _gap_blame(missing: int, gated: int, evicted: int) -> str:
+    """Which of the three ways a frame can go missing explains this hole.
+
+    The counters are read from the reader thread, which runs up to ~1s of
+    audio ahead of whoever is consuming, so the deltas can include a frame
+    or two from just past the hole. That is fine for the question being
+    asked: "is anything being evicted at all" has a categorical answer, and
+    a zero is a zero however the race falls.
+    """
+    if evicted:
+        return f"queue overrun, {evicted} evicted"
+    if gated >= missing:
+        return f"capture gate, {gated} gated (Jarvis was audible)"
+    return f"audio never arrived ({gated} gated, {missing} missing)"
+
+
 def listen_for_wake_word() -> bytes:
     """Block until the wake word fires, returning the ~1s of audio ending
     with the frame that fired (the pre-roll).
@@ -669,10 +720,42 @@ def listen_for_wake_word() -> bytes:
     frames_seen = 0
     last_ts: float | None = None
 
+    # --- Instrumentation for the long-tail question: does a hole ever open
+    # *during* a wait, or only at the start of one? A wake word that scores
+    # ~0.000 because a reset just wiped the model's window looks exactly like
+    # a wake word that was never spoken, so the log has to say which. The
+    # gap line carries where in the wait it happened and what caused it; the
+    # heartbeat says the wait is still being fed when nothing else prints.
+    entry_wall = time.perf_counter()
+    since_gated = _frames_gated
+    since_evicted = _frames_evicted
+    gaps_seen = 0
+    first_ts: float | None = None
+    last_heartbeat = entry_wall
+
     print("Πες «Hey Jarvis»...")
 
     while True:
-        item = audio_queue.get()
+        now = time.perf_counter()
+        if WAKE_DEBUG and now - last_heartbeat >= WAIT_HEARTBEAT_SECONDS:
+            # Checked before the get(), so it still prints when the queue has
+            # starved entirely — "audio stopped arriving" is one of the
+            # answers this is here to give, and it produces no frames to
+            # hang a message off.
+            last_heartbeat = now
+            audio = 0.0 if first_ts is None else (last_ts + FRAME_SECONDS - first_ts)
+            print(
+                f"[wake] waiting {now - entry_wall:.0f}s: {frames_seen} frames, "
+                f"{audio:.1f}s audio, {gaps_seen} gaps, "
+                f"{_frames_gated - since_gated} gated, "
+                f"{_frames_evicted - since_evicted} evicted"
+            )
+
+        try:
+            item = audio_queue.get(timeout=0.2)
+        except queue.Empty:
+            continue
+
         if item is None:
             raise RuntimeError("Η ροή μικροφώνου τερμάτισε απρόσμενα.")
 
@@ -686,11 +769,25 @@ def listen_for_wake_word() -> bytes:
             # it, so feeding it audio welded across a hole leaves that window
             # holding two different moments spliced together. The buffer is
             # invalid either way, so clear it and re-serve the cooldown.
-            _debug(f"[wake] gap of {ts - last_ts - FRAME_SECONDS:.2f}s, model reset")
+            gap = ts - last_ts - FRAME_SECONDS
+            missing = int(round(gap / FRAME_SECONDS))
+            gaps_seen += 1
+            gated = _frames_gated - since_gated
+            evicted = _frames_evicted - since_evicted
+            since_gated = _frames_gated
+            since_evicted = _frames_evicted
+            _debug(
+                f"[wake] gap #{gaps_seen} of {gap:.2f}s ({missing} frames) "
+                f"at +{time.perf_counter() - entry_wall:.1f}s into the wait, "
+                f"after {frames_seen} frames: "
+                f"{_gap_blame(missing, gated, evicted)}; model reset"
+            )
             wakeword.reset()
             preroll.clear()
             frames_seen = 0
 
+        if first_ts is None:
+            first_ts = ts
         last_ts = ts
         frames_seen += 1
 

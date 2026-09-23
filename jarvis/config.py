@@ -43,6 +43,16 @@ WAKE_THRESHOLD = float(os.environ.get("WAKE_THRESHOLD", "0.5"))
 # speech, detection scores, and why each recording stopped.
 WAKE_DEBUG = os.environ.get("WAKE_DEBUG", "false").lower() == "true"
 
+# Under WAKE_DEBUG, the lowest score worth printing. This was 0.1, which made
+# a suppressed detection indistinguishable from silence in the log: a
+# wakeword.reset() reseeds the model's 16-frame window with embeddings of
+# random noise, and a wake word spoken into that window scores ~0.000 rather
+# than merely less — measured on data/wake_probe.wav, utterances that score
+# 0.999 clean score 0.000 when reset lands under ~0.5s before them. Those
+# frames printed nothing at all, so the log could not tell "it scored zero"
+# from "you never spoke". Set to 0 to print every scored frame.
+WAKE_SCORE_FLOOR = float(os.environ.get("WAKE_SCORE_FLOOR", "0.001"))
+
 # Play a short beep after the wake word fires, as a "go ahead" cue. When on,
 # the recording starts from scratch after the beep (the queues are flushed),
 # so the wake word itself is never part of what Whisper transcribes. Turn it

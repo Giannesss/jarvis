@@ -15,6 +15,7 @@ from typing import Any
 from jarvis.config import (
     WAKE_DEBUG,
     WAKE_MODEL_PATH,
+    WAKE_SCORE_FLOOR,
     WAKE_THRESHOLD,
     WAKE_WORD_ENGINE,
 )
@@ -56,8 +57,12 @@ def _get_model() -> Any:
 
 # Under WAKE_DEBUG, scores at or above this are printed even when they don't
 # reach WAKE_THRESHOLD, so a threshold that's set too high is visible as
-# "it scored 0.41" rather than as silence.
-_DEBUG_SCORE_FLOOR = 0.1
+# "it scored 0.41" rather than as silence. WAKE_SCORE_FLOOR (0.001) replaces
+# the 0.1 this used to be: the interesting failure scores ~0.000, not ~0.05,
+# and 0.1 hid exactly the case worth seeing. See config.WAKE_SCORE_FLOOR.
+#
+# Four decimals, not three, for the same reason: at this floor the question
+# is "0.0012 or 0.0400", which .3f rounds into the same-looking number.
 
 
 def _detect_openwakeword(frame: bytes) -> bool:
@@ -68,9 +73,9 @@ def _detect_openwakeword(frame: bytes) -> bool:
     scores = model.predict(audio)
     score = scores.get(_score_key, 0.0)
 
-    if WAKE_DEBUG and score >= _DEBUG_SCORE_FLOOR:
+    if WAKE_DEBUG and score >= WAKE_SCORE_FLOOR:
         hit = "HIT" if score >= WAKE_THRESHOLD else "   "
-        print(f"[wake] {hit} {_score_key}={score:.3f} (threshold {WAKE_THRESHOLD})")
+        print(f"[wake] {hit} {_score_key}={score:.4f} (threshold {WAKE_THRESHOLD})")
 
     return score >= WAKE_THRESHOLD
 
