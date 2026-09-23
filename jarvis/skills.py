@@ -11,7 +11,10 @@ import subprocess
 import threading
 import time
 import webbrowser
+from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
+from typing import Callable
 
 from jarvis import db, memory, speaker, text
 from jarvis.config import SKILL_APPS, SKILL_SITES
@@ -268,6 +271,98 @@ def _handle_memory_recall(raw_text: str) -> str | None:
     return " ".join(hits[:MEMORY_RECALL_LIMIT])
 
 
+class Permission(Enum):
+    """Deny-by-default is a later step (Phase 4's policy layer); every skill
+    below is registered SAFE for now, so this enum is otherwise inert."""
+
+    SAFE = "safe"
+    CONFIRM = "confirm"
+    BLOCKED = "blocked"
+
+
+@dataclass(frozen=True)
+class Skill:
+    """One entry in SKILLS. `phrases` documents what the skill responds to;
+    it is not itself the dispatch mechanism -- matching style already varies
+    per skill (substring-in-list, single-keyword-then-parse, memory.py's own
+    regex ladder), and this registry doesn't unify that. `input` says which
+    text variant `handler` expects: "norm" (normalized) or "raw"."""
+
+    name: str
+    phrases: tuple[str, ...]
+    description: str
+    permission: Permission
+    handler: Callable[[str], str | None]
+    input: str = "norm"
+
+
+# Order matches the ladder `handle()` used before this registry existed, and
+# is load-bearing: shutdown first so "κλείσε" can never be intercepted,
+# memory_save before memory_recall since their trigger phrases overlap. See
+# CLAUDE.md "Skills".
+SKILLS: list[Skill] = [
+    Skill(
+        "shutdown",
+        SHUTDOWN_PHRASES,
+        "Shuts Jarvis down.",
+        Permission.SAFE,
+        _handle_shutdown,
+        "norm",
+    ),
+    Skill(
+        "memory_save",
+        (),
+        "Saves a spoken note/reminder/exam/course/profile fact/business "
+        "note to memory. Real triggers live in memory.parse()'s pattern "
+        "ladder, not here.",
+        Permission.SAFE,
+        _handle_memory_save,
+        "raw",
+    ),
+    Skill(
+        "memory_recall",
+        MEMORY_RECALL_PHRASES,
+        "Answers a question from saved memory.",
+        Permission.SAFE,
+        _handle_memory_recall,
+        "raw",
+    ),
+    Skill(
+        "timer",
+        (TIMER_KEYWORD,),
+        "Starts a spoken countdown timer.",
+        Permission.SAFE,
+        _handle_timer,
+        "norm",
+    ),
+    Skill(
+        "time",
+        TIME_PHRASES,
+        "Says the current time.",
+        Permission.SAFE,
+        _handle_time,
+        "norm",
+    ),
+    Skill(
+        "date",
+        DATE_PHRASES,
+        "Says today's date.",
+        Permission.SAFE,
+        _handle_date,
+        "norm",
+    ),
+    Skill(
+        "open_site_or_app",
+        (OPEN_VERB,),
+        "Opens a configured website or local app by name (SKILL_SITES/"
+        "SKILL_APPS in config.py).",
+        Permission.SAFE,
+        _handle_open,
+        "norm",
+    ),
+]
+
+
 def is_conversation_end(text: str) -> bool:
     """True if text asks to leave conversation mode (not to shut down).
 
@@ -286,18 +381,16 @@ def handle(text: str) -> str | None:
     norm = _normalize(text)
 
     t0 = time.perf_counter()
-    # Shutdown stays first so "κλείσε" can never be intercepted. The two
-    # memory handlers take the raw text, not norm: a note is stored the way
+    # Dispatches through SKILLS in order, first non-None reply wins -- same
+    # short-circuit behavior as the old `or`-chain this replaced. The two
+    # memory skills take the raw text, not norm: a note is stored the way
     # it was said, accents and capitals included.
-    reply = (
-        _handle_shutdown(norm)
-        or _handle_memory_save(text)
-        or _handle_memory_recall(text)
-        or _handle_timer(norm)
-        or _handle_time(norm)
-        or _handle_date(norm)
-        or _handle_open(norm)
-    )
+    reply = None
+    for skill in SKILLS:
+        arg = text if skill.input == "raw" else norm
+        reply = skill.handler(arg)
+        if reply is not None:
+            break
 
     if reply is not None:
         print(f"[timing] Skill match: {time.perf_counter() - t0:.3f}s")
