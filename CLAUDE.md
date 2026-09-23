@@ -497,6 +497,30 @@ Four things about it are deliberate:
   `voice` from `voice_fuzzy`, which is the evidence for retuning later.
   Known boundary, pinned by a test: adjacency means «σταμάτα *τώρα* τα
   πάντα» misses — as it did before this change too.
+- **A third rung catches the verb spoken alone** (`policy.bare_kill()`,
+  tried only when both of the above miss). Two live «σταμάτα τα πάντα»
+  reached Whisper as «Πάγωσα» — the object gone from the transcript
+  entirely rather than mangled inside it, so `fuzzy_kill()` had nothing to
+  confirm the verb against and correctly stayed silent. Not a truncated
+  recording either: those turns held 2.56s and 4.40s of audio against the
+  ~1.4s a cut-short one stops at, so the words were said and the
+  transcription lost them.
+
+  With no object to confirm against, **the guard is the shape of the
+  utterance: the verb and nothing else**, anchored at the start and
+  required to reach the end. Same idiom as bare `"τέλος"` in
+  `is_conversation_end()`. A leading «Τζάρβις» is skipped first (matched
+  fuzzily, and in Latin too — Whisper mangles the name like any other
+  ending), so «Τζάρβις, πάγωσε» still counts as bare.
+
+  **Only `πάγωσ` is on this rung, and that is the design.** A bare
+  «σταμάτα» is how you interrupt Jarvis mid-reply and is pinned as a
+  negative; freezing everything for the commonest barge-in there is would
+  be a worse failure than the one this fixes. «πάγωσε» alone has no
+  competing reading — nothing else in the skill set freezes anything.
+  Logged as `voice_bare`, so all three rungs stay separable in the audit
+  log. Known boundary: a *trailing* «πάγωσε Τζάρβις» misses, since only a
+  leading address is skipped.
 - **There is no voice unlock.** Only `python -m jarvis.policy unlock` (or
   `:policy unlock` at the Enter prompt), or a restart. A spoken unlock would
   defeat the point.

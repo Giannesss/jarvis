@@ -198,6 +198,85 @@ class FuzzyKillSwitchTests(PolicyTestCase):
         self.assertEqual(row["reason"], "voice_fuzzy")
 
 
+class BareKillSwitchTests(PolicyTestCase):
+    """The kill switch when Whisper transcribed the verb and nothing else.
+
+    Two live «σταμάτα τα πάντα» came back as «Πάγωσα»: the object absent from
+    the transcript rather than mangled within it, so fuzzy_kill() had nothing
+    to confirm the verb against. Not a short recording either -- those turns
+    held 2.56s and 4.40s of audio against the ~1.4s a truncated one stops at.
+
+    With the object gone, the guard is the shape of the utterance: the verb
+    and nothing else. The negatives below are what that buys, and the first
+    of them is the one that shaped the rule.
+    """
+
+    POSITIVES = (
+        "Πάγωσα",            # the live transcription, twice
+        "Πάγωσε",            # and how it was actually said
+        "πάγωσα.",           # Whisper punctuates
+        "Πάγωσα!",
+        "Τζάρβις, πάγωσε",   # addressed by name
+        "Τζάρβις πάγωσε",
+        "Jarvis, πάγωσε",    # which it writes in Latin about as often
+        "τζάρβη πάγωσε",     # and mangles like any other ending
+    )
+
+    NEGATIVES = (
+        # The one that decided the design: a bare «σταμάτα» is how you
+        # interrupt Jarvis mid-reply, and it must not freeze everything.
+        "σταμάτα",
+        "πάγωσε το ψυγείο",
+        "πάγωσε ο υπολογιστής",
+        "πάγωσε η οθόνη",
+        "πάγωσα το νερό",
+        "βάλε μου παγωτό",
+        "παγωτό",
+        "Τζάρβις",           # the address alone leaves no verb
+        "σταμάτα τη μουσική",
+    )
+
+    def test_the_bare_verb_freezes(self) -> None:
+        for phrase in self.POSITIVES:
+            with self.subTest(phrase=phrase):
+                _reset_frozen()
+                self.assertEqual(skills.handle(phrase), policy.FREEZE_REPLY)
+                self.assertTrue(policy.is_frozen())
+
+    def test_a_verb_with_any_other_object_does_not(self) -> None:
+        for phrase in self.NEGATIVES:
+            with self.subTest(phrase=phrase):
+                _reset_frozen()
+                skills.handle(phrase)
+                self.assertFalse(policy.is_frozen(), phrase)
+
+    def test_the_shape_is_the_guard_not_the_budget(self) -> None:
+        # Same verb, same ending, same budget: all that separates these is
+        # whether anything else was said. That is the whole rule.
+        self.assertTrue(policy.bare_kill(normalize("πάγωσε")))
+        self.assertFalse(policy.bare_kill(normalize("πάγωσε το ψυγείο")))
+
+    def test_stamata_is_deliberately_not_a_bare_verb(self) -> None:
+        # Pinned so that widening this later is a decision someone makes on
+        # purpose, with the barge-in cost in front of them, rather than a
+        # side effect of adding a verb to the tuple.
+        self.assertFalse(policy.bare_kill(normalize("σταμάτα")))
+        self.assertFalse(policy.bare_kill(normalize("σταμάτησε")))
+
+    def test_a_bare_freeze_is_logged_as_such(self) -> None:
+        skills.handle("Πάγωσα")
+        row = self.audit()[-1]
+        self.assertEqual(row["action"], "kill_switch")
+        self.assertEqual(row["decision"], "frozen")
+        self.assertEqual(row["reason"], "voice_bare")
+
+    def test_the_exact_and_fuzzy_paths_still_win_the_audit_row(self) -> None:
+        # bare_kill() is checked last, so a phrase that matched earlier is
+        # logged by the evidence that actually matched it.
+        skills.handle("πάγωσε τα πάντα")
+        self.assertEqual(self.audit()[-1]["reason"], "voice")
+
+
 class FrozenBehaviourTests(PolicyTestCase):
     def test_frozen_refuses_an_ordinary_skill(self) -> None:
         skills.handle("σταμάτα τα πάντα")

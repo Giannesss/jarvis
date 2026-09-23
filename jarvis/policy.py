@@ -31,7 +31,13 @@ from enum import Enum
 from typing import Callable
 
 from jarvis import db
-from jarvis.text import SHUTDOWN_PHRASES, fuzzy_word, match_core, normalize
+from jarvis.text import (
+    SEPARATORS,
+    SHUTDOWN_PHRASES,
+    fuzzy_word,
+    match_core,
+    normalize,
+)
 
 # --- Vocabularies ----------------------------------------------------------
 #
@@ -48,6 +54,7 @@ REASONS = (
     "kill_switch",
     "voice",
     "voice_fuzzy",  # the kill switch, matched through a mangled transcription
+    "voice_bare",   # the kill switch, spoken as the bare verb (no object said)
     "cli",
     "restart",
 )
@@ -205,6 +212,81 @@ def fuzzy_kill(norm: str) -> bool:
     return False
 
 
+# --- The kill switch, spoken as the bare verb ------------------------------
+#
+# Two live «σταμάτα τα πάντα» reached Whisper as «Πάγωσα» -- the object gone
+# from the transcript entirely rather than mangled inside it, so fuzzy_kill()
+# had nothing to confirm the verb against and correctly stayed silent. This
+# is not the recording being cut short: those turns held 2.56s and 4.40s of
+# audio, well past the ~1.4s a truncated one stops at (ONSET_SECONDS of
+# speech, then SILENCE_DURATION of silence). The words were spoken and the
+# transcription lost them, which no amount of matching downstream can undo.
+#
+# So what replaces the object as the guard is the *shape* of the utterance:
+# the verb and nothing else. Same idiom as skills.is_conversation_end(),
+# where bare "τέλος" matches only as a whole utterance while "τέλος Τζάρβις"
+# matches anywhere -- and for the same reason, that «στο τέλος της μέρας»
+# must not end the conversation. Anchored at 0 and required to reach the end,
+# «πάγωσε το ψυγείο» and «πάγωσε ο υπολογιστής» cannot reach it: they are the
+# verb plus an object, and the object is not «τα πάντα».
+#
+# **Only πάγωσ is here, and that is the whole design.** A bare «σταμάτα» is
+# the natural way to interrupt Jarvis mid-reply -- it is pinned as a negative
+# in tests/test_policy.py -- and freezing everything for the commonest
+# barge-in there is would be a worse failure than the one this fixes.
+# «πάγωσε» alone has no competing reading: nothing else in the skill set
+# freezes anything, so there is nothing else it could have meant.
+_BARE_KILL = tuple(
+    (normalize(core), tuple(normalize(end) for end in endings), budget)
+    for core, endings, budget in (
+        # Both endings are observed, not guessed: «Πάγωσε» is how it is said
+        # and «Πάγωσα» is how it came back. The budget stays at fuzzy_kill's
+        # 2 because the asymmetry is unchanged -- a miss is the switch failing
+        # when it was needed -- and the whole-utterance shape, not the budget,
+        # is what keeps it honest.
+        ("πάγωσ", ("ε", "α"), 2),
+    )
+)
+
+# Sentence-final marks normalize() leaves behind, on top of text.SEPARATORS
+# (which fuzzy_word already stops at). Trimmed from both ends so «Πάγωσα.»
+# and «Πάγωσα!» are still nothing but the verb.
+_EDGE = SEPARATORS + "!;"
+
+# Whisper mangles the name the same way it mangles the verbs -- «τζάρβη» is
+# one of its spellings -- and writes it in Latin about as often as in Greek.
+_ADDRESS_CORE = normalize("τζάρβ")
+_ADDRESS_ENDINGS = tuple(normalize(end) for end in ("ις", "η"))
+_ADDRESS_LATIN = "jarvis"
+
+
+def _strip_address(norm: str) -> str:
+    """Drop a leading «Τζάρβις», so addressing him by name still leaves the
+    bare verb. Returns the text unchanged when there is no address."""
+    end = fuzzy_word(norm, _ADDRESS_CORE, _ADDRESS_ENDINGS, 2)
+    if end is None and norm.startswith(_ADDRESS_LATIN):
+        end = len(_ADDRESS_LATIN)
+    if end is None:
+        return norm
+    return norm[end:].strip(_EDGE)
+
+
+def bare_kill(norm: str) -> bool:
+    """Whether the utterance is the freeze verb and nothing else.
+
+    Only consulted when both _KILL_RE and fuzzy_kill() miss. See the note
+    above for why the whole-utterance shape stands in for the object, and why
+    «σταμάτα» is deliberately not one of these verbs.
+    """
+    stripped = _strip_address(norm.strip(_EDGE))
+
+    for core, endings, budget in _BARE_KILL:
+        end = fuzzy_word(stripped, core, endings, budget)
+        if end is not None and not stripped[end:].strip(_EDGE):
+            return True
+    return False
+
+
 _FROZEN_KEY = "frozen"
 
 # Cache of the flag below, and the fallback when the database cannot be read.
@@ -317,6 +399,13 @@ def intercept(norm: str) -> str | None:
 
     if fuzzy_kill(norm):
         freeze("voice_fuzzy")
+        return FREEZE_REPLY
+
+    # Last, so the audit row always names the strongest evidence that matched:
+    # the phrase as said, then the phrase with a mangled verb, then the verb
+    # alone with the object never transcribed at all.
+    if bare_kill(norm):
+        freeze("voice_bare")
         return FREEZE_REPLY
 
     if not is_frozen():
