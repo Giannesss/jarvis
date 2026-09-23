@@ -137,8 +137,12 @@ confident wrong one.
 
 `WAKE_DEBUG=true` prints detection scores (including near-misses below the
 threshold, for tuning), the mic level once a second while waiting for speech,
-and a stopped-because line carrying the invariant: audio seconds, wall
-seconds, and seconds lost to holes. The `[timing] Recording` line always
+a heartbeat every 5s while waiting for the wake word, and a stopped-because
+line carrying the invariant: audio seconds, wall seconds, and seconds lost to
+holes. `WAKE_SCORE_FLOOR` (0.001) is the lowest score worth printing; it was
+0.1, which hid the only interesting failure, since a wake word spoken into a
+freshly reset model scores ~0.000 rather than ~0.05. Set it to 0 to print
+every scored frame. The `[timing] Recording` line always
 prints both clocks — `4.24s wall / 3.04s audio` — because the wall-clock
 number alone is what hid a 43-second recording and a 0.05-second one for
 hours.
@@ -247,10 +251,60 @@ handed it over immediately afterwards. The floor drops that second wherever
 it is sitting, while anything recorded *after* the flush survives — which
 draining could never manage.
 
-**openWakeWord gets a `reset()` on every hole.** It scores each frame from
-the ~1.5s of audio before it, so audio welded across a hole leaves that
-window holding two different moments spliced together. The retrigger
-cooldown restarts with it, since the buffer is empty either way.
+**openWakeWord gets a `reset()` on every hole — but a reset is expensive,
+so the holes worth resetting for are the ones that are left.** It scores
+each frame from the ~1.5s of audio before it, so audio welded across a hole
+leaves that window holding two different moments spliced together.
+
+The cost is not a degraded score, it is no score at all. `reset()` reseeds
+the model's 16-frame window with embeddings of *four seconds of random
+noise* (`openwakeword/utils.py`), and a wake word spoken into that window
+scores ~0.000 rather than merely low. Measured by replaying
+`data/wake_probe.wav`: utterances that score 0.999 clean score **0.000**
+when a reset lands under ~0.5s before them, and recover only at ~0.96s.
+That is a full second of deafness, and the old debug floor of 0.1 printed
+nothing for it — a swallowed wake word and a wake word never spoken were
+the same empty log.
+
+So the reset is now reserved for holes that mean what it assumes. Two
+changes:
+
+- **`listen_for_wake_word()` calls `flush()` on entry, not `_drain()`.**
+  This was the only transition that emptied the queues without raising
+  `_capture_floor`, and that asymmetry manufactured a hole every single
+  cycle. Draining alone leaves ffmpeg holding ~1s of already-recorded
+  audio; it arrives immediately afterwards and is accepted, because the
+  floor still sits where the previous turn left it. Those stale frames set
+  `last_ts`, and then the frames the capture gate dropped while
+  `beep_done()` sounded — 0.16s of beep plus `speaker.ECHO_PAD` (0.4s), a
+  stable **0.56s**, seven frames — read as a hole. The model was reset at
+  the exact moment the beep told the user to speak. Raising the floor drops
+  those leftovers instead, so the first accepted frame is live audio with
+  `last_ts` still `None` and no hole to find. It costs nothing: the
+  leftovers are the last second of an expired conversation timeout, silent
+  by definition, and the reset threw them away seven frames later anyway.
+- **The retrigger cooldown no longer restarts on a hole.** It exists to stop
+  the wake word that just fired from firing again out of the model's own
+  buffer. After a hole nothing was just spoken, so there is nothing to
+  suppress — and a freshly reset window scores ~0.000, not spuriously high,
+  so it cannot re-fire on its own either. Restarting it bought no protection
+  and cost another ~1s on top of the reset's.
+
+If a structural hole ever comes back, the fallback is to skip the reset when
+`_frames_gated` fully accounts for the missing frames — keyed to that
+counter, never to a duration, which drifts the moment `ECHO_PAD` or a beep
+length changes. `_gap_blame()` already computes it.
+
+**Which is why a hole now says who took it.** A frame can go missing three
+ways and they are identical by the time a consumer notices: the capture gate
+refused it (`_frames_gated`), the queue overran and `_enqueue_bounded`
+dropped the oldest to make room (`_frames_evicted`, otherwise completely
+silent), or ffmpeg never produced it. `_gap_blame()` turns the two counters
+into the answer, and the gap line carries where in the wait the hole opened,
+which separates a structural one at the start of a cycle from one that opens
+mid-wait. A 5s heartbeat reports that the wait is still being fed; it is
+checked *before* the `get()`, so it still prints when the queue has starved
+entirely — which is one of the answers it exists to give.
 
 ## Conversation mode
 

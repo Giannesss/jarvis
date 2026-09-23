@@ -446,10 +446,18 @@ class WakeWordGapTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-        # listen_for_wake_word() drains both queues on entry, deliberately: a
-        # backlog from the previous turn is not fresh audio. Here the queue
-        # *is* the fresh audio, handed over up front, so the drain is stubbed.
+        # listen_for_wake_word() flushes on entry, deliberately: a backlog
+        # from the previous turn is not fresh audio. Here the queue *is* the
+        # fresh audio, handed over up front, so the drain half is stubbed.
         patcher = mock.patch.object(listener, "_drain")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        # The watermark half needs an origin to compute a floor from; with
+        # none, flush() leaves _capture_floor alone and every frame below is
+        # accepted on its own timestamp. The one test that cares about the
+        # floor sets an origin itself.
+        patcher = mock.patch.object(listener, "_stream_origin", None)
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -476,19 +484,51 @@ class WakeWordGapTests(unittest.TestCase):
         # Once on entry, once at the hole, once after firing.
         self.assertEqual(self.wakeword.reset.call_count, 3)
 
-    def test_a_detection_inside_the_post_hole_cooldown_is_ignored(self) -> None:
-        # The model's buffer is empty right after a reset, so whatever it
-        # scores there is not a wake word anyone said. The 20 quiet frames
-        # first put the entry cooldown well behind us, so what this pins is
-        # the hole restarting it -- without that, frame 21 would fire.
+    def test_a_detection_after_a_hole_is_not_suppressed(self) -> None:
+        """The inverse of what this used to pin, and deliberately so.
+
+        A hole used to restart WAKE_RETRIGGER_COOLDOWN along with the reset.
+        That cooldown exists to stop the wake word that just *fired* from
+        firing again out of the model's own buffer; after a hole nothing was
+        just spoken, so there is nothing to suppress — and a freshly reset
+        window scores ~0.000 rather than spuriously high, so it cannot
+        re-fire on its own either. Restarting it bought no protection and
+        cost ~1s of deafness on top of the reset's own.
+        """
         cooldown = int(listener.WAKE_RETRIGGER_COOLDOWN / FRAME)
-        frames = stream(0.0, "." * 20)
+        frames = stream(0.0, "." * 20)  # puts the entry cooldown behind us
         frames += stream(20 * FRAME + 2.0, "." * (cooldown - 2))  # after a 2s hole
 
         self.wakeword.detect.side_effect = [i >= 20 for i in range(len(frames))]
 
-        with self.assertRaises(RuntimeError):  # ran out of frames, never fired
-            self.run_wake_word(frames)
+        self.run_wake_word(frames)  # fires; no RuntimeError from running dry
+
+    def test_the_entry_flush_drops_leftovers_so_a_beep_hole_never_appears(self) -> None:
+        """The reason listen_for_wake_word() flushes instead of draining.
+
+        Shaped like the real thing. Returning to wake-listening after
+        beep_done(), ffmpeg still holds ~1s of audio recorded *before* the
+        beep; it arrives right after entry. Draining alone left the floor
+        where the previous turn put it, so those stale frames were accepted
+        and set last_ts — and the frames the capture gate dropped while the
+        beep sounded (0.16s of beep + 0.4s of ECHO_PAD = 7 frames) then read
+        as a hole, resetting the model at the exact moment the beep told the
+        user to speak. Raising the floor drops the leftovers instead, so the
+        first accepted frame is live audio with last_ts still None.
+        """
+        floor = 5.0
+        with mock.patch.object(listener, "_stream_origin", time.perf_counter() - floor):
+            leftovers = stream(floor - 12 * FRAME, "." * 12)  # stale: below the floor
+            live = stream(floor + 7 * FRAME, "." * 20)  # after the gated beep window
+
+            # One entry per *accepted* frame: detect() is never reached for a
+            # frame below the floor, which is the whole point being pinned.
+            self.wakeword.detect.side_effect = [i == len(live) - 1 for i in range(len(live))]
+
+            out = self.run_wake_word(leftovers + live)
+
+        self.assertEqual(self.wakeword.reset.call_count, 2)  # entry + firing only
+        self.assertTrue(out)
 
     def test_a_contiguous_stream_is_never_reset_mid_listen(self) -> None:
         frames = stream(0.0, "." * 20)

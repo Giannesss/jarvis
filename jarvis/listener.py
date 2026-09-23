@@ -700,19 +700,40 @@ def listen_for_wake_word() -> bytes:
     beep on, acknowledge() flushes instead and the pre-roll is discarded,
     since it necessarily contains the wake word.
 
-    Both queues are flushed on entry so a backlog from the previous turn
-    isn't treated as fresh audio, and the model is reset — openWakeWord
-    scores each frame from the ~1.5s before it, so without a reset the
-    wake word still sitting in its buffer re-fires immediately. Frames are
-    fed but detections ignored for WAKE_RETRIGGER_COOLDOWN after that
-    reset, giving the emptied buffer time to refill with fresh audio."""
+    flush() on entry — a watermark, not just a drain — so a backlog from
+    the previous turn isn't treated as fresh audio, and the model is reset:
+    openWakeWord scores each frame from the ~1.5s before it, so without a
+    reset the wake word still sitting in its buffer re-fires immediately.
+    Frames are fed but detections ignored for WAKE_RETRIGGER_COOLDOWN after
+    that reset, giving the emptied buffer time to refill with fresh audio."""
     audio_queue = _stream_audio_queue
     stderr_queue = _stream_stderr_queue
     if audio_queue is None or stderr_queue is None:
         raise RuntimeError("Wake-word stream not started; call start_stream() first.")
 
-    _drain(audio_queue)
-    _drain(stderr_queue)
+    # flush(), not _drain(): this was the only transition that emptied the
+    # queues without raising _capture_floor, and that asymmetry was the bug.
+    # Draining alone leaves ffmpeg holding ~1s of already-recorded audio,
+    # which arrives immediately afterwards and is accepted because the floor
+    # still sits where the previous turn left it. Those stale frames set
+    # last_ts — and then the frames the capture gate dropped while the beep
+    # sounded (beep + speaker.ECHO_PAD) read as a hole, resetting the model
+    # at the exact moment the beep told the user to speak. Measured cost of
+    # that reset: a wake word that scores 0.999 clean scores 0.000 inside
+    # the ~1s it takes the window to refill.
+    #
+    # Raising the floor drops those leftovers instead, so the first accepted
+    # frame is live audio with last_ts still None and no hole to find. It
+    # costs nothing: the leftovers are the last second of an expired
+    # conversation timeout (silence by definition, or the reset threw them
+    # away seven frames later anyway), and priming still starts from the
+    # first live frame either way.
+    #
+    # Fallback if this proves insufficient: skip the reset when the hole is
+    # fully accounted for by _frames_gated — keyed to the counter, never to
+    # a duration, which drifts the moment ECHO_PAD or a beep length
+    # changes. _gap_blame already computes exactly that.
+    flush()
     wakeword.reset()
 
     preroll: "collections.deque[bytes]" = collections.deque(maxlen=PREROLL_FRAMES)
@@ -764,11 +785,19 @@ def listen_for_wake_word() -> bytes:
             continue  # recorded before the last flush; stale by definition
 
         if last_ts is not None and ts - last_ts > FRAME_SECONDS + GAP_TOLERANCE:
-            # Frames are missing (Jarvis was talking, or the queue overran).
-            # openWakeWord scores each frame from the ~1.5s of audio before
-            # it, so feeding it audio welded across a hole leaves that window
-            # holding two different moments spliced together. The buffer is
-            # invalid either way, so clear it and re-serve the cooldown.
+            # A hole that survived the entry flush: the queue overran, or
+            # ffmpeg/the driver stopped producing. openWakeWord scores each
+            # frame from the ~1.5s of audio before it, so feeding it audio
+            # welded across a hole leaves that window holding two different
+            # moments spliced together. The buffer is invalid, so clear it.
+            #
+            # The cooldown is deliberately *not* re-served with it. It exists
+            # to stop the wake word that just fired from firing again out of
+            # the model's own buffer; after a hole nothing was just spoken,
+            # so there is nothing to suppress — and a freshly reset window
+            # scores ~0.000, not spuriously high, so it cannot re-fire on its
+            # own either. Restarting it here bought no protection and cost
+            # another ~1s of deafness on top of the reset's.
             gap = ts - last_ts - FRAME_SECONDS
             missing = int(round(gap / FRAME_SECONDS))
             gaps_seen += 1
@@ -784,7 +813,6 @@ def listen_for_wake_word() -> bytes:
             )
             wakeword.reset()
             preroll.clear()
-            frames_seen = 0
 
         if first_ts is None:
             first_ts = ts
