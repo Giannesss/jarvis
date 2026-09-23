@@ -27,6 +27,18 @@ _NO_PRETRAINED = "__custom__"
 _model: Any | None = None
 _score_key: str | None = None
 
+# Frames scored since the last reset(), printed beside each score under
+# WAKE_DEBUG. The score alone cannot answer the question the log is asked
+# most often — "was that one utterance or several?" — because a hit is a
+# *ramp*, not a spike: measured on data/wake_probe.csv, every one of nine
+# clean detections rose 0.03 -> 0.30 -> 0.71 -> 0.98 over 4-5 frames and
+# spanned 11 frames (0.88s) above the debug floor. A climb is therefore the
+# normal shape and says nothing on its own. Consecutive indices mean one
+# utterance; a jump between them means silence the floor hid. (12.5 frames
+# to the second; FRAME_SECONDS itself lives in listener.py, which imports
+# this module, so it is not imported back.)
+_frames_since_reset = 0
+
 
 def _get_model() -> Any:
     global _model, _score_key
@@ -66,21 +78,31 @@ def _get_model() -> Any:
 
 
 def _detect_openwakeword(frame: bytes) -> bool:
+    global _frames_since_reset
+
     import numpy as np
 
     model = _get_model()
     audio = np.frombuffer(frame, dtype=np.int16)
     scores = model.predict(audio)
     score = scores.get(_score_key, 0.0)
+    _frames_since_reset += 1
 
     if WAKE_DEBUG and score >= WAKE_SCORE_FLOOR:
         hit = "HIT" if score >= WAKE_THRESHOLD else "   "
-        print(f"[wake] {hit} {_score_key}={score:.4f} (threshold {WAKE_THRESHOLD})")
+        print(
+            f"[wake] {hit} {_score_key}={score:.4f} "
+            f"f{_frames_since_reset} (threshold {WAKE_THRESHOLD})"
+        )
 
     return score >= WAKE_THRESHOLD
 
 
 def _reset_openwakeword() -> None:
+    global _frames_since_reset
+
+    _frames_since_reset = 0
+
     # Only if the model was actually loaded: resetting is pointless before
     # the first detect() call and would trigger the download/load early.
     if _model is not None:

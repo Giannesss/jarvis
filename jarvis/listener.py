@@ -17,6 +17,7 @@ from faster_whisper import WhisperModel
 
 from jarvis import wakeword
 from jarvis.config import (
+    DATA_DIR,
     MAX_RECORD_SECONDS,
     NO_SPEECH_TIMEOUT,
     SILENCE_DURATION,
@@ -934,6 +935,65 @@ class _StopDecider:
         return None
 
 
+def _report_empty_transcription(info, audio: bytes) -> None:
+    """Say why Whisper returned nothing, for a recording that had speech in it
+    by _StopDecider's reckoning.
+
+    An empty result that comes back in ~0.07s is not a failed transcription;
+    it is a transcription that never ran. faster_whisper's vad_filter=True
+    runs Silero over the whole WAV *before* the encoder, keeps only the
+    windows it calls speech, and concatenates them — and when it keeps none,
+    collect_chunks() hands back an empty array (vad.py:193), so the decoder
+    is handed zero samples and yields zero segments. Decoding even one
+    second of Greek on small/int8 costs the better part of a second, so a
+    sub-100ms empty result can only mean duration_after_vad == 0.
+
+    That is the number this prints, and it splits the two candidate causes
+    apart for good:
+
+      * duration > 0, duration_after_vad == 0 — the WAV was fine and Silero
+        rejected all of it. Something crossed SILENCE_THRESHOLD_DB for
+        ONSET_SECONDS without being speech: a desk knock, a breath on the
+        mic, a chair. _frame_db is blind to this by construction; it
+        measures loudness, and -35 dB of thump is -35 dB.
+      * duration itself tiny or zero — then the fault really is upstream,
+        in what this module assembled, and the dumped WAV says so.
+
+    The WAV is written out under WAKE_DEBUG so the question can be settled
+    by ear, and re-scored with tools/wake_score_probe.py --replay.
+    """
+    duration = getattr(info, "duration", 0.0)
+    after_vad = getattr(info, "duration_after_vad", 0.0)
+
+    verdict = (
+        "Whisper's VAD dropped all of it — loud enough for the floor, "
+        "not speech to Silero"
+        if duration and not after_vad
+        else "no audio reached Whisper at all"
+        if not duration
+        else "decoded but produced no text"
+    )
+    _debug(
+        f"[rec] nothing transcribed: {duration:.2f}s in, "
+        f"{after_vad:.2f}s survived VAD; {verdict}"
+    )
+
+    if not WAKE_DEBUG:
+        return
+
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        path = DATA_DIR / f"empty_{time.strftime('%Y%m%d_%H%M%S')}.wav"
+        with wave.open(str(path), "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(SAMPLE_RATE)
+            wav_file.writeframes(audio)
+        print(f"[rec] saved the audio to {path}")
+    except OSError as e:
+        _debug(f"[rec] could not save the audio: {e}")
+
+
 def record_command(
     preroll: bytes = b"",
     no_speech_timeout: float = NO_SPEECH_TIMEOUT,
@@ -1110,6 +1170,7 @@ def record_command(
 
         if not text:
             print("Δεν κατάλαβα τι είπες.")
+            _report_empty_transcription(info, bytes(audio))
             return None, stop_reason
 
         return text, stop_reason
