@@ -142,10 +142,10 @@ class NonInterferenceTests(MemorySkillTestCase):
 
     def test_timer_still_reaches_the_timer_skill(self) -> None:
         # "χρονόμετρο" sits after memory in the chain; memory must not eat it.
-        with mock.patch.object(skills.threading, "Timer", autospec=True) as timer:
+        with mock.patch.object(skills.scheduler, "schedule", autospec=True) as scheduled:
             reply = skills.handle("Βάλε ένα χρονόμετρο για δύο λεπτά")
         self.assertEqual(reply, "Ξεκίνησε το χρονόμετρο για 2 λεπτά.")
-        timer.assert_called_once()
+        scheduled.assert_called_once()
 
 
 class InjectionTests(MemorySkillTestCase):

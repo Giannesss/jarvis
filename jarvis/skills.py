@@ -8,12 +8,11 @@ and rarely matches a command phrase exactly. See CLAUDE.md "Skills".
 from __future__ import annotations
 
 import subprocess
-import threading
 import time
 import webbrowser
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from jarvis import db, memory, policy, speaker, text
+from jarvis import db, memory, policy, scheduler, text
 from jarvis import diag
 from jarvis.config import SKILL_APPS, SKILL_SITES
 
@@ -171,21 +170,20 @@ def _extract_unit(tokens: list[str]) -> tuple[int, int, str] | None:
 
 
 def _start_timer(seconds: int, number: int, label: str) -> None:
-    def _on_finish() -> None:
-        message = f"Το χρονόμετρο των {number} {label} τελείωσε!"
-        print(f"[timer] {message}")
-        try:
-            # speaker.speak() is serialized by a lock, so this waits its
-            # turn instead of overlapping if Jarvis is already talking.
-            speaker.speak(message)
-        except Exception as e:
-            print(f"Σφάλμα εκφώνησης χρονομέτρου: {e}")
+    """Persist the countdown instead of arming a threading.Timer.
 
-    timer = threading.Timer(seconds, _on_finish)
-    # Daemon: quitting Jarvis with a timer still pending shouldn't hang the
-    # process waiting for it to fire.
-    timer.daemon = True
-    timer.start()
+    A Timer object dies with the process, so «βάλε χρονόμετρο για 20 λεπτά»
+    used to evaporate on a restart -- silently, since nothing recorded that it
+    had ever been set. The row is what survives now; jarvis/scheduler.py
+    claims and announces it, within SCHEDULER_TICK of its due time, and its
+    announcement still goes through speaker.speak()'s lock so it waits its
+    turn rather than cutting across a reply.
+    """
+    scheduler.schedule(
+        f"Το χρονόμετρο των {number} {label} τελείωσε!",
+        datetime.now() + timedelta(seconds=seconds),
+        kind=scheduler.TIMER,
+    )
 
 
 def _handle_timer(norm_text: str) -> str | None:

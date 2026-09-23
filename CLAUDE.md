@@ -14,9 +14,9 @@ already built.
 
 **Current phase: Phase 4 — structure and safety.** Four steps: the skills
 registry (done), the policy layer and kill switch (done — see "Policy"), a
-durable scheduler for reminders and timers that survive a restart, and a
-tag/category column across the memory tables so "τι έχω σήμερα" can pull from
-every area at once.
+durable scheduler for reminders and timers that survive a restart (done — see
+"Scheduler"), and a tag/category column across the memory tables so "τι έχω
+σήμερα" can pull from every area at once.
 
 Phase 1 closed on 2026-09-23 (`docs/PHASE1_STATUS.md`): the beep-reset bug and
 the too-high silence floor are fixed and confirmed live, and the remaining
@@ -83,6 +83,8 @@ only falling back to the brain when a skill doesn't match (see "Skills").
 - `jarvis/diag.py` — the diagnostic log: every `[timing]`/`[rec]`/`[wake]`
   line the terminal prints, timestamped into `data/jarvis.log`. See
   "Diagnostics".
+- `jarvis/scheduler.py` — fires the `reminders` rows: claim, announce, and the
+  startup catch-up for what came due while Jarvis was off. See "Scheduler".
 - `jarvis/memory.py` — parsing speech into rows, and recalling rows as context.
 - `jarvis/mem.py` — `python -m jarvis.mem`, also backing `:mem` at the prompt.
 - `tools/wake_score_probe.py` — standalone wake-word diagnostic, not part of
@@ -399,7 +401,8 @@ carries an empty tuple for that reason: its real triggers are
 
 Implemented, in the order `handle()` tries them: shutting Jarvis down; saving
 to memory and reading it back (both in "Memory" below); a spoken timer that
-announces itself (print + `speaker.speak`) when it fires; current time / date;
+announces itself when it fires (a `reminders` row now, see "Scheduler");
+current time / date;
 and opening a website (`SKILL_SITES` in `config.py`) or a local app
 (`SKILL_APPS` in `config.py`) by name. Only the sites/apps listed in
 `config.py` can ever be opened — `skills.py` never builds a command from
@@ -413,10 +416,12 @@ Shutdown is signalled via a `skills.shutdown_requested` flag (set by the
 skill, checked by `main.py` after speaking the reply) rather than by
 `handle()`'s return value, since `handle()` is otherwise always `str | None`.
 
-Timers run on a daemon `threading.Timer` so a pending one can't hang process
-exit. `speaker.speak()` is guarded by a lock so a timer announcement firing
-while Jarvis is already talking waits its turn instead of cutting off or
-overlapping the current audio.
+A timer is a `reminders` row with `kind='timer'`, not a `threading.Timer`:
+a Timer object dies with the process, so «βάλε χρονόμετρο για 20 λεπτά» used
+to evaporate on a restart, silently, since nothing recorded it had ever been
+set. `jarvis/scheduler.py` announces it. `speaker.speak()` is still guarded by
+a lock, so an announcement firing while Jarvis is already talking waits its
+turn instead of cutting off or overlapping the current audio.
 
 ## Policy
 
@@ -596,6 +601,79 @@ about it are deliberate:
 Rotated at `LOG_MAX_BYTES` (2MB), keeping `LOG_KEEP` (3) old files, and
 each run opens with a `--- session start ---` banner so one session's lines
 can be told from the last one's. `LOG_ENABLED=false` turns it off entirely.
+
+## Scheduler
+
+`jarvis/scheduler.py` is the half of the `reminders` table that was
+missing. The columns — `due_at`, `kind`, `status`, `fired_at`, and the
+`(status, due_at)` index — existed from the day the table was written, and
+nothing ever fired them: `status` was only ever written as `"pending"` and
+`fired_at` never written at all. A reminder set for 5pm was stored and then
+surfaced only if the brain happened to be asked something that recalled it.
+
+`main()` calls `scheduler.start(speaker.speak)` after
+`policy.clear_on_startup()` — so a freeze left over from the last run can't
+swallow the catch-up — and `scheduler.stop()` in the same `finally` as
+`listener.stop_stream()`. Nothing here imports `speaker` or `listener`: the
+announcement is an injected callable, the same idiom as
+`policy.set_confirm_asker`, so the whole module is testable without a
+microphone.
+
+Four things about it are deliberate:
+
+- **It polls; it does not arm a timer per row.** A `threading.Timer` object
+  cannot survive a restart, which is the entire requirement. Polling also
+  means a reminder added from a second terminal, or edited with `:mem edit`,
+  is picked up on the next tick with no further wiring — the same WAL trick
+  `:mem` and `:policy unlock` already rely on. The thread holds **one**
+  connection for its lifetime, because `db.connect()` re-runs the whole
+  schema script on every call; that is what makes `SCHEDULER_TICK` (2s)
+  cheap enough to double as a timer's worst-case lateness.
+- **A row is claimed before it is announced**, by an `UPDATE` guarded on
+  `status = 'pending'`, and announced only if it changed exactly one row.
+  Two Jarvis processes against one database is a shape WAL mode deliberately
+  allows, and the loser of that race says nothing rather than repeating it.
+  Claims are taken while the connection is held and the announcements made
+  after it is released: speaking takes seconds, and holding a write
+  transaction across it would block `:mem` in the other terminal for just as
+  long.
+- **Claim first, speak second.** A crash in between loses that one
+  announcement. The other order risks the realistic failure instead: if
+  `speak()` is itself what is broken (no audio device), speaking before
+  marking would re-announce the same reminder every tick forever.
+- **A freeze stops the clock without eating it.** While the kill switch is
+  on, a tick claims nothing and announces nothing, so the rows are still
+  `pending` when it is lifted. Announcing would break the freeze; claiming
+  silently would make the freeze destroy data.
+
+### Catch-up
+
+`catch_up()` runs once at startup, on the caller's thread and before the
+loop, so what was missed is heard right after «Jarvis έτοιμος» rather than a
+tick later. Everything `pending` with `due_at <= now` is claimed as a third
+status, **`missed`** — distinct from `fired`, so `:mem list reminders` can
+tell "you were told this" from "this went by while Jarvis was off".
+
+It is announced as one sentence rather than fired one after another: five
+reminders replayed back to back on startup is a wall of speech nobody
+listens to. Only the newest `SCHEDULER_CATCHUP_LIMIT` (3) are read out, and
+**the bound is on what is spoken aloud, never on what is reported** — the
+rest are counted in the same sentence («και άλλες 2 υπενθυμίσεις») and every
+row stays in the table. An expired timer is counted but not replayed: a
+countdown from yesterday has no content worth hearing again, and it is still
+reported rather than dropped.
+
+**A future-dated row is never touched.** `due_at <= now` is the whole
+filter, so tomorrow's reminder is still `pending` after a catch-up and still
+there to fire tomorrow. This is the roadmap's "never silently drops a
+future-dated exam or deadline", and it is read as a constraint on the sweep
+rather than a request to fire exams: `exams` has a date-only `due_date` and
+no status column, and an exam is a fact `_due_today()` recalls, not an alarm.
+`tests/test_scheduler.py` pins both halves.
+
+No migration was involved. Every column already existed; `'fired'` and
+`'missed'` are new *data*, not new schema, so `SCHEMA_VERSION` stays at 2 —
+the same reasoning that let `audit` and `policy_state` arrive without a bump.
 
 ## Memory
 

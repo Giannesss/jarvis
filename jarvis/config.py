@@ -108,6 +108,16 @@ LOG_ENABLED = os.environ.get("LOG_ENABLED", "true").lower() == "true"
 LOG_MAX_BYTES = int(os.environ.get("LOG_MAX_BYTES", str(2 * 1024 * 1024)))
 LOG_KEEP = int(os.environ.get("LOG_KEEP", "3"))
 
+# The scheduler (jarvis/scheduler.py): reminders and timers that survive a
+# restart. SCHEDULER_TICK is how often the pending rows are checked, so it is
+# also the worst-case lateness of a timer -- the thread holds one connection
+# for its lifetime, which is what makes a tick this short cheap. Only the
+# newest SCHEDULER_CATCHUP_LIMIT missed reminders are read out at startup;
+# the rest are counted aloud and stay in the table as `missed`.
+SCHEDULER_ENABLED = os.environ.get("SCHEDULER_ENABLED", "true").lower() == "true"
+SCHEDULER_TICK = float(os.environ.get("SCHEDULER_TICK", "2"))
+SCHEDULER_CATCHUP_LIMIT = int(os.environ.get("SCHEDULER_CATCHUP_LIMIT", "3"))
+
 # Hard cap on how much remembered context is injected into a brain call.
 # Estimated at len(text)/3, which is conservative for Greek.
 MEMORY_TOKEN_BUDGET = int(os.environ.get("MEMORY_TOKEN_BUDGET", "300"))

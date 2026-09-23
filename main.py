@@ -1,7 +1,19 @@
 import shlex
 from typing import Callable
 
-from jarvis import brain, db, diag, listener, mem, memory, policy, skills, speaker, wakeword
+from jarvis import (
+    brain,
+    db,
+    diag,
+    listener,
+    mem,
+    memory,
+    policy,
+    scheduler,
+    skills,
+    speaker,
+    wakeword,
+)
 from jarvis.config import (
     CONVERSATION_MODE,
     CONVERSATION_TIMEOUT,
@@ -200,6 +212,11 @@ def main() -> None:
     policy.set_confirm_asker(_ask_confirm)
     listener.preload()
 
+    # After clear_on_startup(), so the catch-up is not swallowed by a freeze
+    # left over from the last run, and before the loop, so anything missed
+    # while Jarvis was off is heard right after "Jarvis έτοιμος".
+    scheduler.start(speaker.speak)
+
     _wake_word_active = WAKE_WORD_ENABLED
     if _wake_word_active:
         try:
@@ -261,6 +278,7 @@ def main() -> None:
             if skills.shutdown_requested:
                 break
     finally:
+        scheduler.stop()
         listener.stop_stream()  # always runs: Ctrl+C, exception, or normal exit
 
 

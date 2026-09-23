@@ -2,22 +2,24 @@
 conversation-end detection. See CLAUDE.md "Skills" for the matching rules
 these exercise (accent/case-insensitive substring matching).
 
-Importing jarvis.skills pulls in jarvis.speaker, but that no longer touches
-the disk: the Piper voice is a lazy singleton (speaker._get_voice), loaded on
-first use rather than at import, so this suite costs nothing to start and
-needs no model file present. See tests/test_speaker_lazy.py. webbrowser.open,
-subprocess.Popen and threading.Timer are mocked in every test that could
-reach them so nothing ever opens on screen or schedules a real callback.
+webbrowser.open, subprocess.Popen and scheduler.schedule are mocked in every
+test that could reach them, so nothing ever opens on screen or writes a row
+that would later be announced out loud.
+
+A timer used to be a threading.Timer armed in-process, which these tests
+patched directly; it is a `reminders` row now, so what they assert on is the
+due_at the skill scheduled. See jarvis/scheduler.py.
 """
 
 from __future__ import annotations
 
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
-from jarvis import db, policy, skills
+from jarvis import db, policy, scheduler, skills
 
 
 class SkillsTestCase(unittest.TestCase):
@@ -72,16 +74,36 @@ class NormalizationMatchingTests(SkillsTestCase):
 
 class TimerParsingTests(SkillsTestCase):
     def _patched_timer(self):
-        return mock.patch.object(skills.threading, "Timer", autospec=True)
+        return mock.patch.object(skills.scheduler, "schedule", autospec=True)
+
+    @staticmethod
+    def _scheduled_seconds(mock_schedule) -> int:
+        """How far ahead the skill scheduled the announcement.
+
+        The duration is no longer an argument anywhere -- it lives in the
+        due_at the row carries -- so the parsing tests read it back out of
+        that. Rounded because a few milliseconds pass between the skill
+        calling datetime.now() and this call.
+        """
+        due_at = mock_schedule.call_args[0][1]
+        return round((due_at - datetime.now()).total_seconds())
 
     def test_number_word_before_unit(self) -> None:
         with self._patched_timer() as mock_timer:
             reply = skills.handle("Βάλε ένα χρονόμετρο για δύο λεπτά")
         self.assertEqual(reply, "Ξεκίνησε το χρονόμετρο για 2 λεπτά.")
         mock_timer.assert_called_once()
-        seconds = mock_timer.call_args[0][0]
-        self.assertEqual(seconds, 120)
-        mock_timer.return_value.start.assert_called_once()
+        self.assertEqual(self._scheduled_seconds(mock_timer), 120)
+
+    def test_the_timer_is_scheduled_as_a_durable_row(self) -> None:
+        """The point of the change: a timer outlives the process that set it,
+        so the countdown is a row rather than a threading.Timer."""
+        with self._patched_timer() as mock_timer:
+            skills.handle("Βάλε ένα χρονόμετρο για δύο λεπτά")
+
+        text, _due_at = mock_timer.call_args[0]
+        self.assertEqual(text, "Το χρονόμετρο των 2 λεπτά τελείωσε!")
+        self.assertEqual(mock_timer.call_args[1]["kind"], scheduler.TIMER)
 
     def test_closest_number_wins_over_farther_one(self) -> None:
         # "ένα" belongs to "χρονόμετρο", not the duration; "δύο" (closer to
@@ -95,7 +117,7 @@ class TimerParsingTests(SkillsTestCase):
         with self._patched_timer() as mock_timer:
             reply = skills.handle("χρονόμετρο για 5 λεπτά")
         self.assertEqual(reply, "Ξεκίνησε το χρονόμετρο για 5 λεπτά.")
-        self.assertEqual(mock_timer.call_args[0][0], 300)
+        self.assertEqual(self._scheduled_seconds(mock_timer), 300)
 
     def test_seconds_stem_checked_before_minutes_stem(self) -> None:
         # "δευτερόλεπτα" contains "λεπτ" as a substring; _TIMER_UNITS must
@@ -103,7 +125,7 @@ class TimerParsingTests(SkillsTestCase):
         with self._patched_timer() as mock_timer:
             reply = skills.handle("χρονόμετρο για δέκα δευτερόλεπτα")
         self.assertEqual(reply, "Ξεκίνησε το χρονόμετρο για 10 δευτερόλεπτα.")
-        self.assertEqual(mock_timer.call_args[0][0], 10)
+        self.assertEqual(self._scheduled_seconds(mock_timer), 10)
 
     def test_no_unit_asks_for_clarification(self) -> None:
         with self._patched_timer() as mock_timer:
