@@ -17,8 +17,21 @@ BRAIN_PROVIDER = os.environ.get("BRAIN_PROVIDER", "ollama")
 TTS_ENGINE = os.environ.get("TTS_ENGINE", "edge")
 TTS_VOICE = os.environ.get("TTS_VOICE", "el-GR-NestorasNeural")
 
-# Recording silence detection (see jarvis/listener.py).
-SILENCE_THRESHOLD_DB = -35  # ffmpeg silencedetect noise floor, in dB
+# Recording silence detection (see jarvis/listener.py). The floor separating
+# speech from room noise, in dBFS: _StopDecider compares each 80ms frame's RMS
+# against it, and ffmpeg's silencedetect takes the same number.
+#
+# -35 was too high for this microphone. Measured over data/wake_probe.csv (890
+# frames, one session): speech runs at a median of -38.0 dB and peaks at -20.6,
+# against a noise floor whose median is -72.0. So the floor sat *above* median
+# speech and was cleared only on peaks — onset detection was a coin flip on a
+# quiet utterance, and ffmpeg called ordinary speech silence.
+#
+# -45 sits 27 dB clear of the noise floor and 7 dB under median speech, which
+# is the right side of both. Note this is not the wake word's problem: that
+# score is level-invariant (a 15 dB replay sweep moved it by <0.001), so this
+# threshold governs the *recorder* only.
+SILENCE_THRESHOLD_DB = -45
 SILENCE_DURATION = 1.0  # seconds of silence before ffmpeg reports it
 MAX_RECORD_SECONDS = 15  # hard safety cap on recording length
 NO_SPEECH_TIMEOUT = 8  # stop early if nothing is said within this long
