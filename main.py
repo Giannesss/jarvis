@@ -19,6 +19,12 @@ from jarvis.text import is_yes
 GAP_REPLY = "Δεν σε άκουσα καλά, πες το ξανά."
 MAX_GAP_RETRIES = 2
 
+# Said when the brain call itself fails (Ollama down, or the intermittent
+# CUDA error). Spoken, not just printed: in wake-word mode nobody is
+# watching the terminal, so a print-only failure is indistinguishable from
+# Jarvis ignoring the question.
+BRAIN_ERROR_REPLY = "Συγγνώμη, δεν μπορώ να απαντήσω αυτή τη στιγμή."
+
 # Whether the wake word is driving the loop, which also decides how
 # _ask_confirm() listens for an answer. Module-level rather than a local in
 # main() because the confirm asker is installed into policy once at startup,
@@ -53,8 +59,11 @@ def _ask_confirm(question: str) -> bool:
 
 
 def _reply_to(text: str) -> str | None:
-    """Skill first, brain only when no skill matches. None on a brain error
-    (already reported), so the caller just moves on to the next turn."""
+    """Skill first, brain only when no skill matches.
+
+    A brain error comes back as BRAIN_ERROR_REPLY rather than None, so the
+    caller speaks it like any other reply. None is reserved for "say nothing
+    at all", which is only the frozen backstop below."""
     reply = skills.handle(text)
     if reply is not None:
         return reply
@@ -72,8 +81,10 @@ def _reply_to(text: str) -> str | None:
         # memory this turn, not a failed reply.
         return brain.ask(text, memory.recall_safe(text))
     except Exception as e:
+        # brain.ask() has already dropped this turn from its history, so the
+        # next question starts clean rather than trailing an unanswered one.
         print(f"Σφάλμα κατά την κλήση στο τοπικό μοντέλο: {e}")
-        return None
+        return BRAIN_ERROR_REPLY
 
 
 def _converse(preroll: bytes) -> bool:

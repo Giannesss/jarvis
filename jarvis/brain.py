@@ -146,7 +146,16 @@ def ask(user_text: str, memory_block: str | None = None) -> str:
             + _history[_PREFIX_LEN:]
         )
 
-    reply = _PROVIDERS[BRAIN_PROVIDER](messages)
+    try:
+        reply = _PROVIDERS[BRAIN_PROVIDER](messages)
+    except Exception:
+        # As far as the conversation is concerned, this turn never happened.
+        # Leaving the user message behind would stack unanswered user turns
+        # across a run of failures -- Ollama's intermittent CUDA error does
+        # exactly that -- and the next successful call would read them as one
+        # run-on question. The caller reports the error; history stays clean.
+        _history.pop()
+        raise
 
     _history.append({"role": "assistant", "content": reply})
     _history[:] = _history[:_PREFIX_LEN] + _history[_PREFIX_LEN:][-MAX_HISTORY_MESSAGES:]
