@@ -296,6 +296,65 @@ class MangledTriggerEndingTests(unittest.TestCase):
         self.assertEqual(parsed.table, memory.REJECTED)
 
 
+class WantToRememberTests(unittest.TestCase):
+    """"Θέλω να θυμάσαι ότι..." -- the natural way to say it, and a live miss.
+
+    Nothing was mangled here: the recognizer heard the phrase correctly and
+    the ladder still refused it, because RE_TRIGGER is anchored at the start
+    of the utterance and "θέλω" was not one of the things allowed to come
+    first. The utterance fell past the save into memory_recall, which
+    answered a recall question nobody had asked. So it is a trigger form of
+    its own now, alongside "να θυμάσαι" and at the same rung, on both paths.
+    """
+
+    def test_the_phrase_that_failed_by_hand(self) -> None:
+        parsed = memory.parse("Θέλω να θυμάσαι ότι με λένε Γιάννης", NOW)
+        self.assertIsNotNone(parsed, "fell through to the recall")
+        self.assertEqual(parsed.table, "profile")
+        self.assertEqual(parsed.fields["key"], "ονομα")
+        # Verbatim as ever -- the longer trigger shifts where the body starts,
+        # and the span map has to follow it.
+        self.assertEqual(parsed.fields["value"], "Γιάννης")
+
+    def test_the_particles_and_the_wake_name(self) -> None:
+        for phrase in (
+            "Θέλω να θυμάσαι πως με λένε Γιάννης",
+            "Θέλω να θυμάσαι με λένε Γιάννης",
+            "Τζάρβις, θέλω να θυμάσαι ότι με λένε Γιάννης",
+            "Θέλω, να θυμάσαι, ό,τι με λένε Γιάννης",
+        ):
+            with self.subTest(phrase=phrase):
+                parsed = memory.parse(phrase, NOW)
+                self.assertIsNotNone(parsed, "fell through to the recall")
+                self.assertEqual(parsed.fields["value"], "Γιάννης")
+
+    def test_an_unstructured_body_is_still_a_note(self) -> None:
+        # The exact path reaches rung 7, same as every other exact trigger.
+        parsed = memory.parse("Θέλω να θυμάσαι ότι το συνέδριο ήταν βαρετό", NOW)
+        self.assertEqual(parsed.table, "notes")
+
+    def test_a_mangled_ending_is_tolerated_here_too(self) -> None:
+        # The fuzzy rung carries the same form, so the two fixes compose: a
+        # correct "θέλω να" with the ending Whisper keeps inventing. Guard 3
+        # still applies, hence a structured body.
+        parsed = memory.parse("Θέλω να θυμάσω ότι με λένε Γιάννης", NOW)
+        self.assertIsNotNone(parsed, "fell through to the recall")
+        self.assertEqual(parsed.fields["value"], "Γιάννης")
+
+    def test_it_does_not_swallow_other_wishes(self) -> None:
+        # "θέλω να" opens an enormous number of ordinary sentences; what keeps
+        # them out is the same mandatory exact core as everywhere else, three
+        # words long here.
+        for phrase, why in (
+            ("Θέλω να μάθω τι ώρα είναι", "'μάθω' is not the verb"),
+            ("Θέλω να πάω σινεμά", "nothing trigger-shaped after 'να'"),
+            ("Θέλω να θυμάμαι τι μου είπες", "first person, and no body to confirm"),
+            ("Δεν θέλω να θυμάσαι τίποτα", "negated -- and the anchor refuses it"),
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIsNone(memory.parse(phrase, NOW), why)
+
+
 class FuzzyTriggerNegativeTests(unittest.TestCase):
     """The eight sentences that must keep reaching the brain.
 
@@ -508,6 +567,7 @@ class FallbackTests(unittest.TestCase):
     def test_alternate_triggers_all_reach_the_fallback(self) -> None:
         for phrase in (
             "Να θυμάσαι ότι ο Κώστας μετακόμισε",
+            "Θέλω να θυμάσαι ότι ο Κώστας μετακόμισε",
             "Σημείωσε ότι ο Κώστας μετακόμισε",
             "Κράτα ότι ο Κώστας μετακόμισε",
             "Μην ξεχάσεις ότι ο Κώστας μετακόμισε",

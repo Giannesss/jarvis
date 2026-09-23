@@ -704,6 +704,17 @@ patterns, first match wins.
 7. **fallback to a plain note — always taken, unless the trigger itself was
    fuzzy** (see "Endings are tolerated, stems are not")
 
+`RE_TRIGGER` is anchored at the start of the utterance, so which phrases may
+open one is the whole of what it accepts: `θυμήσου`, `να θυμάσαι`, **`θέλω να
+θυμάσαι`**, `κράτα`, `σημείωσε`, `μην ξεχάσεις`, each optionally behind a
+leading `Τζάρβις`. `θέλω να θυμάσαι` was a live miss — nothing mangled, the
+phrase transcribed correctly and refused anyway, because the anchor left no
+room in front of `να θυμάσαι`. It fell past the save into `memory_recall`,
+which answered a recall question nobody had asked. It is a form of its own on
+both paths now, exact and fuzzy, at the same rung as `να θυμάσαι`, and
+`WantToRememberTests` pins it — including the ordinary wishes (`θέλω να μάθω…`,
+`θέλω να πάω…`) that the three-word core keeps out.
+
 Nothing is ever discarded or guessed into the wrong table. Profile rows are
 keyed, so saying your name twice updates it; every other table appends.
 Captured values are stored verbatim, articles included (`η σχολή μου είναι το
@@ -1058,8 +1069,9 @@ of them is a number:
    expensive one: nobody sees it until a recall reads it back.
 
 Budgets are per phrase, because how much room a verb has depends on what
-lives next to it: `θυμήσου`, `να θυμάσαι` and `μην ξεχάσεις` get 2;
-`σημείωσε` gets 1, because `σημειώσεις` is an ordinary noun sitting 2 away;
+lives next to it: `θυμήσου`, `να θυμάσαι`, `θέλω να θυμάσαι` and `μην
+ξεχάσεις` get 2; `σημείωσε` gets 1, because `σημειώσεις` is an ordinary noun
+sitting 2 away;
 `κράτα` gets none and stays exact-only in `RE_TRIGGER`, since at five
 characters `κρατάω` is a single edit from it.
 

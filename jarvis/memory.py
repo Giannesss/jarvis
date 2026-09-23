@@ -322,6 +322,7 @@ RE_TRIGGER = _re(
     rf"^(?:τζαρβισ{_GAP})?"
     rf"(?:θυμη{_JOIN}σου(?:{_GAP}{_OTI}|{_GAP}πωσ)?"
     rf"|να{_GAP}θυμασαι(?:{_GAP}{_OTI})?"
+    rf"|θελω{_GAP}να{_GAP}θυμασαι(?:{_GAP}{_OTI})?"
     rf"|κρατα(?:{_GAP}{_OTI})?"
     rf"|σημειωσε(?:{_GAP}{_OTI})?"
     rf"|μην{_GAP}ξεχασεισ(?:{_GAP}{_OTI})?)"
@@ -373,6 +374,11 @@ _FUZZY_TRIGGERS = tuple(
         ("θυμ", ("ήσου",), 2),
         # The "να" is the guard described above, not decoration.
         ("να θυμ", ("άσαι",), 2),
+        # "Θέλω να θυμάσαι ότι..." -- how the phrase is actually spoken, and
+        # a live miss on both paths: RE_TRIGGER is anchored, so the leading
+        # "θέλω" kept it out, and "να θυμ" does not start the utterance
+        # either. The longer core is its own guard.
+        ("θέλω να θυμ", ("άσαι",), 2),
         # 1, not 2: "σημειώσεις" (an ordinary noun that opens a sentence) is
         # exactly 2 from "σημείωσε".
         ("σημείωσ", ("ε",), 1),
