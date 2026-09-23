@@ -186,6 +186,76 @@ def edit_distance(a: str, b: str) -> int:
     return previous[-1]
 
 
+# --- Fuzzy word matching ---------------------------------------------------
+#
+# Whisper reproduces the stressed *stem* of a word and improvises the
+# unstressed ending, and it inserts word breaks and commas that were never
+# spoken. Two callers have to survive both: memory's save triggers
+# (memory.fuzzy_trigger) and the kill switch (policy.fuzzy_kill). The shared
+# shape is "this stem, exactly, then an ending within a small budget", so it
+# lives here beside edit_distance rather than in either of them.
+
+SEPARATORS = " ,.·"
+
+
+def match_core(norm: str, core: str, start: int = 0) -> int | None:
+    """Index just past an exact match of `core` at `start`, or None.
+
+    Separators are free on both sides -- skipped in the input, ignored in the
+    core -- so a word the recognizer split ("θυμ ήσου", "στα μάτα") still
+    matches, and a multi-word core ("να θυμ", "τα πάντα") needs no separator
+    pattern of its own.
+    """
+    i = start
+    for char in core:
+        if char in SEPARATORS:
+            continue
+        while i < len(norm) and norm[i] in SEPARATORS:
+            i += 1
+        if i >= len(norm) or norm[i] != char:
+            return None
+        i += 1
+    return i
+
+
+def fuzzy_word(
+    norm: str,
+    core: str,
+    endings: tuple[str, ...],
+    budget: int,
+    start: int = 0,
+) -> int | None:
+    """Index just past a word whose stem is `core` exactly and whose ending is
+    within `budget` edits of one of `endings`. None if it is neither.
+
+    The stem is the guard and carries no budget at all; only the ending is
+    guessed. The returned index sits at the word boundary, never inside a
+    word: the ending is taken whole to the next separator rather than capped
+    at some length, so a long word simply scores far past its budget instead
+    of being sliced in half.
+    """
+    after_core = match_core(norm, core, start)
+    if after_core is None:
+        return None
+
+    end = after_core
+    while end < len(norm) and norm[end] not in SEPARATORS:
+        end += 1
+
+    tail = norm[after_core:end]
+    if min(edit_distance(tail, ending) for ending in endings) > budget:
+        return None
+    return end
+
+
+def skip_separators(norm: str, start: int) -> int:
+    """Index of the next non-separator at or after `start`."""
+    i = start
+    while i < len(norm) and norm[i] in SEPARATORS:
+        i += 1
+    return i
+
+
 def phrases(*items: str) -> list[str]:
     """Normalize a literal phrase list at import time.
 
@@ -205,6 +275,30 @@ def strip_punctuation(text: str) -> str:
 # Quitting Jarvis entirely. Here rather than in skills.py because policy.py
 # needs them too: "κλείσε" has to keep working while Jarvis is frozen.
 SHUTDOWN_PHRASES = phrases("κλείσε", "τερματισμός", "τερμάτισε")
+
+# Confirming an action, spoken aloud (policy.py) or typed at the CLI (mem.py).
+# Deliberately short: each entry must be an answer on its own, since is_yes()
+# compares the whole utterance rather than searching inside it. "εντάξει" is
+# here because it is how a yes actually sounds in Greek speech; "σωστά" is
+# not, since "that's correct" is not the same as "go ahead".
+YES_WORDS = set(phrases("ν", "ναι", "y", "yes", "ok", "οκ", "εντάξει"))
+
+
+def is_yes(answer: str) -> bool:
+    """True only for an explicit yes. Anything else -- a mangled word, a whole
+    sentence, an empty string where the user said nothing -- is a no.
+
+    The burden is on the yes because the callers are confirming something
+    irreversible: a deleted row, or an action the policy layer has decided
+    needs asking about first.
+
+    Punctuation is stripped before the comparison. Whisper punctuates what it
+    hears, so a spoken "Ναι." arrives with the full stop attached and would
+    otherwise miss every entry in YES_WORDS -- the same trap
+    CONVERSATION_END_EXACT handles for "Τέλος." (see CLAUDE.md
+    "Punctuation is *not* normalized away").
+    """
+    return strip_punctuation(normalize(answer or "")) in YES_WORDS
 
 # Spoken numbers, used by the timer skill and by memory's relative-time
 # reminders ("σε δύο ώρες"). No composition: "είκοσι πέντε" is not 25.

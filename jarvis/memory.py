@@ -19,10 +19,11 @@ from jarvis import db
 from jarvis.config import MEMORY_TOKEN_BUDGET
 from jarvis.text import (
     NUMBER_WORDS,
-    edit_distance,
     fold_iotacism,
+    fuzzy_word,
     normalize,
     normalize_spans,
+    skip_separators,
     strip_accents,
 )
 
@@ -360,7 +361,8 @@ RE_STRANDED_PARTICLE = _re(rf"^(?:{_OTI}|πωσ)\b[\s,.·]*")
 #
 # The budget is per phrase rather than global, because how much room a verb
 # has depends entirely on what lives next to it in the language.
-_SEPARATORS = " ,.·"
+#
+# The matching itself is text.fuzzy_word(), shared with policy's kill switch.
 
 _JARVIS = normalize("Τζάρβις")
 
@@ -382,25 +384,6 @@ _FUZZY_TRIGGERS = tuple(
 # "Κρατάω σημειώσεις στο μάθημα". It stays exact-only, in RE_TRIGGER.
 
 
-def _core_end(norm: str, core: str, start: int) -> int | None:
-    """Index just past an exact match of `core` at `start`, or None.
-
-    Separators are free on both sides -- skipped in the input, ignored in the
-    core -- so a verb the recognizer split ("θυμ ήσου") still matches, and a
-    two-word core ("να θυμ") needs no separator pattern of its own.
-    """
-    i = start
-    for char in core:
-        if char in _SEPARATORS:
-            continue
-        while i < len(norm) and norm[i] in _SEPARATORS:
-            i += 1
-        if i >= len(norm) or norm[i] != char:
-            return None
-        i += 1
-    return i
-
-
 def fuzzy_trigger(norm: str) -> int | None:
     """Where the body starts when the trigger's ending was mangled, or None.
 
@@ -410,31 +393,15 @@ def fuzzy_trigger(norm: str) -> int | None:
     """
     start = 0
     if norm.startswith(_JARVIS):
-        rest = norm[len(_JARVIS):]
-        start = len(norm) - len(rest.lstrip(_SEPARATORS))
+        start = skip_separators(norm, len(_JARVIS))
 
     for core, endings, budget in _FUZZY_TRIGGERS:
-        after_core = _core_end(norm, core, start)
-        if after_core is None:
+        end = fuzzy_word(norm, core, endings, budget, start)
+        if end is None:
             continue
-
-        # The rest of that word is the ending. Taken whole rather than capped
-        # at some length, so the body can only ever start at a word boundary
-        # -- a truncated tail would slice a word in half. A long word simply
-        # scores a distance far past its budget.
-        end = after_core
-        while end < len(norm) and norm[end] not in _SEPARATORS:
-            end += 1
-
-        tail = norm[after_core:end]
-        if min(edit_distance(tail, ending) for ending in endings) > budget:
-            continue
-
         # Consume the gap after the verb, as RE_TRIGGER's trailing _GAP does,
         # so the body starts where RE_STRANDED_PARTICLE expects it to.
-        while end < len(norm) and norm[end] in _SEPARATORS:
-            end += 1
-        return end
+        return skip_separators(norm, end)
 
     return None
 

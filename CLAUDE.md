@@ -7,15 +7,21 @@ offline Piper if it's unavailable); everything else stays local.
 ## Roadmap
 
 The build plan lives outside this repo, in a Claude doc:
-https://claude.ai/artifact/HdQAkniZAwJQVoMaTqX8q2 — eight phases, with the
-model to use and the budget for each. It is the source of truth for what comes
-next; this file stays the source of truth for what is already built.
+https://claude.ai/code/artifact/86a745ad-d442-47ac-b841-30d3bc2b070d — eight
+phases, with the model to use and the budget for each. It is the source of
+truth for what comes next; this file stays the source of truth for what is
+already built.
 
-**Current phase: Phase 1 — wake word reliability.** "Hey Jarvis" should trigger
-within a couple of seconds on the first try; live tests show it sometimes taking
-30-90s, while the hits that do land score 0.93-0.99. Diagnosis before tuning
-(`tools/wake_score_probe.py`), then either a custom Greek "Τζάρβις" model or a
-mic-gain/`WAKE_THRESHOLD` recalibration from real scores.
+**Current phase: Phase 4 — structure and safety.** Four steps: the skills
+registry (done), the policy layer and kill switch (done — see "Policy"), a
+durable scheduler for reminders and timers that survive a restart, and a
+tag/category column across the memory tables so "τι έχω σήμερα" can pull from
+every area at once.
+
+Phase 1 closed on 2026-09-23 (`docs/PHASE1_STATUS.md`): the beep-reset bug and
+the too-high silence floor are fixed and confirmed live, and the remaining
+20-30s trigger latency is explained as model/accent fit rather than a bug —
+the real fix is a custom Greek "Τζάρβις" model, deferred as not urgent.
 
 Update that line when a phase is finished and the next one starts.
 
@@ -60,11 +66,16 @@ only falling back to the brain when a skill doesn't match (see "Skills").
 - `main.py` — CLI loop tying listener → skills → brain → speaker together.
 - `jarvis/listener.py` — FFmpeg recording + Whisper transcription.
 - `jarvis/skills.py` — local Greek voice commands, handled without the LLM.
+- `jarvis/policy.py` — the `Skill`/`Permission` types, the permission gate,
+  the kill switch, the audit log, and `python -m jarvis.policy` (also backing
+  `:policy` at the prompt). See "Policy".
 - `jarvis/brain.py` — Ollama chat call + conversation history + system prompt.
 - `jarvis/speaker.py` — Piper TTS + playback.
 - `jarvis/config.py` — loads `.env` (via `python-dotenv`) into `OLLAMA_MODEL` and `PIPER_MODEL_PATH`.
 - `jarvis/text.py` — Greek normalization (see "Normalization"), the span map
-  that makes captures verbatim, and the phrase data shared by `skills.py` and
+  that makes captures verbatim, the fuzzy word matcher (`edit_distance`,
+  `match_core`, `fuzzy_word`) shared by `memory.py`'s save triggers and
+  `policy.py`'s kill switch, and the phrase data shared by `skills.py` and
   `memory.py` (see "Memory"). `skills.py`
   re-exports it under the old names, so `_normalize` and `SHUTDOWN_PHRASES`
   still work there.
@@ -369,6 +380,20 @@ when that returns `None`. Matching is accent-insensitive, case-insensitive,
 and tolerant of extra words (simple substring matching on normalized text),
 since the input comes from speech recognition.
 
+Each skill is a `Skill` entry in the `SKILLS` list — name, trigger phrases,
+description, handler, permission — and `handle()` walks that list in order,
+dispatching each through `policy.dispatch()` rather than calling the handler
+itself. The `Skill` and `Permission` types live in `policy.py`, not here:
+`dispatch()` has to call a handler, so policy can't import skills, and the
+registry's *contents* stay here while its *types* live there. `skills.py`
+re-exports both under their own names. See "Policy".
+
+`phrases` on a registry entry is documentation, not the dispatch mechanism —
+matching style genuinely varies (substring-in-list, single-keyword-then-parse,
+`memory.py`'s regex ladder), and the registry doesn't unify it. `memory_save`
+carries an empty tuple for that reason: its real triggers are
+`memory.parse()`'s ladder, and listing a few here would be a fiction.
+
 Implemented, in the order `handle()` tries them: shutting Jarvis down; saving
 to memory and reading it back (both in "Memory" below); a spoken timer that
 announces itself (print + `speaker.speak`) when it fires; current time / date;
@@ -389,6 +414,124 @@ Timers run on a daemon `threading.Timer` so a pending one can't hang process
 exit. `speaker.speak()` is guarded by a lock so a timer announcement firing
 while Jarvis is already talking waits its turn instead of cutting off or
 overlapping the current audio.
+
+## Policy
+
+`jarvis/policy.py` sits between `skills.handle()` and every handler: nothing
+runs without a permission, nothing that isn't `SAFE` runs without an explicit
+yes, and every decision leaves an audit row. Nothing here imports `speaker`
+or `listener` — asking the user a question is an injected callable
+(`set_confirm_asker`), the same way `mem.run()` takes its confirm reader, so
+the whole layer is testable without a microphone.
+
+**Deny by default.** `Skill.permission` defaults to `Permission.BLOCKED`, so
+a skill added later without naming a permission cannot run. An unrecognised
+permission value is blocked too. All seven registered skills are `SAFE` —
+none sends, deletes, spends or reaches outside the machine. The `CONFIRM`
+and `BLOCKED` paths are built and tested but carry no live skill yet; they
+are what Phase 7's file move/rename/delete plugs into.
+
+**A `CONFIRM` skill needs a `matches()` and a `confirm_prompt`.** The
+existing handlers answer "did you match?" by *doing the thing*, which is fine
+for a safe action — running it is the decision — but a `CONFIRM` skill has to
+be recognised before it acts or there is nothing left to confirm. So anything
+not `SAFE` must be able to say whether it matched without acting, and must
+carry the Greek question to ask out loud. A `CONFIRM` skill missing either
+raises at import: that would be a registration bug wearing a safety feature's
+clothes, silently never running. `BLOCKED` needs neither — with no matcher it
+simply never runs, which is the right outcome anyway.
+
+Silence, a mangled answer, an unrecognised word, a raising asker, or no asker
+installed at all are all a **no** (`text.is_yes`, shared with `:mem del`).
+The burden is on the yes.
+
+### The kill switch
+
+«σταμάτα τα πάντα» (also «σταμάτησε τα πάντα», «πάγωσε τα πάντα») freezes
+everything except shutdown. While frozen, every utterance gets one fixed line;
+only `SHUTDOWN_PHRASES` passes through, because being unable to shut down a
+frozen assistant would be a worse trap than the one the switch exists to
+escape. `main._reply_to()` re-checks `is_frozen()` before the brain as a
+backstop.
+
+Four things about it are deliberate:
+
+- **It is checked in `policy.intercept()`, before the registry loop and
+  before the permission gate** — not registered as a skill. It governs the
+  policy layer, so it must not be gated *by* the policy layer.
+- **It is matched as a substring, via a regex with `memory.py`'s `_GAP`
+  separator between words.** A false positive freezes Jarvis, which is
+  recoverable and roughly what the user meant anyway; a false negative means
+  the kill switch didn't work when it was needed. Those are not symmetric.
+  The regex rather than a plain substring is because `normalize()` doesn't
+  strip punctuation and Whisper inserts it mid-phrase — «σταμάτα, τα πάντα»
+  would otherwise miss. See "Punctuation is *not* normalized away".
+- **The verb is matched fuzzily, the object is not** (`policy.fuzzy_kill()`,
+  tried only when the exact regex misses). Two live attempts at «σταμάτα τα
+  πάντα» came back as «Στα μάτα τα πάντα» and «Λέω στα μάτα τα πάντα» — both
+  normalizing to `στα ματα τα παντα`, a word break *inside* the verb, which
+  `_GAP` (a separator *between* words) cannot catch. So the verb goes through
+  `text.fuzzy_word()` like memory's save triggers: stem exact (`σταματ`,
+  `παγωσ` — that σ is what excludes «παγωτό»), ending by edit distance.
+
+  **The asymmetry is the opposite of memory's, and that sets the budgets.**
+  There a wrong match is a wrong row nobody sees until a recall reads it
+  back; here it is a freeze, announced out loud and undone by `unlock` or a
+  restart, while a miss is the switch failing when it was needed. So the
+  budget is generous (2) and **what keeps it honest is the object, not the
+  budget**: `τα πάντα` must follow the verb immediately, matched exactly
+  (separators free, so a split «τα πά ντα» survives). Same role as memory's
+  `notes_ok` — a guessed trigger must be confirmed by a second, independent
+  piece. It does real work: «κοίτα με στα μάτια» normalizes to `κιτα με στα
+  ματια`, whose `στα ματια` *does* match the verb one edit out, and is saved
+  only by the missing object.
+
+  Measured over the corpus in `FuzzyKillSwitchTests`: 14/14 positives fire,
+  19/21 negatives stay silent. The two that fire are «θέλω να σταματήσω τα
+  πάντα και να φύγω» and «σταμάτησα τα πάντα χθες» — first-person forms of
+  the phrase itself, and accepted, since «σταμάτησε τα πάντα» already takes
+  the third-person narration of the same thing. The audit log separates
+  `voice` from `voice_fuzzy`, which is the evidence for retuning later.
+  Known boundary, pinned by a test: adjacency means «σταμάτα *τώρα* τα
+  πάντα» misses — as it did before this change too.
+- **There is no voice unlock.** Only `python -m jarvis.policy unlock` (or
+  `:policy unlock` at the Enter prompt), or a restart. A spoken unlock would
+  defeat the point.
+
+The flag lives in `db.policy_state`, not in memory, so `unlock` from a second
+terminal reaches a *running* Jarvis — the same WAL-mode trick that makes
+`:mem` work mid-session. That means it also outlives the process that set it,
+which is why `main()` calls `clear_on_startup()`: restart is the other
+documented way out, and without that clear, a freeze would survive every
+restart with no way back short of editing the database.
+
+`is_frozen()` treats the database as authoritative whenever it can be read,
+so a second terminal's unlock lands on the next utterance; the in-process
+flag is a cache and the fallback when the read fails. It therefore fails
+*frozen* if this process is the one that froze — forgetting a freeze is the
+expensive direction.
+
+### Audit log
+
+`db.audit`, four short columns: `ts`, `action`, `decision`, `reason`. One row
+per utterance — the skill that actually replied (not each one tried), or
+`brain -> allowed (no_skill_matched)` when none did.
+
+**It never holds what was said.** `action` is a skill name or a fixed word;
+an utterance refused while frozen is logged as `request`, never as its text.
+`decision` and `reason` come from the fixed vocabularies at the top of
+`policy.py`, so the log can be grepped and reads consistently. A test asserts
+every row stays inside them.
+
+Read it with `:mem list audit`. It is evidence, so `mem.py` has it in
+`_READABLE` but not `_WRITABLE` — `edit` and `del` refuse it. A failed audit
+write costs a log row, never a turn, same discipline as `memory.recall_safe()`.
+
+`policy_state` and `audit` were both added without touching `SCHEMA_VERSION`:
+every statement in `_SCHEMA` is `CREATE ... IF NOT EXISTS` and `_init()` runs
+the whole script on every connect, so an existing database picks up a new
+table on its next start. That version tracks *data* migrations (the norm
+refold), and bumping it would re-run that for nothing.
 
 ## Memory
 
@@ -669,8 +812,10 @@ false trigger *above* the true one (`κρατάω`/`κράτα` 0.909, `θυμά
 character" rather than as a tuned constant.
 
 `memory._FUZZY_TRIGGERS` holds each trigger as an **exact core plus an
-ending budget**. Three separate guards keep the looseness honest, and only
-one of them is a number:
+ending budget**, matched by `text.fuzzy_word()` — which the kill switch
+shares, with a looser budget and a different confirming guard (see "The kill
+switch"). Three separate guards keep the looseness honest here, and only one
+of them is a number:
 
 1. **The core is mandatory and exact.** `"να θυμ"` keeps its `να`, so a
    recall question (`"Θυμάσαι τι σου είπα;"`) can never reach the save path

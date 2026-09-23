@@ -12,14 +12,31 @@ reach them so nothing ever opens on screen or schedules a real callback.
 
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
-from jarvis import skills
+from jarvis import db, policy, skills
 
 
 class SkillsTestCase(unittest.TestCase):
     def setUp(self) -> None:
+        # skills.handle() writes an audit row for every decision now, so this
+        # suite needs a database even where no skill touches memory. Patched
+        # to a throwaway one, as in test_db.py and test_memory_skills.py, so
+        # running the tests can never write to the real data/jarvis.db.
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+
+        patcher = mock.patch.object(db, "DB_PATH", Path(self._tmp.name) / "jarvis.db")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        # The frozen flag is module state that would otherwise leak in from
+        # whichever test ran last; cleared directly rather than via thaw(),
+        # which is a real decision and would write a real audit row.
+        policy._frozen = False
         skills.shutdown_requested = False
 
     def tearDown(self) -> None:

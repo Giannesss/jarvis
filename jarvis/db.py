@@ -20,6 +20,12 @@ from jarvis.text import fold_iotacism
 
 # 2: text.normalize() began folding the iotacism vowels, so every stored
 # `norm` written before that has to be refolded -- see _migrate().
+#
+# This tracks *data* migrations, not the shape of the schema. Adding a table
+# needs no bump: every statement below is CREATE ... IF NOT EXISTS and _init()
+# runs the whole script on every connect, so an existing database picks up a
+# new table on its next start (that is how `audit` and `policy_state` both
+# arrived). Bumping it would only re-run the refold above for nothing.
 SCHEMA_VERSION = 2
 
 # Tables carrying free text also carry a `norm` column: text.normalize() of
@@ -106,6 +112,19 @@ CREATE TABLE IF NOT EXISTS audit (
     action   TEXT NOT NULL,
     decision TEXT NOT NULL,
     reason   TEXT
+);
+
+-- Policy state shared between processes: currently just the kill switch's
+-- frozen flag. It lives in the database rather than in memory so that
+-- `python -m jarvis.policy unlock` in a second terminal reaches a *running*
+-- Jarvis, the same way `python -m jarvis.mem` reaches its memory (WAL mode is
+-- what makes both work). main() clears it at startup, because a restart has
+-- to unlock too and a persisted flag would otherwise outlive the process
+-- that set it. See jarvis/policy.py.
+CREATE TABLE IF NOT EXISTS policy_state (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders (status, due_at);

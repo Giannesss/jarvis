@@ -11,13 +11,16 @@ import subprocess
 import threading
 import time
 import webbrowser
-from dataclasses import dataclass
 from datetime import datetime
-from enum import Enum
-from typing import Callable
 
-from jarvis import db, memory, speaker, text
+from jarvis import db, memory, policy, speaker, text
 from jarvis.config import SKILL_APPS, SKILL_SITES
+
+# Defined in policy.py, which owns them because dispatch() has to call a
+# skill's handler and so cannot import this module back. Re-exported here
+# under the names the registry below (and its tests) already use.
+Permission = policy.Permission
+Skill = policy.Skill
 
 # Re-exported from jarvis/text.py, which owns them now so memory.py and
 # policy.py can share them without importing this module back. Kept under
@@ -271,94 +274,81 @@ def _handle_memory_recall(raw_text: str) -> str | None:
     return " ".join(hits[:MEMORY_RECALL_LIMIT])
 
 
-class Permission(Enum):
-    """Deny-by-default is a later step (Phase 4's policy layer); every skill
-    below is registered SAFE for now, so this enum is otherwise inert."""
-
-    SAFE = "safe"
-    CONFIRM = "confirm"
-    BLOCKED = "blocked"
-
-
-@dataclass(frozen=True)
-class Skill:
-    """One entry in SKILLS. `phrases` documents what the skill responds to;
-    it is not itself the dispatch mechanism -- matching style already varies
-    per skill (substring-in-list, single-keyword-then-parse, memory.py's own
-    regex ladder), and this registry doesn't unify that. `input` says which
-    text variant `handler` expects: "norm" (normalized) or "raw"."""
-
-    name: str
-    phrases: tuple[str, ...]
-    description: str
-    permission: Permission
-    handler: Callable[[str], str | None]
-    input: str = "norm"
-
-
 # Order matches the ladder `handle()` used before this registry existed, and
 # is load-bearing: shutdown first so "κλείσε" can never be intercepted,
 # memory_save before memory_recall since their trigger phrases overlap. See
 # CLAUDE.md "Skills".
+#
+# All seven are SAFE: none of them sends, deletes, spends or reaches outside
+# the machine. The CONFIRM and BLOCKED paths exist for what Phase 7 adds
+# (file move/rename/delete) -- see CLAUDE.md "Policy".
+#
+# Written as keyword arguments because `permission` now has a default
+# (BLOCKED), so position no longer carries it. That is the deny-by-default
+# rule: a skill added here without naming a permission cannot run.
 SKILLS: list[Skill] = [
     Skill(
-        "shutdown",
-        SHUTDOWN_PHRASES,
-        "Shuts Jarvis down.",
-        Permission.SAFE,
-        _handle_shutdown,
-        "norm",
+        name="shutdown",
+        phrases=SHUTDOWN_PHRASES,
+        description="Shuts Jarvis down.",
+        handler=_handle_shutdown,
+        permission=Permission.SAFE,
+        input="norm",
     ),
     Skill(
-        "memory_save",
-        (),
-        "Saves a spoken note/reminder/exam/course/profile fact/business "
-        "note to memory. Real triggers live in memory.parse()'s pattern "
-        "ladder, not here.",
-        Permission.SAFE,
-        _handle_memory_save,
-        "raw",
+        name="memory_save",
+        phrases=(),
+        description=(
+            "Saves a spoken note/reminder/exam/course/profile fact/business "
+            "note to memory. Real triggers live in memory.parse()'s pattern "
+            "ladder, not here."
+        ),
+        handler=_handle_memory_save,
+        permission=Permission.SAFE,
+        input="raw",
     ),
     Skill(
-        "memory_recall",
-        MEMORY_RECALL_PHRASES,
-        "Answers a question from saved memory.",
-        Permission.SAFE,
-        _handle_memory_recall,
-        "raw",
+        name="memory_recall",
+        phrases=MEMORY_RECALL_PHRASES,
+        description="Answers a question from saved memory.",
+        handler=_handle_memory_recall,
+        permission=Permission.SAFE,
+        input="raw",
     ),
     Skill(
-        "timer",
-        (TIMER_KEYWORD,),
-        "Starts a spoken countdown timer.",
-        Permission.SAFE,
-        _handle_timer,
-        "norm",
+        name="timer",
+        phrases=(TIMER_KEYWORD,),
+        description="Starts a spoken countdown timer.",
+        handler=_handle_timer,
+        permission=Permission.SAFE,
+        input="norm",
     ),
     Skill(
-        "time",
-        TIME_PHRASES,
-        "Says the current time.",
-        Permission.SAFE,
-        _handle_time,
-        "norm",
+        name="time",
+        phrases=TIME_PHRASES,
+        description="Says the current time.",
+        handler=_handle_time,
+        permission=Permission.SAFE,
+        input="norm",
     ),
     Skill(
-        "date",
-        DATE_PHRASES,
-        "Says today's date.",
-        Permission.SAFE,
-        _handle_date,
-        "norm",
+        name="date",
+        phrases=DATE_PHRASES,
+        description="Says today's date.",
+        handler=_handle_date,
+        permission=Permission.SAFE,
+        input="norm",
     ),
     Skill(
-        "open_site_or_app",
-        (OPEN_VERB,),
-        "Opens a configured website or local app by name (SKILL_SITES/"
-        "SKILL_APPS in config.py).",
-        Permission.SAFE,
-        _handle_open,
-        "norm",
+        name="open_site_or_app",
+        phrases=(OPEN_VERB,),
+        description=(
+            "Opens a configured website or local app by name (SKILL_SITES/"
+            "SKILL_APPS in config.py)."
+        ),
+        handler=_handle_open,
+        permission=Permission.SAFE,
+        input="norm",
     ),
 ]
 
@@ -381,16 +371,22 @@ def handle(text: str) -> str | None:
     norm = _normalize(text)
 
     t0 = time.perf_counter()
-    # Dispatches through SKILLS in order, first non-None reply wins -- same
-    # short-circuit behavior as the old `or`-chain this replaced. The two
-    # memory skills take the raw text, not norm: a note is stored the way
-    # it was said, accents and capitals included.
-    reply = None
-    for skill in SKILLS:
-        arg = text if skill.input == "raw" else norm
-        reply = skill.handler(arg)
-        if reply is not None:
-            break
+    # Policy sees the utterance before any skill does: the kill switch has to
+    # fire whatever else is true, and a frozen Jarvis must not reach a
+    # handler at all. Returns None in the ordinary case.
+    reply = policy.intercept(norm)
+
+    if reply is None:
+        # Dispatches through SKILLS in order, first non-None reply wins --
+        # same short-circuit behavior as the old `or`-chain this replaced,
+        # with policy.dispatch() deciding whether each one may actually run.
+        # The two memory skills take the raw text, not norm: a note is stored
+        # the way it was said, accents and capitals included.
+        for skill in SKILLS:
+            arg = text if skill.input == "raw" else norm
+            reply = policy.dispatch(skill, arg)
+            if reply is not None:
+                break
 
     if reply is not None:
         print(f"[timing] Skill match: {time.perf_counter() - t0:.3f}s")

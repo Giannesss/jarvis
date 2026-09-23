@@ -20,6 +20,7 @@ import sys
 from typing import Callable
 
 from jarvis import db, memory
+from jarvis.text import is_yes
 
 # Listable/inspectable tables. audit is included read-only; it is evidence,
 # so `edit` and `del` refuse it.
@@ -148,7 +149,10 @@ def _cmd_del(args, conn, out, confirm) -> int:
         # Read back what is about to go, then require an explicit yes.
         out(f"Να σβήσω {args.table} #{args.row_id}: {_summarize(args.table, row)}")
         answer = (confirm or input)("Σίγουρα; [ν/o] ")
-        if not _is_yes(answer):
+        # Anything unrecognised is a no: deleting is not the safe default.
+        # Shared with the voice confirmation in policy.py, so a yes means the
+        # same thing whichever way it arrives (jarvis/text.py).
+        if not is_yes(answer):
             out("Ακυρώθηκε.")
             return 1
 
@@ -191,16 +195,6 @@ _HANDLERS = {
     "export": _cmd_export,
     "backup": _cmd_backup,
 }
-
-_YES = {"ν", "ναι", "y", "yes", "ok", "οκ"}
-
-
-def _is_yes(answer: str) -> bool:
-    # Anything unrecognised is a no: deleting is not the safe default.
-    from jarvis.text import normalize
-
-    return normalize(answer or "") in _YES
-
 
 def _fetch(conn: sqlite3.Connection, table: str, row_id: int) -> sqlite3.Row | None:
     return conn.execute(f"SELECT * FROM {table} WHERE id = ?", (row_id,)).fetchone()

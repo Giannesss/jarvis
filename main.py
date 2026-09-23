@@ -1,6 +1,7 @@
 import shlex
+from typing import Callable
 
-from jarvis import brain, db, listener, mem, memory, skills, speaker, wakeword
+from jarvis import brain, db, listener, mem, memory, policy, skills, speaker, wakeword
 from jarvis.config import (
     CONVERSATION_MODE,
     CONVERSATION_TIMEOUT,
@@ -8,6 +9,7 @@ from jarvis.config import (
     WAKE_BEEP,
     WAKE_WORD_ENABLED,
 )
+from jarvis.text import is_yes
 
 
 # Said when a recording came back with holes in it (listener returns "gap").
@@ -17,6 +19,38 @@ from jarvis.config import (
 GAP_REPLY = "Δεν σε άκουσα καλά, πες το ξανά."
 MAX_GAP_RETRIES = 2
 
+# Whether the wake word is driving the loop, which also decides how
+# _ask_confirm() listens for an answer. Module-level rather than a local in
+# main() because the confirm asker is installed into policy once at startup,
+# but wake-word mode can still fall back to the Enter prompt mid-run -- and an
+# answer has to be read whichever way is live *at the time of the question*.
+_wake_word_active = False
+
+
+def _ask_confirm(question: str) -> bool:
+    """Ask a yes/no question out loud and read the answer back.
+
+    Installed into policy at startup, so policy itself never imports the
+    microphone. Silence, a mangled answer, or a recording with holes in it
+    are all a no -- see text.is_yes(); the burden is on the yes.
+    """
+    print(f"Jarvis: {question}")
+    speaker.speak(question)
+
+    if _wake_word_active:
+        # Same discipline as _converse(): drop whatever was captured around
+        # the question so the answer can't be Jarvis's own voice asking it.
+        listener.flush()
+        answer, _stop_reason = listener.record_command(b"", CONVERSATION_TIMEOUT)
+    else:
+        answer = listener.listen()
+
+    if not answer:
+        return False
+
+    print(f"Εσύ: {answer}")
+    return is_yes(answer)
+
 
 def _reply_to(text: str) -> str | None:
     """Skill first, brain only when no skill matches. None on a brain error
@@ -24,6 +58,14 @@ def _reply_to(text: str) -> str | None:
     reply = skills.handle(text)
     if reply is not None:
         return reply
+
+    if policy.is_frozen():
+        # Belt and braces. policy.intercept() already refuses everything but
+        # a shutdown phrase while frozen, so getting here means one that no
+        # skill claimed -- the brain still must not answer for it.
+        return None
+
+    policy.record("brain", "allowed", "no_skill_matched")
 
     try:
         # recall_safe never raises: a broken or locked database means no
@@ -114,9 +156,9 @@ def _startup_backup() -> None:
         print(f"Σφάλμα αντιγράφου μνήμης: {e}")
 
 
-def _run_mem_command(command: str) -> None:
-    """`:mem ...` at the Enter prompt, sharing jarvis/mem.py's dispatcher with
-    the standalone `python -m jarvis.mem`."""
+def _run_admin_command(command: str, runner: Callable[[list[str]], int]) -> None:
+    """`:mem ...` / `:policy ...` at the Enter prompt, each sharing its own
+    module's argv dispatcher with its standalone `python -m` entry point."""
     try:
         argv = shlex.split(command)[1:]
     except ValueError as e:
@@ -127,39 +169,46 @@ def _run_mem_command(command: str) -> None:
         argv = ["--help"]
 
     try:
-        mem.run(argv)
+        runner(argv)
     except Exception as e:
-        print(f"Σφάλμα μνήμης: {e}")
+        print(f"Σφάλμα εντολής: {e}")
 
 
 def main() -> None:
+    global _wake_word_active
+
     _startup_backup()
+    # A restart is one of the two documented ways out of the kill switch, and
+    # the flag is persisted so a second terminal can reach a running Jarvis.
+    # Clearing it here is what keeps the freeze from outliving the process.
+    policy.clear_on_startup()
+    policy.set_confirm_asker(_ask_confirm)
     listener.preload()
 
-    wake_word_active = WAKE_WORD_ENABLED
-    if wake_word_active:
+    _wake_word_active = WAKE_WORD_ENABLED
+    if _wake_word_active:
         try:
             wakeword.preload()
             listener.start_stream()
         except Exception as e:
             print(f"Ανίχνευση λέξης-κλειδί μη διαθέσιμη ({e}), πάτα Enter αντ' αυτού.")
             listener.stop_stream()  # no-op if it never started; guards partial startup
-            wake_word_active = False
+            _wake_word_active = False
 
-    if wake_word_active:
+    if _wake_word_active:
         print("Jarvis έτοιμος. Πες «Hey Jarvis» για να μιλήσεις (Ctrl+C για έξοδο).")
     else:
         print("Jarvis έτοιμος. Πάτα Enter για να μιλήσεις ('exit' για έξοδο).")
 
     try:
         while True:
-            if wake_word_active:
+            if _wake_word_active:
                 try:
                     preroll = listener.listen_for_wake_word()
                 except Exception as e:
                     print(f"Σφάλμα ανίχνευσης ({e}), πάτα Enter αντ' αυτού.")
                     listener.stop_stream()  # tear down before listen() opens the mic
-                    wake_word_active = False
+                    _wake_word_active = False
                     continue
 
                 if not _converse(preroll):
@@ -170,10 +219,15 @@ def main() -> None:
             if command.strip().lower() in ("exit", "quit"):
                 break
 
-            # Typed memory admin, so the database is reachable without a
-            # second terminal. Never recorded, never sent to the brain.
+            # Typed admin, so the database and the kill switch are reachable
+            # without a second terminal. Never recorded, never sent to the
+            # brain -- and ":policy unlock" deliberately cannot be spoken.
             if command.strip().startswith(":mem"):
-                _run_mem_command(command.strip())
+                _run_admin_command(command.strip(), mem.run)
+                continue
+
+            if command.strip().startswith(":policy"):
+                _run_admin_command(command.strip(), policy.run)
                 continue
 
             text = listener.listen()
