@@ -30,15 +30,27 @@ voice model downloaded into `models/`. Enter at the prompt to record, `exit`/`qu
 
 ## Pipeline (as implemented)
 
-1. **Record** — `jarvis/listener.py` shells out to FFmpeg to capture `RECORD_SECONDS`
-   (6s) from a hardcoded DirectShow mic (`MICROPHONE_NAME`) into a temp WAV.
-2. **Speech-to-text** — same file, transcribes that WAV with `faster_whisper`
-   (`base` model, CPU, int8, `language="el"`).
-3. **LLM reply** — `jarvis/brain.py` sends the running chat history to a local
-   Ollama model (`ollama.chat`) with a system prompt telling it to be concise
-   and reply in whatever language the user used.
-4. **Text-to-speech** — `jarvis/speaker.py` synthesizes the reply with Piper
-   and plays it via `winsound`.
+1. **Record** — `jarvis/listener.py` shells out to FFmpeg over a hardcoded
+   DirectShow mic (`MICROPHONE_NAME`). Two paths, both silence-detected
+   rather than fixed-duration: `listen()` is the Enter-press one-shot path,
+   stopping on ffmpeg's own `silencedetect` filter, capped by
+   `MAX_RECORD_SECONDS` (15s) with `NO_SPEECH_TIMEOUT` (8s) for leading
+   silence. Wake-word mode instead keeps one persistent ffmpeg stream open
+   for the whole run and stops each turn via `record_command()`'s own
+   frame-level `_StopDecider` — see "Wake word" and "The recording clock"
+   for how that path works.
+2. **Speech-to-text** — same file, transcribes with `faster_whisper`
+   (`WHISPER_MODEL` from `.env`, default `"small"`; CPU, int8,
+   `language="el"`).
+3. **LLM reply** — `jarvis/brain.py` sends the running chat history to a
+   local Ollama model (`ollama.chat`) with a system prompt asking for short,
+   natural-sounding replies (no markdown, no calling itself an AI unless
+   asked). The prompt doesn't say anything about which language to reply
+   in — see "Language" for how that's actually handled.
+4. **Text-to-speech** — `jarvis/speaker.py` synthesizes the reply with
+   Microsoft Edge TTS by default (`TTS_ENGINE=edge`) and plays it via
+   `winsound`, falling back to offline Piper if Edge synthesis fails (e.g.
+   no internet) or if `TTS_ENGINE=piper`.
 
 `main.py` wires these together in a loop, trying `jarvis/skills.py` first and
 only falling back to the brain when a skill doesn't match (see "Skills").
@@ -59,6 +71,13 @@ only falling back to the brain when a skill doesn't match (see "Skills").
 - `jarvis/db.py` — SQLite schema, connections, backups.
 - `jarvis/memory.py` — parsing speech into rows, and recalling rows as context.
 - `jarvis/mem.py` — `python -m jarvis.mem`, also backing `:mem` at the prompt.
+- `tools/wake_score_probe.py` — standalone wake-word diagnostic, not part of
+  the app: scores live or replayed audio with no threshold or debug floor in
+  the way (free-running, prompted-attempts, and replay modes). See "Roadmap".
+- `tools/gen_wakeword_clips.py`, `tools/record_wakeword_clips.py` — one-off
+  data-prep tools for training a custom Greek "Τζάρβις" openWakeWord model:
+  synthesizing clips from TTS voices, and recording real clips through the
+  mic. Not part of the app.
 - `native_mic_test.py`, `wavein_capture_test.py`, `windows_capture_test.py` — throwaway
   experiments trying different Windows mic-capture APIs; not part of the app.
 
