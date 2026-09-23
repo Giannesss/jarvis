@@ -4,6 +4,21 @@ Local, offline Greek-speaking voice assistant. No cloud APIs, no API keys.
 Voice output can optionally use Microsoft's online Edge TTS (falls back to
 offline Piper if it's unavailable); everything else stays local.
 
+## Roadmap
+
+The build plan lives outside this repo, in a Claude doc:
+https://claude.ai/artifact/HdQAkniZAwJQVoMaTqX8q2 — eight phases, with the
+model to use and the budget for each. It is the source of truth for what comes
+next; this file stays the source of truth for what is already built.
+
+**Current phase: Phase 1 — wake word reliability.** "Hey Jarvis" should trigger
+within a couple of seconds on the first try; live tests show it sometimes taking
+30-90s, while the hits that do land score 0.93-0.99. Diagnosis before tuning
+(`tools/wake_score_probe.py`), then either a custom Greek "Τζάρβις" model or a
+mic-gain/`WAKE_THRESHOLD` recalibration from real scores.
+
+Update that line when a phase is finished and the next one starts.
+
 ## Run
 
 ```

@@ -16,6 +16,11 @@ can be a decision rather than a guess:
                            normalize its input, so fix this before anything
                            else
 
+The per-utterance table at the end is the one to read when the question is
+"does it miss most of the time": say the wake word ten times and it shows ten
+peak scores. All near zero with one spike is a recognition problem (accent,
+model fit, mic); a cluster just under the threshold is a threshold problem.
+
 Usage:
     .\.venv\Scripts\python.exe tools\wake_score_probe.py [--seconds 30]
 
@@ -43,6 +48,11 @@ from jarvis.config import WAKE_MODEL_PATH, WAKE_THRESHOLD  # noqa: E402
 # into the "speech" percentiles would drag them toward the noise floor.
 SPEECH_FLOOR_DB = -45.0
 
+# openWakeWord scores each frame from the ~1.5s of audio before it, so an
+# utterance's peak score lands *after* its loud frames end. Quiet frames
+# within this much of the last loud one still count toward that utterance.
+UTTERANCE_TAIL_SECONDS = 1.5
+
 
 def _percentile(values: list[float], fraction: float) -> float:
     ordered = sorted(values)
@@ -66,6 +76,8 @@ def main() -> int:
     scores: list[float] = []
     speech_db: list[float] = []
     quiet_db: list[float] = []
+    utterances: list[dict] = []
+    current: dict | None = None
     gaps = 0
     last_ts: float | None = None
     deadline = time.perf_counter() + args.seconds
@@ -96,6 +108,21 @@ def main() -> int:
             scores.append(score)
             (speech_db if level > SPEECH_FLOOR_DB else quiet_db).append(level)
 
+            # Group frames into utterances so ten repetitions read as ten
+            # numbers rather than as scrollback.
+            if level > SPEECH_FLOOR_DB:
+                if current is None:
+                    current = {"start": ts, "end": ts, "peak_db": level, "peak_score": score}
+                    utterances.append(current)
+                current["end"] = ts
+                current["peak_db"] = max(current["peak_db"], level)
+                current["peak_score"] = max(current["peak_score"], score)
+            elif current is not None:
+                if ts - current["end"] <= UTTERANCE_TAIL_SECONDS:
+                    current["peak_score"] = max(current["peak_score"], score)
+                else:
+                    current = None
+
             # A bar makes the shape of each utterance readable while it runs.
             if score >= 0.02 or level > SPEECH_FLOOR_DB:
                 bar = "#" * int(score * 40)
@@ -113,8 +140,10 @@ def main() -> int:
     print("\n--- summary ---")
     print(f"frames: {len(scores)}   holes: {gaps}")
     print(f"peak score: {max(scores):.3f}   (threshold {WAKE_THRESHOLD})")
-    for cutoff in (0.1, 0.2, 0.3, 0.4, 0.5):
-        print(f"  frames >= {cutoff:.1f}: {sum(1 for s in scores if s >= cutoff)}")
+    # Buckets start below the debug floor: 0.06 and 0.00 look the same in
+    # jarvis/wakeword.py's log, and they mean very different things here.
+    for cutoff in (0.02, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5):
+        print(f"  frames >= {cutoff:.2f}: {sum(1 for s in scores if s >= cutoff)}")
 
     if speech_db:
         print(
@@ -125,6 +154,21 @@ def main() -> int:
         print(f"speech level: nothing above {SPEECH_FLOOR_DB:.0f} dB -- mic gain is very low")
     if quiet_db:
         print(f"noise floor:  median {_percentile(quiet_db, 0.5):.1f} dB")
+
+    if utterances:
+        print(
+            f"\nutterances (runs above {SPEECH_FLOOR_DB:.0f} dB; peak score includes "
+            f"the {UTTERANCE_TAIL_SECONDS:.1f}s after each, where it usually lands):"
+        )
+        for i, u in enumerate(utterances, 1):
+            seconds = u["end"] - u["start"] + listener.FRAME_SECONDS
+            fired = " <-- would fire" if u["peak_score"] >= WAKE_THRESHOLD else ""
+            print(
+                f"  {i:2d}. at {u['start']:6.2f}s  {seconds:4.2f}s  "
+                f"peak {u['peak_db']:6.1f} dB  score {u['peak_score']:.3f}{fired}"
+            )
+        hits = sum(1 for u in utterances if u["peak_score"] >= WAKE_THRESHOLD)
+        print(f"  {hits}/{len(utterances)} would fire at threshold {WAKE_THRESHOLD}")
 
     return 0
 
