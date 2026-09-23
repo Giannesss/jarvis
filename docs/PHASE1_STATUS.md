@@ -68,6 +68,10 @@ test that pinned the old one (`test_a_detection_inside_the_post_hole_cooldown_is
 plus a new test for the flush-on-entry path. Both fail against the pre-fix
 commit.
 
+**Confirmed live, 2026-09-23.** Both (B) and (E) held up at the mic: no
+beep-triggered reset observed, no hole manufactured by the drain-vs-flush gap
+they targeted.
+
 ## Probe run after the fix
 
 A prompted 10-attempt run was captured live post-fix (`data/wake_probe.csv`,
@@ -102,45 +106,57 @@ range as attempts 1, 6 and 8, which all fired cleanly. So on this run, 2/10
 misses look like ordinary threshold-margin variance, not a repeat of the
 reset bug and not a mic-gain problem.
 
-## Still open: the 30-90s long tail
+## `SILENCE_THRESHOLD_DB = -45` (fixed, commit `e6ef915`)
+
+Separately from wake-word scoring, the recorder's own speech/silence floor
+was too high for this microphone: real speech from `data/wake_probe.csv`
+had a median of -38.0 dB against a -35 dB floor, so onset detection missed
+half of ten genuinely spoken utterances outright (`"no_speech"` without ever
+registering speech). Dropped to -45, which replay-tested at 10/10 onset
+detection with zero false onsets across 39s of true silence. Confirmed as
+level-invariant to wake-word scoring (a 15 dB replay sweep moved detections
+by <0.001), so this was purely a recorder fix, not a wake-word tuning knob.
+
+**Confirmed live, 2026-09-23.** Speech onset registered reliably at the mic
+after the change; no repeat of the old "no_speech" cutoff on a normal-volume
+utterance.
+
+## Resolved: the 20-30s long tail is a model-fit limitation, not an app bug
 
 The original complaint was delays up to 90s, not misses inside a single ~4s
-attempt window. Nothing in this phase's data has reproduced or explained
-that directly — the prompted-attempt probe only measures the few seconds
-after the user is told to speak, so it can't see a 90s stall by
-construction. The instrumentation built for it (heartbeat, `_gap_blame`,
-score floor) is in place but hasn't yet been read against a live run that
-actually exhibits the long tail.
+attempt window. The frame-index instrumentation added in `35d4f0a`
+(`_frames_since_reset`, printed beside every score under `WAKE_DEBUG`) made
+it possible to read a long wait directly instead of guessing between
+delivery-side and scoring-side causes.
 
-Per the heartbeat/gap data reasoning that motivated `_gap_blame()`: a stall
-that long is not explained by ordinary frame loss (holes are bounded by
-`MAX_GAP_SECONDS`/`MAX_LOST_SECONDS` and would surface as a `"gap"` stop
-reason or a logged reset, not silence) — which points at a **scoring-side**
-issue rather than a **delivery-side** one: audio is reaching the model, but
-something about a live 30-90s wait behaves differently from a scripted
-10-attempt session (queue starvation the heartbeat hasn't caught in a
-directed test, model score drift over a longer idle stretch, cooldown/reset
-interaction outside the beep-hole case just fixed, etc.). This is a
-hypothesis, not a finding — it hasn't been isolated yet.
+**Confirmed live, 2026-09-23:** during a slow trigger (20-30s to fire), the
+frame index climbed continuously — no reset, no gap, no jump. Frames kept
+arriving and being scored the entire time; the model was simply not scoring
+"Τζάρβις" spoken with a Greek accent high enough, often enough, against a
+model trained on English "Hey Jarvis." This rules out every delivery-side
+hypothesis this phase considered (queue starvation, structural holes,
+beep-reset recurrence, cooldown/reset interaction) — the pipeline was
+healthy the whole time. It is a **recognition-fit problem**: the pretrained
+`hey_jarvis` model doesn't fit this accent/phrase well, so it takes several
+spoken attempts, each scoring low, before one climbs past threshold.
 
-## What to test next (at the mic)
+This is not an app bug to keep chasing in this phase. The real fix is a
+custom Greek "Τζάρβις" openWakeWord model (data-prep tooling already exists:
+`tools/gen_wakeword_clips.py`, `tools/record_wakeword_clips.py`) — deferred
+to later, not urgent, since the pretrained model does eventually fire and
+the beep-reset and silence-floor fixes above already removed the failure
+modes that made individual attempts silently vanish. Revisit if the
+20-30s-per-trigger cost becomes worth the model-training effort, per the
+roadmap doc.
 
-1. **Reproduce the long tail with `WAKE_DEBUG=true` running.** The goal is a
-   live session that actually hits a 30-90s delay with the heartbeat, gap
-   lines, and score floor all visible — none of the current data has that.
-2. **Read the heartbeat cadence during a long wait.** If it stops appearing
-   or slows down, the queue is starving (delivery-side, ffmpeg/device). If
-   it keeps ticking every 5s but no score ever gets near threshold, that's
-   scoring-side and points back at the model/session state.
-3. **Watch for repeated `reset()` calls during a single long wait.** If the
-   model is getting reset far more often than expected outside the
-   just-fixed beep-hole case, each reset buys ~1s of near-zero scoring —
-   several of those could plausibly compound into the 30-90s range.
-4. **Re-run the 10-attempt prompted probe a few more times** to see whether
-   the ~2/10 narrow-margin miss rate (peak ~0.40) is stable. If it climbs
-   toward 4-5/10, `WAKE_THRESHOLD` is too tight for real conditions and
-   lowering it is the fix this phase's roadmap note anticipated. If it stays
-   around 2/10, it's probably not worth chasing further.
-5. **Try `--replay` with `--gain-db`** on a saved long-tail session's WAV (if
-   one gets captured) to check whether a gain bump moves the borderline
-   ~0.40 scores meaningfully, before touching mic hardware or `.env`.
+## Phase 1: closing
+
+The three failure modes chased this phase are each resolved or explained:
+
+1. Beep-reset bug (B+E) — fixed and confirmed live.
+2. Recorder silence floor too high for this mic — fixed (`-45` dB) and
+   confirmed live.
+3. 20-30s trigger latency — explained as model/accent fit, not a bug;
+   real fix (custom Greek model) deferred, not urgent.
+
+Next phase per the roadmap doc: https://claude.ai/artifact/HdQAkniZAwJQVoMaTqX8q2
