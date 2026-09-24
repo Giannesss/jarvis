@@ -6,51 +6,73 @@ Not part of the app -- a diagnostic, like tools/wake_score_probe.py.
 Barge-in has to answer one question on every frame recorded while Jarvis is
 talking: is this him, or is this you? The microphone hears both, mixed, and
 nothing in the audio says which is which. Every threshold in the feature is
-therefore a bet on one number -- **how many dB above his own voice yours
-arrives** -- and that number is a property of your room, your speakers, your
-mic gain and where they all sit. It cannot be guessed from here, and it is the
-reason this probe exists before the feature does.
+therefore a bet on one number -- **how far above his own voice yours reaches**
+-- and that number is a property of your room, your speakers, your mic gain
+and where they all sit. It cannot be guessed from here, and it is the reason
+this probe exists before the feature does.
 
 Read the summary in this order:
 
-  * **margin (speech p50 - echo p50)**. This is the headroom barge-in has to
-    work in, and it decides whether the feature is buildable as designed:
+  * **the decision rule block**. This is the headline, because it is the only
+    thing that reports the statistic the feature actually tests. The rule
+    compares one frame against a *running median* of recent audio, and speech
+    is bursty against its own median by 25-30 dB -- so the number that decides
+    the feature is not the gap between two medians, it is how far each signal
+    reaches above the running floor and *stays* there for ONSET_SECONDS:
 
-        > 12 dB   comfortable. Set BARGE_IN_MARGIN_DB to about half of it.
-        6 - 12 dB workable, but expect to tune the onset window too.
-        < 6 dB    level alone cannot separate you from him. Turn the speakers
-                  down or move the mic; if the margin stays small, barge-in
-                  has to be BARGE_IN_MODE=wakeword (say the wake word to
-                  interrupt) rather than level-based.
-        negative  the mic hears him better than it hears you. Nothing
-                  downstream can fix that -- it is a furniture problem.
+        echo alone reaches +X dB   -> any margin at or below X false-fires on
+                                      Jarvis's own vowels
+        you over him      +Y dB   -> any margin above Y misses you
 
-  * **the would-have-fired table**. For each candidate margin it replays the
-    recorded frames through the same rule the feature will use (this many dB
-    over the running echo level, sustained for this long) and reports what it
-    would have done: a FIRE during the echo-only phase is a reply cut off for
-    nothing, a miss during the barge phase is an interruption that did not
-    work. Pick the smallest margin with no false fires.
+    Buildable iff Y > X, with the operating point between them. If Y <= X,
+    level alone cannot separate you from him: turn the speakers down or move
+    the mic, and if it stays that way, barge-in has to be
+    BARGE_IN_MODE=wakeword (say the wake word to interrupt).
 
-  * **echo p95 vs speech p50**. If the echo's loud tail reaches your median
-    speech, a median-based floor will flap. That is the case for a longer
-    onset window rather than a bigger margin.
+  * **the would-have-fired table**, which is the same thing measured per
+    candidate rather than as a bound. A FIRE during the echo-only phase is a
+    reply cut off for nothing; a miss during the barge phase is an
+    interruption that did not work. Pick the smallest margin with no false
+    fire that still fires on the barge.
 
-Two modes.
+  * **margin (speech p50 - echo p50)** is reported last and is *context, not
+    a verdict*. It compares two medians, while the rule compares an
+    instantaneous frame to a median. The two can differ by the burstiness
+    figure above, so a healthy-looking margin here is routinely accompanied
+    by false fires at every candidate. That is not a contradiction; it is the
+    two panels measuring different things.
 
-  Echo only -- Jarvis speaks, you stay quiet. This is the baseline and the
-  one to run first; it alone answers "how loud is he at the mic".
+Two modes. **Run --echo first, and give it a CSV.** The echo-only run is the
+one that establishes the false-fire bound, and it needs a long clean stretch
+of Jarvis talking: in a --barge run the echo bucket ends the moment you are
+prompted, which leaves only a few seconds of it.
 
-      .\.venv\Scripts\python.exe tools\barge_probe.py --echo
+  Echo only -- Jarvis speaks, you stay quiet.
+
+      .\.venv\Scripts\python.exe tools\barge_probe.py --echo --csv data\echo.csv
 
   Barge -- Jarvis speaks and the probe tells you when to talk over him. Say
   something ordinary at a normal volume, the way you actually would; saying
   it loudly proves nothing, because the whole question is whether normal
   speech clears him.
 
-      .\.venv\Scripts\python.exe tools\barge_probe.py --barge --csv data\barge_probe.csv
+      .\.venv\Scripts\python.exe tools\barge_probe.py --barge --csv data\barge.csv
 
 Ctrl+C stops early and still prints what it has.
+
+**The buckets are cut from real playback, not from speak().** speak() spends
+its first seconds synthesizing in total silence -- Edge TTS is a network
+round trip -- and counting that silence as "echo" drops the echo median by
+several dB and primes the false-fire replay on an empty room. Both make the
+feature look far more buildable than it is. speaker._intervals already
+records the wall-clock spans during which a sound was actually audible (it is
+what the capture gate reads), so the phases are cut from those, and frames
+inside the reply but outside them are reported as `synthesis` and dropped.
+
+**The barge bucket is bounded.** It covers BARGE_WINDOW_SECONDS after the
+prompt and no more. Left to run to the end of the reply it is mostly Jarvis
+again -- you say one phrase and he keeps talking for another fifteen seconds
+-- and its median then measures the mixture ratio rather than your voice.
 
 **The capture gate is deliberately bypassed.** listener._should_capture drops
 every frame recorded while Jarvis is audible -- which is precisely the audio
@@ -99,9 +121,28 @@ PASSAGE = (
 # number this probe exists to produce, so it is simply dropped.
 BARGE_REACTION_LEAD = 0.6
 
+# How much audio after the reaction lead counts as "you over Jarvis".
+#
+# This bound is the whole difference between measuring your voice and
+# measuring a mixture. You are asked for one ordinary phrase; the reply runs
+# for another fifteen or twenty seconds afterwards, and every one of those
+# seconds is echo-only audio that would land in the speech bucket. Measured
+# on a real run, an unbounded bucket was 18.2s long and alternated between
+# your level and the echo's, with a median sitting halfway between the two
+# and moving with how long you happened to speak.
+#
+# Generous enough for a phrase said at a normal pace, short enough that it
+# cannot swallow the rest of the reply.
+BARGE_WINDOW_SECONDS = 2.5
+
 # Candidate margins the would-have-fired table reports on, in dB over the
 # running echo level.
-CANDIDATE_MARGINS = (3.0, 6.0, 9.0, 12.0, 15.0)
+#
+# These start where they do because speech is bursty against its own running
+# median by 25-30 dB, so every candidate below about 18 dB fires on Jarvis's
+# own vowels -- a table that stopped at 15 dB reported a false fire on every
+# row and pointed at no usable operating point at all.
+CANDIDATE_MARGINS = (9.0, 12.0, 15.0, 18.0, 21.0, 24.0, 27.0)
 
 # How long a frame run must stay above the floor to count as a barge-in.
 # Longer than the recorder's ONSET_SECONDS (0.16s) on purpose: a door or a
@@ -135,16 +176,23 @@ def _describe(name: str, levels: list[float]) -> str:
     )
 
 
-def _would_fire(
-    prime: list[float], test: list[float], margin: float
-) -> tuple[bool, float]:
-    """Replay the barge-in rule: prime the echo estimate, then run it.
+def _window_frames() -> int:
+    return max(1, int(ECHO_WINDOW_SECONDS / listener.FRAME_SECONDS))
 
-    Returns (fired, seconds into `test`).
+
+def _onset_frames() -> int:
+    return max(1, int(ONSET_SECONDS / listener.FRAME_SECONDS))
+
+
+def _deltas(prime: list[float], test: list[float]) -> list[float]:
+    """Each test frame's level minus the running median in front of it.
+
+    This is the quantity the decision rule thresholds, so every number the
+    summary reports about the rule is derived from it rather than from a
+    second, differently-shaped statistic.
 
     **`prime` is not optional, and leaving it out is the bug this signature
-    exists to prevent.** The rule is "this many dB above the running level of
-    recent audio", and the running level means *Jarvis's* level -- which is
+    exists to prevent.** The running level means *Jarvis's* level, which is
     established by the frames before the user speaks. Building the median out
     of the frames under test instead lets the floor chase the interruption
     upward, and nothing ever clears it: a synthetic run with a clean +11.4 dB
@@ -155,24 +203,48 @@ def _would_fire(
     two-second window, so it cannot pull the floor up over itself before the
     onset window has already elapsed.
     """
-    window_frames = max(1, int(ECHO_WINDOW_SECONDS / listener.FRAME_SECONDS))
-    onset_frames = max(1, int(ONSET_SECONDS / listener.FRAME_SECONDS))
-    window = collections.deque(prime[-window_frames:], maxlen=window_frames)
-    run = 0
-
-    for index, level in enumerate(test):
-        if window:
-            floor = statistics.median(window) + margin
-            if level > floor:
-                run += 1
-                if run >= onset_frames:
-                    return True, index * listener.FRAME_SECONDS
-            else:
-                run = 0
-
+    size = _window_frames()
+    window = collections.deque(prime[-size:], maxlen=size)
+    out: list[float] = []
+    for level in test:
+        out.append(level - statistics.median(window) if window else float("-inf"))
         window.append(level)
+    return out
 
+
+def _would_fire(
+    prime: list[float], test: list[float], margin: float
+) -> tuple[bool, float]:
+    """Replay the barge-in rule. Returns (fired, seconds into `test`)."""
+    onset = _onset_frames()
+    run = 0
+    for index, delta in enumerate(_deltas(prime, test)):
+        if delta > margin:
+            run += 1
+            if run >= onset:
+                return True, (index - onset + 1) * listener.FRAME_SECONDS
+        else:
+            run = 0
     return False, 0.0
+
+
+def _reach(prime: list[float], test: list[float]) -> float:
+    """The largest margin this audio would still fire at.
+
+    Equivalently: the highest level, in dB over the running median, that the
+    signal holds for a sustained ONSET_SECONDS. For echo-only audio that is
+    the false-fire bound -- any margin at or below it cuts off a reply for
+    nothing. For barge audio it is the miss bound. The feature is buildable
+    exactly when the second exceeds the first, which is the one comparison
+    the old summary never made.
+    """
+    deltas = _deltas(prime, test)
+    onset = _onset_frames()
+    if len(deltas) < onset:
+        return float("-inf")
+    return max(
+        min(deltas[i:i + onset]) for i in range(len(deltas) - onset + 1)
+    )
 
 
 class _Probe:
@@ -193,20 +265,13 @@ class _Probe:
         if self._csv_file is not None:
             self._csv_file.close()
 
-    def write_csv(self, phases: list[tuple[float, float, str]]) -> None:
+    def write_csv(self, label) -> None:
         if self._csv is None:
             return
         for stream_time, level in self.frames:
             self._csv.writerow(
-                [f"{stream_time:.3f}", f"{level:.2f}", _phase_of(stream_time, phases)]
+                [f"{stream_time:.3f}", f"{level:.2f}", label(stream_time)]
             )
-
-
-def _phase_of(stream_time: float, phases: list[tuple[float, float, str]]) -> str:
-    for start, end, name in phases:
-        if start <= stream_time < end:
-            return name
-    return "idle"
 
 
 def _drain_into(probe: _Probe, stop: threading.Event) -> None:
@@ -229,16 +294,40 @@ def _speak_in_background(text: str) -> threading.Thread:
     return thread
 
 
+def _wait_for_playback(stop: threading.Event, timeout: float = 30.0) -> float | None:
+    """Block until a sound is actually audible, and return when that was.
+
+    speaker._playback_start is set by the _playing() context manager at the
+    instant playback begins, which is the event this probe cares about and
+    which speak() returning cannot tell us.
+    """
+    deadline = time.perf_counter() + timeout
+    while not stop.is_set() and time.perf_counter() < deadline:
+        started = speaker._playback_start
+        if started is not None:
+            return started
+        if stop.wait(0.02):
+            break
+    return None
+
+
 def _prompt_barge(delay: float, stop: threading.Event, prompted: dict) -> None:
     """Tell the user to speak, and record exactly when we told them.
 
     The wall clock here -- not a fraction of the reply's length -- is what
-    splits the echo-only frames from the ones with speech over them. The two
-    are not the same instant: this fires `delay` seconds after speak() was
-    called, and speak() spends its first second or two synthesizing in
-    silence before any playback starts at all.
+    splits the echo-only frames from the ones with speech over them.
+
+    The delay is counted from **playback onset**, not from the speak() call.
+    Synthesis is silent and its length varies with the network, so counting
+    from the call made `--barge-after 6` mean anything from four to six
+    seconds of actual echo, and left the echo bucket short by however long
+    Edge TTS happened to take.
     """
-    if stop.wait(delay):
+    started = _wait_for_playback(stop)
+    if started is None:
+        return
+    remaining = delay - (time.perf_counter() - started)
+    if remaining > 0 and stop.wait(remaining):
         return
     prompted["at"] = time.perf_counter()
     print("\n  >>> ΜΙΛΑ ΤΩΡΑ -- πες κάτι κανονικά, πάνω από τη φωνή του <<<\n")
@@ -261,20 +350,19 @@ def run(args: argparse.Namespace) -> int:
     reader = threading.Thread(target=_drain_into, args=(probe, stop), daemon=True)
     reader.start()
 
-    phases: list[tuple[float, float, str]] = []
+    # Wall clock throughout. Converting to stream time needs _stream_origin,
+    # which is a rolling estimate that is still tightening while the run is
+    # in progress -- so every boundary is converted once, at the end, with
+    # the final estimate. Converting each as it happened mixed origins and
+    # shifted the phase edges against each other.
+    marks: list[tuple[float, float, str]] = []
     prompted: dict[str, float] = {}
-
-    def mark(name: str, start_wall: float, end_wall: float) -> None:
-        origin = listener._stream_origin
-        if origin is None:
-            return
-        phases.append((start_wall - origin, end_wall - origin, name))
 
     try:
         print("\nBaseline: μείνε σιωπηλός για 3 δευτερόλεπτα...")
         base_start = time.perf_counter()
         time.sleep(3.0)
-        mark("baseline", base_start, time.perf_counter())
+        marks.append((base_start, time.perf_counter(), "baseline"))
 
         print("Ο Τζάρβις μιλάει τώρα.")
         if args.barge:
@@ -292,7 +380,13 @@ def run(args: argparse.Namespace) -> int:
 
         speaking.join()
         speak_end = time.perf_counter()
-        mark("speaking", speak_start, speak_end)
+        marks.append((speak_start, speak_end, "reply"))
+
+        # The spans during which a sound was actually in the room. speak()
+        # brackets synthesis as well, and synthesis is silent.
+        for start, end in list(speaker._intervals):
+            if end >= speak_start and start <= speak_end:
+                marks.append((start, end, "audible"))
 
         print("Τέλος. Μείνε σιωπηλός άλλα 2 δευτερόλεπτα...")
         time.sleep(2.0)
@@ -303,66 +397,75 @@ def run(args: argparse.Namespace) -> int:
         reader.join(timeout=2)
         listener.stop_stream()
 
-    return _summarize(probe, phases, prompted, args)
+    return _summarize(probe, marks, prompted, args)
 
 
-def _summarize(probe: _Probe, phases, prompted: dict, args) -> int:
+def _summarize(probe: _Probe, marks, prompted: dict, args) -> int:
     if not probe.frames:
         print("\nNo frames were captured at all -- check the microphone.")
         return 1
 
-    speaking_phase = next((p for p in phases if p[2] == "speaking"), None)
-    if speaking_phase is None:
-        print("\nPlayback never started, so there is nothing to compare.")
+    origin = listener._stream_origin
+    if origin is None:
+        print("\nThe stream never produced an origin estimate.")
         return 1
 
-    origin = listener._stream_origin
+    def to_stream(wall: float) -> float:
+        return wall - origin
+
+    spans = [(to_stream(s), to_stream(e), name) for s, e, name in marks]
+    audible = [(s, e) for s, e, name in spans if name == "audible"]
+    reply = next(((s, e) for s, e, name in spans if name == "reply"), None)
+    baseline_span = next(((s, e) for s, e, name in spans if name == "baseline"), None)
+
+    if not audible:
+        print("\nPlayback never became audible, so there is nothing to compare.")
+        return 1
+
     barge_at = None
     if args.barge:
         if "at" not in prompted:
             print("\nThe speak prompt never fired, so only the echo was measured.")
-        elif origin is None:
-            print("\nThe stream never produced an origin estimate.")
         else:
-            # Converted on the same clock every frame carries, so the split
-            # lands where the user was actually told to speak.
-            barge_at = (prompted["at"] - origin) + BARGE_REACTION_LEAD
-
-    baseline: list[float] = []
-    echo: list[float] = []
-    barge: list[float] = []
-    dropped = 0
-
-    # Frames between the prompt and the end of the reaction window are
-    # neither: see BARGE_REACTION_LEAD.
+            barge_at = to_stream(prompted["at"]) + BARGE_REACTION_LEAD
     lead_start = barge_at - BARGE_REACTION_LEAD if barge_at is not None else None
+    barge_end = barge_at + BARGE_WINDOW_SECONDS if barge_at is not None else None
 
+    def label(t: float) -> str:
+        """One place deciding which bucket a frame lands in.
+
+        The summary and the CSV both read it, so a row can always be traced
+        back to the population it was counted in -- they were computed by two
+        separate pieces of logic before, which is a standing invitation for
+        the file and the numbers to disagree.
+        """
+        if baseline_span and baseline_span[0] <= t < baseline_span[1]:
+            return "baseline"
+        if any(s <= t < e for s, e in audible):
+            if barge_at is not None:
+                if t >= barge_end:
+                    return "post"      # he is still talking; not your voice
+                if t >= barge_at:
+                    return "barge"
+                if t >= lead_start:
+                    return "reaction"  # see BARGE_REACTION_LEAD
+            return "echo"
+        if reply and reply[0] <= t < reply[1]:
+            return "synthesis"         # inside speak(), but silent
+        return "idle"
+
+    buckets: dict[str, list[float]] = collections.defaultdict(list)
     for stream_time, level in probe.frames:
-        phase = _phase_of(stream_time, phases)
-        if phase == "baseline":
-            baseline.append(level)
-        elif phase == "speaking":
-            if barge_at is not None and stream_time >= barge_at:
-                barge.append(level)
-            elif lead_start is not None and stream_time >= lead_start:
-                dropped += 1
-            else:
-                echo.append(level)
+        buckets[label(stream_time)].append(level)
 
-    # Both lists are already in recorded order, which is what the
-    # would-have-fired replay needs: it rebuilds a running median as it goes.
-    echo_ordered, barge_ordered = echo, barge
-
-    # Label the CSV with the same split the summary used, so a row can be
-    # traced back to which population it landed in. Inserted at the front
-    # because _phase_of takes the first match and "speaking" spans both.
-    if barge_at is not None:
-        speak_end = speaking_phase[1]
-        phases.insert(0, (barge_at, speak_end, "barge"))
-        phases.insert(0, (lead_start, barge_at, "reaction"))
-
-    probe.write_csv(phases)
+    probe.write_csv(label)
     probe.close()
+
+    baseline = buckets["baseline"]
+    # Already in recorded order, which is what the replay needs: it rebuilds
+    # a running median as it goes.
+    echo = buckets["echo"]
+    barge = buckets["barge"]
 
     print("\n" + "=" * 72)
     print("LEVELS")
@@ -370,45 +473,92 @@ def _summarize(probe: _Probe, phases, prompted: dict, args) -> int:
     print(_describe("Jarvis only (echo)", echo))
     if args.barge:
         print(_describe("you over Jarvis", barge))
-        if dropped:
-            print(f"  ({dropped} frames dropped as reaction time after the prompt)")
 
-    if echo and barge:
-        margin = _percentile(barge, 0.50) - _percentile(echo, 0.50)
-        print(f"\n  margin (speech p50 - echo p50): {margin:+.1f} dB")
-        if margin < 6:
-            print("  -> too small for a level-based rule. See the module docstring.")
-        elif margin < 12:
-            print("  -> workable; expect to tune the onset window as well.")
-        else:
-            print(f"  -> comfortable. Try BARGE_IN_MARGIN_DB around {margin / 2:.0f}.")
+    dropped = [
+        (name, len(buckets[name]))
+        for name in ("synthesis", "reaction", "post")
+        if buckets[name]
+    ]
+    if dropped:
+        print("\n  dropped from both buckets:")
+        why = {
+            "synthesis": "inside speak() but silent -- Edge TTS on the network",
+            "reaction": "reaction time after the prompt",
+            "post": f"more than {BARGE_WINDOW_SECONDS:.1f}s after the prompt"
+                    " -- he is still talking",
+        }
+        for name, count in dropped:
+            print(f"    {name:<10} {count:>4} frames "
+                  f"({count * listener.FRAME_SECONDS:5.2f}s)  {why[name]}")
 
-        print(f"\n  echo p95 {_percentile(echo, 0.95):.1f} dB vs speech p50 "
-              f"{_percentile(barge, 0.50):.1f} dB")
+    # The prime is the audio the live decider will be holding when the user
+    # starts talking, and it must be real echo. Priming on the synthesis
+    # silence -- which is what cutting the phase from speak() used to do --
+    # starts the floor at the empty room's level, and then the first vowel
+    # Jarvis utters clears every candidate margin.
+    split = _window_frames()
+    echo_prime, echo_test = echo[:split], echo[split:]
 
-    if echo_ordered:
+    if len(echo_test) >= _onset_frames():
         print("\n" + "=" * 72)
-        print(f"WOULD-HAVE-FIRED  (onset {ONSET_SECONDS:.2f}s, "
-              f"echo window {ECHO_WINDOW_SECONDS:.1f}s)")
+        print(f"DECISION RULE  (sustained {ONSET_SECONDS:.2f}s over a running "
+              f"{ECHO_WINDOW_SECONDS:.1f}s median)")
+        echo_reach = _reach(echo_prime, echo_test)
+        print(f"  echo alone reaches   {echo_reach:+6.1f} dB over its own running "
+              f"median")
+        print(f"     -> a margin at or below {echo_reach:.0f} dB false-fires on his "
+              f"own vowels")
+        if barge:
+            barge_reach = _reach(echo, barge)
+            print(f"  you over Jarvis      {barge_reach:+6.1f} dB")
+            print(f"     -> a margin above {barge_reach:.0f} dB misses you")
+            if barge_reach > echo_reach:
+                lo, hi = echo_reach, barge_reach
+                print(f"\n  => usable margins: {lo:.0f} to {hi:.0f} dB. "
+                      f"Try BARGE_IN_MARGIN_DB around {(lo + hi) / 2:.0f}.")
+            else:
+                print("\n  => no usable margin: he reaches as far over the floor as "
+                      "you do.")
+                print("     Turn the speakers down or move the mic and re-run. If it "
+                      "stays\n     this way, barge-in has to be "
+                      "BARGE_IN_MODE=wakeword.")
+        else:
+            print("  you over Jarvis      (not measured -- this is an --echo run)")
+
+        print("\n" + "=" * 72)
+        print("WOULD-HAVE-FIRED")
         print(f"  {'margin':>8}  {'echo-only phase':<26}  barge phase")
-        # The false-positive run primes on the opening of the echo and is
-        # tested on the rest of it; the true-positive run primes on the whole
-        # echo, which is what the live decider will be holding when the user
-        # starts talking.
-        split = max(1, int(ECHO_WINDOW_SECONDS / listener.FRAME_SECONDS))
         for candidate in CANDIDATE_MARGINS:
-            false_fire, false_at = _would_fire(
-                echo_ordered[:split], echo_ordered[split:], candidate
-            )
+            false_fire, false_at = _would_fire(echo_prime, echo_test, candidate)
             left = f"FIRE at +{false_at:.2f}s (false)" if false_fire else "silent (good)"
-            if barge_ordered:
-                hit, hit_at = _would_fire(echo_ordered, barge_ordered, candidate)
+            if barge:
+                hit, hit_at = _would_fire(echo, barge, candidate)
                 right = f"FIRE at +{hit_at:.2f}s (good)" if hit else "MISSED"
             else:
                 right = "(not measured)"
             print(f"  {candidate:6.0f} dB  {left:<26}  {right}")
         print("\n  Pick the smallest margin with no false fire that still fires"
               " on the barge.")
+    else:
+        print(f"\n  Not enough clean echo to replay the rule: {len(echo)} frames, and "
+              f"the\n  first {split} prime the floor. Run --echo (or raise "
+              f"--barge-after) for a\n  longer stretch of Jarvis talking alone.")
+
+    if echo and barge:
+        print("\n" + "=" * 72)
+        print("CONTEXT  (not the verdict -- see the decision rule block above)")
+        margin = _percentile(barge, 0.50) - _percentile(echo, 0.50)
+        print(f"  margin (speech p50 - echo p50): {margin:+.1f} dB")
+        burst = _percentile(echo, 0.95) - _percentile(echo, 0.50)
+        print(f"  echo burstiness (p95 - p50):    {burst:+.1f} dB")
+        print("\n  These two are why the margin above is not the verdict: the rule")
+        print("  thresholds single frames against a median, so a margin has to clear")
+        print("  the echo's *burstiness*, not its median. Whenever the burstiness")
+        print("  exceeds the margin, expect false fires at every candidate below it.")
+        print(f"\n  (For the same reason 'echo p95 {_percentile(echo, 0.95):.1f} dB "
+              f"vs speech p50 {_percentile(barge, 0.50):.1f} dB'")
+        print("   is near-tautological when both sides are speech, and is no longer")
+        print("   reported as a finding.)")
 
     print("=" * 72)
     if args.csv:
@@ -423,7 +573,7 @@ def main() -> int:
     parser.add_argument("--barge", action="store_true",
                         help="Jarvis speaks and you talk over him when prompted")
     parser.add_argument("--barge-after", type=float, default=6.0,
-                        help="seconds into playback before the speak prompt")
+                        help="seconds of audible playback before the speak prompt")
     parser.add_argument("--csv", help="write one row per frame here")
     args = parser.parse_args()
 
