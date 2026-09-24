@@ -54,7 +54,8 @@ voice model downloaded into `models/`. Enter at the prompt to record, `exit`/`qu
 3. **LLM reply** — `jarvis/brain.py` sends the running chat history to a
    local Ollama model (`ollama.chat`) with a system prompt asking for short,
    natural-sounding replies (no markdown, no calling itself an AI unless
-   asked). The prompt doesn't say anything about which language to reply
+   asked) and refusing to invent the user's own facts (see "Grounding").
+   The prompt doesn't say anything about which language to reply
    in — see "Language" for how that's actually handled.
 4. **Text-to-speech** — `jarvis/speaker.py` synthesizes the reply with
    Microsoft Edge TTS by default (`TTS_ENGINE=edge`), falling back to
@@ -1261,6 +1262,49 @@ Two consequences to carry forward:
 negatives are the ones that matter — eight sentences that must keep reaching
 the brain — because loosening a trigger trades a missed save for the risk of
 a silent wrong one.
+
+## Grounding
+
+The brain is a small local model with no tools and no network, and its
+failure mode is not silence — it is a fluent invention. Asked what the shop
+sold in March it will name a figure; asked what is on today it will invent a
+deadline. Both read exactly like an answer, and out loud there is nothing to
+reread.
+
+So `SYSTEM_PROMPT` has a second paragraph, and it draws the line by
+**subject, not by confidence**. Anything about the speaker's own life — their
+schedule, school, courses, coursework, obligations, business — may only be
+said if it is in the recalled memory block or was said earlier in this same
+conversation. Names, dates, times, deadlines, numbers and turnover are never
+to be produced from the model's own head, *not even as an example or a
+hypothetical* — that hedge is spelled out because it is the loophole a model
+takes when told not to guess: it guesses and labels the guess «ας πούμε».
+
+General world knowledge is explicitly still allowed. The instruction is
+about the user's facts, not about the model's; forbidding invention wholesale
+would also have cost the capital-of-Australia answer the few-shot examples
+ask for.
+
+**"No internet" is stated separately** because it is a different kind of
+ignorance. Weather, news, prices, email and messages are not things the model
+lacks memory of — they are things nothing in this process can ever reach, so
+the honest answer is fixed rather than dependent on what was saved.
+
+The prompt also supplies the words for saying no — «δεν το ξέρω αυτό», «δεν
+μου το έχεις πει», «δεν έχω πρόσβαση σε αυτό» — and says to stop there. A
+model told only *not* to answer tends to fill the turn with an apology and
+then answer anyway.
+
+Two few-shot examples carry the same thing by demonstration, which this model
+follows more reliably than prose: a weather question and a question about the
+user's own shop, each answered with a flat refusal and nothing after it. They
+sit in `FEW_SHOT_EXAMPLES`, inside the frozen prefix, so the history trim can
+never drop them.
+
+None of this is enforceable in code — it is a prompt, and a prompt is
+persuasion. It was hand-tested on live audio against the five questions that
+had previously drawn invented answers, and the one that mattered was the
+business-figures question, since that is the failure a user would act on.
 
 ## Language
 
