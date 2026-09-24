@@ -57,9 +57,10 @@ voice model downloaded into `models/`. Enter at the prompt to record, `exit`/`qu
    asked). The prompt doesn't say anything about which language to reply
    in — see "Language" for how that's actually handled.
 4. **Text-to-speech** — `jarvis/speaker.py` synthesizes the reply with
-   Microsoft Edge TTS by default (`TTS_ENGINE=edge`) and plays it via
-   `winsound`, falling back to offline Piper if Edge synthesis fails (e.g.
-   no internet) or if `TTS_ENGINE=piper`.
+   Microsoft Edge TTS by default (`TTS_ENGINE=edge`), falling back to
+   offline Piper if Edge synthesis fails (e.g. no internet) or if
+   `TTS_ENGINE=piper`. Both hand raw PCM to `jarvis/player.py`, which can be
+   stopped mid-word — see "Playback".
 
 `main.py` wires these together in a loop, trying `jarvis/skills.py` first and
 only falling back to the brain when a skill doesn't match (see "Skills").
@@ -73,7 +74,10 @@ only falling back to the brain when a skill doesn't match (see "Skills").
   the kill switch, the audit log, and `python -m jarvis.policy` (also backing
   `:policy` at the prompt). See "Policy".
 - `jarvis/brain.py` — Ollama chat call + conversation history + system prompt.
-- `jarvis/speaker.py` — Piper TTS + playback.
+- `jarvis/speaker.py` — Edge/Piper synthesis, the speech lock, and the
+  audible-interval bookkeeping the capture gate reads.
+- `jarvis/player.py` — the output device: one PortAudio stream per utterance,
+  fed from a queue, abortable mid-word. See "Playback".
 - `jarvis/config.py` — loads `.env` (via `python-dotenv`) into `OLLAMA_MODEL` and `PIPER_MODEL_PATH`.
 - `jarvis/text.py` — Greek normalization (see "Normalization"), the span map
   that makes captures verbatim, the fuzzy word matcher (`edit_distance`,
@@ -90,6 +94,10 @@ only falling back to the brain when a skill doesn't match (see "Skills").
   startup catch-up for what came due while Jarvis was off. See "Scheduler".
 - `jarvis/memory.py` — parsing speech into rows, and recalling rows as context.
 - `jarvis/mem.py` — `python -m jarvis.mem`, also backing `:mem` at the prompt.
+- `tools/barge_probe.py` — standalone barge-in diagnostic, not part of the
+  app: measures how loud Jarvis's own voice arrives at the microphone against
+  how loud you are talking over it, and replays candidate thresholds over the
+  recorded frames. See "Playback".
 - `tools/wake_score_probe.py` — standalone wake-word diagnostic, not part of
   the app: scores live or replayed audio with no threshold or debug floor in
   the way (free-running, prompted-attempts, and replay modes). See "Roadmap".
@@ -131,6 +139,81 @@ top of `jarvis/listener.py`.
 
 No new dependencies or API-key handling have been added for the
 placeholders — that's future work when one is actually implemented.
+
+## Playback
+
+`jarvis/player.py` owns the output device; `speaker.py` owns synthesis, the
+lock that serializes two callers, and the audible intervals the capture gate
+reads. They were one module until Phase 3, and the split is what makes a
+reply stoppable.
+
+**The reason it had to change.** `speaker.speak()` played with
+`winsound.PlaySound(wav_bytes, SND_MEMORY)`, which blocks until the sound
+ends and cannot be cancelled — Python refuses the one flag combination that
+would help:
+
+```
+>>> winsound.PlaySound(data, winsound.SND_MEMORY | winsound.SND_ASYNC)
+RuntimeError: Cannot play asynchronously from memory
+```
+
+So barge-in was never a feature that could be bolted onto the old speaker: a
+reply already handed to winsound was going to finish. It also had no way to
+answer "how much of that did we actually say", which is what the
+conversation history has to be committed from once a reply can be cut in
+half.
+
+A `Player` is one PortAudio stream per utterance, fed from a deque by the
+callback thread. Four things about it are deliberate:
+
+- **One stream across chunks, not one per sentence.** A streamed reply
+  arrives as several separately synthesized pieces; giving each its own
+  device open/close would put a seam between every sentence. Appending to a
+  running stream makes the seam a buffer hand-off instead.
+- **Underruns are counted, never silent.** If synthesis falls behind
+  playback the callback has nothing to hand the device and plays silence —
+  audible as a hole mid-sentence and otherwise invisible. Same discipline as
+  `listener._frames_evicted`, which exists for the same reason.
+- **`played_seconds` is what reached the device, not what was heard.**
+  PortAudio runs up to a blocksize plus the device's own latency ahead of
+  the speaker cone, so it overstates by ~20–50ms. That is the right
+  direction to be wrong in: it decides how much of a reply to commit to
+  history, and crediting Jarvis with a few milliseconds he almost said beats
+  dropping a word he did.
+- **`CallbackStop` is raised on the block that empties the buffer, not the
+  one after.** sounddevice's own contract is that pending buffers still
+  play, so that block is heard in full; raising a block later would append
+  silence to every reply, and not raising it would count an underrun for a
+  sentence that simply ended.
+
+**`speaker.stop()` is the output half of barge-in** — deciding *whether* to
+interrupt is somebody else's job. It is not a no-op when nothing is playing
+yet, and that is the non-obvious part. Measured live: an Edge synthesis took
+1.53s, a stop arrived at 1.20s, and the reply then played out in full,
+because `_current` was still `None` and the stop was dropped on the floor. A
+stop that does nothing is worse than no stop at all — the user hears the
+assistant ignore them. So it sets `_stop_pending`, which the next player to
+start within that same `speak()` honours; `speak()` clears the flag on
+entry, so a stop aimed at the previous reply cannot silence the next one.
+
+**The device is configurable because PortAudio's default is not Windows's.**
+Measured here, PortAudio picks device 3 (MME, the monitor's HDMI output)
+while winsound followed the system setting. `PLAYBACK_DEVICE` takes an index
+or part of a device name; empty means PortAudio's default. If replies ever
+go silent, this is the first thing to check. A device that will not open
+raises `PlaybackUnavailable` and `speaker.py` falls back to winsound —
+uninterruptible, but losing barge-in is cheaper than losing the reply.
+
+**The beeps stay on `winsound.Beep`.** They drive the system beep rather
+than an output stream, they are far too short for cancelling to mean
+anything, and keeping them off the PortAudio path means a device that will
+not open costs the reply's quality and never the cue that tells the user to
+speak.
+
+`tests/test_player.py` drives the callback by hand, one block at a time,
+with `sounddevice` faked in `sys.modules` — the same way
+`tests/test_record_timing.py` drives `_StopDecider` from a list. Nothing in
+the suite opens an audio device.
 
 ## Wake word
 

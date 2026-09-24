@@ -17,6 +17,58 @@ BRAIN_PROVIDER = os.environ.get("BRAIN_PROVIDER", "ollama")
 TTS_ENGINE = os.environ.get("TTS_ENGINE", "edge")
 TTS_VOICE = os.environ.get("TTS_VOICE", "el-GR-NestorasNeural")
 
+# Playback (jarvis/player.py). Replies now play through one PortAudio stream
+# instead of winsound, because winsound cannot play from memory
+# asynchronously ("RuntimeError: Cannot play asynchronously from memory") and
+# so cannot be stopped once started -- which is the whole of barge-in.
+#
+# PLAYBACK_DEVICE is empty for PortAudio's own default, an index, or a
+# substring of a device name ("Realtek"). It is configurable because
+# PortAudio's default is NOT necessarily the Windows default winsound used:
+# measured here, PortAudio picks the monitor's HDMI output. If Jarvis goes
+# quiet after this change, this is the first thing to check.
+#
+# PLAYBACK_BLOCKSIZE is how much audio the device is handed at a time, so it
+# is also how long a barge-in takes to actually silence him: 512 frames is
+# ~23ms at 22050 Hz. Smaller is more responsive and more likely to underrun.
+PLAYBACK_DEVICE = os.environ.get("PLAYBACK_DEVICE", "")
+PLAYBACK_BLOCKSIZE = int(os.environ.get("PLAYBACK_BLOCKSIZE", "512"))
+
+# Streaming replies (jarvis/chunker.py): how a reply is cut into pieces worth
+# speaking before the rest of it exists.
+#
+# STREAM_EARLY_FIRST_CHUNK lets the *first* piece be smaller than a sentence,
+# broken at a comma. This is the knob that decides whether streaming is
+# visible at all: measured warm on qwen3:8b, the first sentence completes at
+# 5.4-6.1s and the whole reply at 6.2-8.0s -- and in one of the two trials the
+# first sentence WAS the whole reply, 0.08s apart, because SYSTEM_PROMPT asks
+# for one or two short sentences. Sentence-granular streaming therefore buys
+# ~0.5s on a typical reply; breaking the first chunk at a clause gets the
+# first words out at ~2-3s. The cost is prosody at one seam, once per reply.
+# Turn it off to keep whole sentences everywhere.
+STREAM_EARLY_FIRST_CHUNK = (
+    os.environ.get("STREAM_EARLY_FIRST_CHUNK", "true").lower() == "true"
+)
+# 25, not 40, and the difference is the whole feature. A typical short Greek
+# reply puts its first comma around character 36 ("Συνήθως είναι ζεστός και
+# ηλιόλουστος,"), so a minimum of 40 skips it and finds nothing until the
+# sentence ends -- the early chunk never fires at all. Measured live against
+# qwen3:8b, time until the first words could start playing:
+#
+#     "Τι καιρό κάνει τον Οκτώβριο;"   off 6.33s   min=40 6.24s   min=25 3.26s
+#     "Πες μου δυο πράγματα για την Αθήνα."
+#                                      off 8.32s   min=40 5.47s   min=25 5.54s
+#
+# Below ~20 it starts cutting off openers ("Λοιπόν,") as chunks of their own,
+# which wastes a synthesis round trip on one word and sounds clipped.
+STREAM_FIRST_CHUNK_MIN_CHARS = int(os.environ.get("STREAM_FIRST_CHUNK_MIN_CHARS", "25"))
+STREAM_FIRST_CHUNK_MAX_CHARS = int(os.environ.get("STREAM_FIRST_CHUNK_MAX_CHARS", "140"))
+
+# Never synthesize a piece shorter than this on its own: a two-word chunk
+# spends the same ~0.4s Edge round trip as a whole sentence and lands clipped.
+# A short sentence is merged into the next one instead.
+STREAM_MIN_CHUNK_CHARS = int(os.environ.get("STREAM_MIN_CHUNK_CHARS", "16"))
+
 # Recording silence detection (see jarvis/listener.py). The floor separating
 # speech from room noise, in dBFS: _StopDecider compares each 80ms frame's RMS
 # against it, and ffmpeg's silencedetect takes the same number.
