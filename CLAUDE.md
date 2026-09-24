@@ -103,7 +103,12 @@ only falling back to the brain when a skill doesn't match (see "Skills").
   audio is meant to be flowing continuously) and the run is abandoned with a
   device diagnosis the moment the microphone stops feeding it, rather than
   summarized as statistics; see the stderr note under "The recording clock"
-  for the run that earned that.
+  for the run that earned that. `tests/test_barge_probe.py` pins the phase
+  bucketing on synthetic frames — unusual for a diagnostic, and there because
+  the buckets were once accused of dropping every frame when the real fault
+  was the microphone. It asserts through the CSV, which is written by the same
+  `label` closure the summary counts through, so it tests that the file and
+  the numbers agree as well as that the labels are right.
 - `tools/wake_score_probe.py` — standalone wake-word diagnostic, not part of
   the app: scores live or replayed audio with no threshold or debug floor in
   the way (free-running, prompted-attempts, and replay modes). See "Roadmap".
