@@ -120,6 +120,23 @@ WAIT_HEARTBEAT_SECONDS = 5.0
 # bounded one.
 STREAM_STALL_TIMEOUT = 15.0
 
+# How long start_stream() waits for evidence that the device really opened.
+#
+# Popen succeeding says nothing about the microphone. ffmpeg starts fine,
+# fails to open the device, prints why, and exits -- and start_stream() used
+# to report success anyway, because it only ever checked that the process had
+# been *created*. Measured with the mic unplugged: exit code -5 (AVERROR EIO)
+# about 200ms in, after which every consumer waited on a queue nothing would
+# ever fill. The probe spent a full 25-second script that way and then blamed
+# its own statistics.
+#
+# Only a process that has *exited* is treated as a failure. A device that is
+# merely slow must never cost wake-word mode, so a timeout with ffmpeg still
+# alive returns normally and leaves the case to STREAM_STALL_TIMEOUT. The
+# bound therefore only has to exceed the ~1.4s DirectShow takes to hand over
+# its first frame, and the loop returns the moment that frame arrives.
+DEVICE_OPEN_TIMEOUT = 2.5
+
 # dB reported for a completely silent frame (log10(0) is undefined).
 SILENT_DB = -90.0
 
@@ -453,6 +470,68 @@ def _drain(item_queue: "queue.Queue") -> None:
             return
 
 
+# ffmpeg's own description of what it opened, which it prints on every
+# successful start. Dropped from _stderr_lines because a caller asking what
+# ffmpeg said about a *failure* must not be handed six lines of banner that
+# look like an explanation and are not -- which is the same mistake as
+# reporting a -47 dB room level measured from one buffer of teardown noise.
+#
+# A structural filter, not a keyword one: this removes known boilerplate
+# rather than trying to recognise an unknown error, so a heading that slips
+# through costs one noisy line while a missed error would cost the diagnosis.
+_BANNER_MARKERS = (
+    "Input #",
+    "Output #",
+    "Stream #",
+    "Stream mapping",
+    "Duration:",
+    "Metadata:",
+    "encoder",
+    "Press [q]",
+    "Guessed Channel Layout",
+    "command received",
+    "size=",
+    "video:",
+)
+
+
+def _is_banner(message: str) -> bool:
+    return any(marker in message for marker in _BANNER_MARKERS)
+
+
+def _stderr_lines(stderr_queue: "queue.Queue") -> list[str]:
+    """What ffmpeg has said so far, for an error message a human can act on.
+
+    Consumes the queue, which is only ever drained otherwise, and returns the
+    lines in order. Two kinds are dropped, both of them ffmpeg talking about
+    itself rather than about the device: the silencedetect traffic, which is
+    the expected output and would bury everything else, and the startup banner
+    (see _BANNER_MARKERS). Nothing else is filtered -- a keyword rule for
+    "real" errors would let an unanticipated failure fall through and leave
+    nothing but an exit code, which is the one outcome this exists to prevent.
+
+    **Which end to keep is the caller's to choose, and the two callers differ.**
+    A device that never opened is explained by the *first* lines: ffmpeg names
+    the specific cause ("Could not find audio only device with name [...]")
+    and then unwinds into generic wrappers, so a tail keeps only "Error
+    opening input files: I/O error". A device that died mid-run is explained
+    by the *last* lines, since the first fifteen are the startup banner of a
+    stream that was working fine at the time.
+    """
+    lines: list[str] = []
+    while True:
+        try:
+            item = stderr_queue.get_nowait()
+        except queue.Empty:
+            break
+        if item is None:
+            break
+        message = item[1].strip()
+        if message and "silencedetect" not in message and not _is_banner(message):
+            lines.append(message)
+    return lines
+
+
 _stream_process: subprocess.Popen | None = None
 _stream_threads: list[threading.Thread] = []
 _stream_audio_queue: "queue.Queue[tuple[float, bytes] | None] | None" = None
@@ -527,6 +606,24 @@ def _stream_stderr_reader(
         for line_bytes in iter(stderr.readline, b""):
             line = line_bytes.decode("utf-8", errors="replace")
             stream_time = _stream_frames_read * FRAME_SECONDS
+            if "silencedetect" not in line:
+                # Everything ffmpeg says that isn't the expected silencedetect
+                # traffic. This is the channel it explains a dead or stalled
+                # device on, and it used to be enqueued and then only ever
+                # _drain()ed -- so the one line that would have settled a
+                # stall was discarded every time, twice at the cost of a
+                # diagnosis.
+                #
+                # diag.write(), not diag.log(): most of what arrives here is
+                # ffmpeg's startup banner and stream mapping, which belongs in
+                # the record and not on the terminal at every launch. Not
+                # gated on WAKE_DEBUG either -- the device failure happens
+                # whether or not anyone asked for debug output, and this is
+                # the only trace of it. Holds no transcribed text, same rule
+                # as the rest of the log.
+                message = line.strip()
+                if message:
+                    diag.write(f"[stream] ffmpeg: {message}")
             if _should_capture(stream_time):
                 _enqueue_bounded(stderr_queue, (stream_time, line))
     except Exception:
@@ -601,6 +698,26 @@ def start_stream() -> None:
         )
         audio_thread.start()
         stderr_thread.start()
+
+        # Did the microphone actually open? See DEVICE_OPEN_TIMEOUT. The
+        # globals above are deliberately still unset at this point, so a
+        # raise here leaves the module in its "no stream" state and the
+        # caller's fallback has nothing to undo.
+        deadline = time.perf_counter() + DEVICE_OPEN_TIMEOUT
+        while not _stream_frames_read and time.perf_counter() < deadline:
+            if process.poll() is not None:
+                # ffmpeg started and then gave up: a missing, renamed or
+                # busy device. Its stderr says which, so put that in the
+                # message rather than an exit code nobody can read.
+                stderr_thread.join(timeout=1)
+                audio_thread.join(timeout=1)
+                # The head: the cause comes first, then generic unwinding.
+                said = _stderr_lines(stderr_queue)[:4]
+                detail = " | ".join(said) or f"exit code {process.returncode}"
+                raise RuntimeError(
+                    f"ffmpeg opened no audio from {MICROPHONE_NAME!r}: {detail}"
+                )
+            time.sleep(0.05)
 
         _stream_process = process
         _stream_threads = [audio_thread, stderr_thread]

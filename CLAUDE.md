@@ -446,10 +446,49 @@ before falling back to the Enter prompt. 15s is ~15x the worst inter-frame
 gap normal operation produces, so it cannot fire on jitter; it only turns
 an unbounded hang into a bounded one.
 
-Still unlogged: the persistent stream's stderr, which
-`_stream_stderr_reader` enqueues and only ever `_drain`s — so whatever
-ffmpeg said as the device stalled was discarded. Routing it through
-`diag.log()` is the obvious next diagnostic.
+**ffmpeg's stderr is no longer discarded, and `start_stream()` no longer
+reports success for a microphone that isn't there.** Those were one loose
+end: `_stream_stderr_reader` enqueued the lines onto `_stream_stderr_queue`
+and nothing ever read it, so whatever ffmpeg said as a device failed was
+thrown away. It cost two diagnoses — a wake-word wait that sat for 200+
+seconds, and then a `tools/barge_probe.py` run whose microphone had dropped
+off the USB bus mid-run: it captured 13 frames (1.04s, exactly one
+`-audio_buffer_size 1000` buffer, ending on a -18 dB teardown transient) and
+then reported a *statistics* problem, "0 frames of clean echo", beside a
+plausible-looking -47 dB "room" level measured from that one buffer. A
+`--barge` run 40s later captured nothing at all. Neither said the word
+microphone, and ffmpeg's `Could not find audio only device with name [...]`
+was sitting unread in the queue throughout.
+
+- `_stream_stderr_reader` routes every non-`silencedetect` line through
+  **`diag.write()`**, not `diag.log()`: most of it is ffmpeg's startup
+  banner, which belongs in the record and not on the terminal at every
+  launch. Deliberately not gated on `WAKE_DEBUG` — the device failure
+  happens whether or not anyone asked for debug output, and this is its only
+  trace.
+- `_stderr_lines()` reads the queue back for an error message, dropping the
+  `silencedetect` traffic and the startup banner (`_BANNER_MARKERS`) — both
+  of them ffmpeg talking about itself rather than about the device. A
+  *structural* filter, never a keyword one for "real" errors: an
+  unanticipated failure must fall through it intact, since the outcome this
+  exists to prevent is a bare exit code. **Which end to keep is the
+  caller's**, and the two differ: a device that never opened is explained by
+  the first lines (ffmpeg names the cause, then unwinds into generic
+  wrappers), while one that died mid-run is explained by the last (the first
+  fifteen are the banner of a stream that was working fine).
+- `start_stream()` waits `DEVICE_OPEN_TIMEOUT` (2.5s) for evidence the device
+  really opened, and raises with ffmpeg's own words if the process **exited**.
+  Popen succeeding says nothing about the microphone: with the mic unplugged,
+  ffmpeg starts, fails, prints why and exits -5 (`AVERROR(EIO)`) in ~200ms,
+  and `start_stream()` used to return normally. Only an *exited* process
+  counts as failure — a merely slow device must never cost wake-word mode, so
+  a timeout with ffmpeg still alive returns normally and leaves that case to
+  `STREAM_STALL_TIMEOUT`. The bound therefore only has to clear the ~1.4s
+  DirectShow takes to hand over its first frame, and the wait returns the
+  moment that frame arrives. `main()` already caught anything raised here
+  into the Enter-press fallback, so the message reaches the user unchanged.
+  `DeviceOpenTests` and `StderrLineTests` in `tests/test_record_timing.py`
+  pin all of it, with a faked `Popen`.
 
 If a structural hole ever comes back, the fallback is to skip the reset when
 `_frames_gated` fully accounts for the missing frames — keyed to that

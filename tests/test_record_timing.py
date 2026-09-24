@@ -651,5 +651,179 @@ class WakeWordStallTests(unittest.TestCase):
         self.assertIsInstance(self.wait(), bytes)
 
 
+class _FakePipe:
+    """Hands over a fixed list of chunks, then EOF forever."""
+
+    def __init__(self, chunks):
+        self.chunks = list(chunks)
+
+    def read(self, size=-1):
+        return self.chunks.pop(0) if self.chunks else b""
+
+    def readline(self):
+        return self.chunks.pop(0) if self.chunks else b""
+
+    def write(self, data):
+        return len(data)
+
+    def flush(self):
+        pass
+
+
+class _FakeProcess:
+    def __init__(self, stdout_chunks, stderr_lines, exit_code=None):
+        self.stdout = _FakePipe(stdout_chunks)
+        self.stderr = _FakePipe(stderr_lines)
+        self.stdin = _FakePipe([])
+        self.returncode = exit_code
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+    def terminate(self):
+        self.returncode = -15
+
+    def kill(self):
+        self.returncode = -9
+
+
+class DeviceOpenTests(unittest.TestCase):
+    """start_stream() must not report success for a microphone that isn't there.
+
+    The live failure: the Razer mic dropped off the USB bus, ffmpeg started,
+    printed "Could not find audio only device with name [...]" and exited -5
+    (AVERROR EIO) about 200ms later. Popen had succeeded, so start_stream()
+    returned normally, and every consumer then waited on a queue nothing
+    would ever fill -- main() for STREAM_STALL_TIMEOUT, and tools/barge_probe
+    for a whole 25-second script it then summarized as a statistics problem
+    ("0 frames of clean echo") without once naming the device.
+
+    ffmpeg had explained itself on stderr the entire time. Those lines were
+    enqueued and only ever drained, so they went in the message now.
+    """
+
+    def setUp(self) -> None:
+        self.addCleanup(listener.stop_stream)
+
+    def start(self, process):
+        with mock.patch.object(listener.subprocess, "Popen", return_value=process):
+            listener.start_stream()
+
+    def test_a_dead_device_raises_with_ffmpegs_own_words(self) -> None:
+        process = _FakeProcess(
+            stdout_chunks=[],
+            stderr_lines=[
+                b"[in#0] Could not find audio only device with name [Mic]"
+                b" among source devices of type audio.\n",
+                b"Error opening input files: I/O error\n",
+            ],
+            exit_code=-5,
+        )
+
+        with self.assertRaises(RuntimeError) as caught:
+            self.start(process)
+
+        message = str(caught.exception)
+        self.assertIn("Could not find audio only device", message)
+        self.assertIn(listener.MICROPHONE_NAME, message)
+
+    def test_a_dead_device_leaves_no_stream_behind(self) -> None:
+        # The globals are still unset when the raise happens, so the caller's
+        # fallback (main.py calls stop_stream() then drops to the Enter
+        # prompt) has nothing to unwind.
+        with self.assertRaises(RuntimeError):
+            self.start(_FakeProcess([], [], exit_code=-5))
+
+        self.assertIsNone(listener._stream_process)
+        self.assertIsNone(listener._stream_audio_queue)
+        listener.stop_stream()  # must be a safe no-op
+
+    def test_a_live_device_starts_as_before(self) -> None:
+        # One real frame is all the evidence the check wants, and it returns
+        # the moment that frame arrives rather than waiting out the timeout.
+        process = _FakeProcess([QUIET], [], exit_code=None)
+
+        started = time.perf_counter()
+        self.start(process)
+        elapsed = time.perf_counter() - started
+
+        self.assertIs(listener._stream_process, process)
+        self.assertIsNotNone(listener._stream_audio_queue)
+        self.assertLess(elapsed, listener.DEVICE_OPEN_TIMEOUT)
+
+    def test_a_slow_device_is_not_called_dead(self) -> None:
+        # ffmpeg alive but silent: a device that is merely slow to start must
+        # never cost wake-word mode, so this returns and leaves the case to
+        # STREAM_STALL_TIMEOUT.
+        with mock.patch.object(listener, "DEVICE_OPEN_TIMEOUT", 0.2):
+            self.start(_FakeProcess([], [], exit_code=None))
+
+        self.assertIsNotNone(listener._stream_process)
+        self.assertEqual(listener._stream_frames_read, 0)
+
+
+class StderrLineTests(unittest.TestCase):
+    """ffmpeg talking about itself must not bury what it said about the device.
+
+    Both dropped kinds were measured, not imagined. The silencedetect lines
+    are the bulk of normal traffic; the startup banner is what a *tail* of
+    this queue returns after a healthy stream dies, and six lines of
+    "Stream #0:0: Audio: pcm_s16le ..." presented as the explanation of a
+    dead microphone is worse than saying nothing.
+    """
+
+    def lines(self, *raw: str) -> list[str]:
+        stderr_queue: queue.Queue = queue.Queue()
+        for line in raw:
+            stderr_queue.put((0.0, line + "\n"))
+        stderr_queue.put(None)
+        return listener._stderr_lines(stderr_queue)
+
+    def test_silencedetect_is_dropped_and_order_is_kept(self) -> None:
+        self.assertEqual(
+            self.lines(
+                "[in#0] Could not find audio only device with name [Mic]",
+                "[silencedetect @ 0x1] silence_start: 1.234",
+                "Error opening input files: I/O error",
+            ),
+            [
+                "[in#0] Could not find audio only device with name [Mic]",
+                "Error opening input files: I/O error",
+            ],
+        )
+
+    def test_the_startup_banner_is_dropped(self) -> None:
+        # Verbatim from a live run, which is the whole point: a made-up
+        # banner would pin a filter against text ffmpeg never prints.
+        self.assertEqual(
+            self.lines(
+                "[aist#0:0/pcm_s16le @ 0x1] Guessed Channel Layout: stereo",
+                "Input #0, dshow, from 'audio=Mic':",
+                "Duration: N/A, start: 7914.601000, bitrate: 1411 kb/s",
+                "Stream #0:0: Audio: pcm_s16le, 44100 Hz, stereo, s16",
+                "Stream mapping:",
+                "Press [q] to stop, [?] for help",
+                "Output #0, s16le, to 'pipe:1':",
+                "Metadata:",
+                "encoder         : Lavf63.1.101",
+                "[q] command received. Exiting.",
+                "size=      31KiB time=00:00:01.00 bitrate= 256.0kbits/s",
+            ),
+            [],
+        )
+
+    def test_an_unrecognised_failure_survives(self) -> None:
+        # The safe direction: anything that isn't known boilerplate is kept,
+        # so a message nobody anticipated still reaches the user instead of
+        # being reduced to an exit code.
+        self.assertEqual(
+            self.lines("Something entirely new went wrong"),
+            ["Something entirely new went wrong"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
