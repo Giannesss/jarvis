@@ -81,6 +81,18 @@ real feature will do, except that it will route those frames to the barge-in
 decider instead of into the recording pipeline. Nothing here touches the
 database, and no transcribed text is produced or stored: levels only, same
 rule the diagnostic log follows.
+
+**It refuses to run blind.** Every phase is watched, and the run is abandoned
+the moment the microphone stops feeding it. This exists because of a run that
+did not: the mic had dropped off the USB bus, the probe captured 13 frames
+(1.04s, one -audio_buffer_size 1000 buffer) and then nothing, and it went on
+to spend 3s on a baseline, ~20s on a reply and 2s on a tail against a dead
+ffmpeg -- reporting a *statistics* problem ("0 frames of clean echo") and a
+plausible-looking -47 dB room level that was really one buffer of
+device-teardown noise. A --barge run 40 seconds later captured nothing at
+all. Neither said the word microphone, and ffmpeg's own explanation was
+sitting unread in _stream_stderr_queue the whole time, which is what
+_ffmpeg_said reads now.
 """
 
 from __future__ import annotations
@@ -154,6 +166,31 @@ ONSET_SECONDS = 0.32
 # not a mean: a barge-in is short and loud, and would drag a mean up toward
 # itself until it stopped being detectable.
 ECHO_WINDOW_SECONDS = 2.0
+
+# How long the probe tolerates no frame being *read* off ffmpeg before it
+# gives up on the run.
+#
+# Far more aggressive than listener.STREAM_STALL_TIMEOUT (15s), and it can
+# afford to be: that one guards a wake-word wait, where nobody talking for a
+# minute is the ordinary case, while here audio is supposed to be flowing
+# continuously from the moment the baseline starts. Still above both numbers
+# it has to clear -- the ~1.4s DirectShow takes to hand over its first frame,
+# and the 1.008s worst inter-frame gap a bursty dshow input produces -- so it
+# cannot fire on jitter.
+#
+# It watches listener._stream_frames_read rather than the queue, for the
+# reason listener's own backstop does: an empty queue is a normal state, a
+# frozen read counter is not.
+STREAM_SILENT_TIMEOUT = 3.0
+
+
+class _StreamGone(Exception):
+    """The microphone stopped feeding the probe mid-run.
+
+    Raised from whichever phase noticed, so run() can abandon the script and
+    report a device problem instead of letting _summarize describe the
+    statistics of an empty sample.
+    """
 
 
 def _percentile(values: list[float], fraction: float) -> float:
@@ -274,8 +311,13 @@ class _Probe:
             )
 
 
-def _drain_into(probe: _Probe, stop: threading.Event) -> None:
-    """Pull every frame off the stream until told to stop."""
+def _drain_into(probe: _Probe, stop: threading.Event, ended: threading.Event) -> None:
+    """Pull every frame off the stream until told to stop.
+
+    `ended` is the EOF sentinel promoted to something the main thread can see.
+    This used to just `return`, which is why a run against a dead ffmpeg
+    looked exactly like a run against a silent room.
+    """
     audio_queue = listener._stream_audio_queue
     while not stop.is_set():
         try:
@@ -283,9 +325,66 @@ def _drain_into(probe: _Probe, stop: threading.Event) -> None:
         except queue.Empty:
             continue
         if item is None:
+            ended.set()
             return
         stream_time, frame = item
         probe.feed(stream_time, frame)
+
+
+def _ffmpeg_said() -> list[str]:
+    """Whatever ffmpeg has put on stderr, which the probe has to read itself.
+
+    listener routes these lines to diag.write() now, but that only records for
+    a real Jarvis session (diag stays disabled until start_session, which this
+    tool deliberately never calls -- the log is a record of runs of Jarvis,
+    not of diagnostics). So the queue is the probe's copy.
+    """
+    stderr_queue = listener._stream_stderr_queue
+    if stderr_queue is None:
+        return []
+    # The tail: a stream that died mid-run was working when it printed its
+    # banner, so the last thing it said is the only interesting part.
+    return listener._stderr_lines(stderr_queue)[-6:]
+
+
+def _watchdog() -> dict:
+    """State for _check_stream: the last read count and when it last moved."""
+    return {"read": listener._stream_frames_read, "since": time.perf_counter()}
+
+
+def _check_stream(state: dict, ended: threading.Event) -> None:
+    """Raise _StreamGone if the microphone has stopped feeding the probe."""
+    if ended.is_set():
+        raise _StreamGone("ffmpeg's audio stream ended")
+
+    now = time.perf_counter()
+    read = listener._stream_frames_read
+    if read != state["read"]:
+        state["read"], state["since"] = read, now
+    elif now - state["since"] > STREAM_SILENT_TIMEOUT:
+        raise _StreamGone(
+            f"no frame was read for {STREAM_SILENT_TIMEOUT:.1f}s "
+            f"(stuck at {read} frames)"
+        )
+
+
+def _sleep_watching(seconds: float, state: dict, ended: threading.Event) -> None:
+    """time.sleep(seconds), abandoning the run if the stream dies during it."""
+    deadline = time.perf_counter() + seconds
+    while time.perf_counter() < deadline:
+        _check_stream(state, ended)
+        time.sleep(0.05)
+
+
+def _join_watching(thread: threading.Thread, state: dict, ended: threading.Event) -> None:
+    """thread.join(), abandoning the run if the stream dies while waiting.
+
+    The reply is the longest phase by far -- ~20s -- so joining it blind is
+    where most of a dead run's time used to go.
+    """
+    while thread.is_alive():
+        _check_stream(state, ended)
+        thread.join(0.05)
 
 
 def _speak_in_background(text: str) -> threading.Thread:
@@ -344,10 +443,19 @@ def run(args: argparse.Namespace) -> int:
 
     print(f"TTS engine: {TTS_ENGINE}   speech floor in .env: {SILENCE_THRESHOLD_DB} dB")
     print("Opening the microphone...")
-    listener.start_stream()
+    try:
+        listener.start_stream()
+    except Exception as e:
+        # start_stream() checks that the device really opened now, so this is
+        # where an unplugged or busy microphone lands -- before a 25-second
+        # script rather than after one.
+        probe.close()
+        print(f"\nThe microphone did not open:\n  {e}")
+        return 1
 
     stop = threading.Event()
-    reader = threading.Thread(target=_drain_into, args=(probe, stop), daemon=True)
+    ended = threading.Event()
+    reader = threading.Thread(target=_drain_into, args=(probe, stop, ended), daemon=True)
     reader.start()
 
     # Wall clock throughout. Converting to stream time needs _stream_origin,
@@ -357,12 +465,22 @@ def run(args: argparse.Namespace) -> int:
     # shifted the phase edges against each other.
     marks: list[tuple[float, float, str]] = []
     prompted: dict[str, float] = {}
+    gone: str | None = None
+    watch = _watchdog()
 
     try:
         print("\nBaseline: μείνε σιωπηλός για 3 δευτερόλεπτα...")
         base_start = time.perf_counter()
-        time.sleep(3.0)
+        _sleep_watching(3.0, watch, ended)
         marks.append((base_start, time.perf_counter(), "baseline"))
+
+        # The baseline is the cheapest possible check that the microphone is
+        # real, and it is shorter than STREAM_SILENT_TIMEOUT -- so a device
+        # that opened and then produced nothing at all would otherwise not be
+        # caught until several seconds into the reply. Explicit here, and
+        # decisive: three silent seconds still produce ~33 frames.
+        if not probe.frames:
+            raise _StreamGone("no audio at all arrived during the 3s baseline")
 
         print("Ο Τζάρβις μιλάει τώρα.")
         if args.barge:
@@ -378,7 +496,7 @@ def run(args: argparse.Namespace) -> int:
                 daemon=True,
             ).start()
 
-        speaking.join()
+        _join_watching(speaking, watch, ended)
         speak_end = time.perf_counter()
         marks.append((speak_start, speak_end, "reply"))
 
@@ -389,24 +507,72 @@ def run(args: argparse.Namespace) -> int:
                 marks.append((start, end, "audible"))
 
         print("Τέλος. Μείνε σιωπηλός άλλα 2 δευτερόλεπτα...")
-        time.sleep(2.0)
+        _sleep_watching(2.0, watch, ended)
     except KeyboardInterrupt:
         print("\n(διακόπηκε)")
+    except _StreamGone as e:
+        gone = str(e)
+        # Nothing left to measure, so stop the reply rather than talking at an
+        # empty room through the diagnosis. This is speaker.stop() doing the
+        # output half of barge-in, for once with no decider behind it.
+        speaker.stop()
     finally:
         stop.set()
         reader.join(timeout=2)
+        # Before stop_stream(), which drops the queue this reads.
+        said = _ffmpeg_said()
         listener.stop_stream()
+
+    if gone is not None:
+        return _report_gone(probe, gone, said)
 
     return _summarize(probe, marks, prompted, args)
 
 
+def _report_gone(probe: _Probe, why: str, said: list[str]) -> int:
+    """Say that the microphone died, and say it in those words.
+
+    The failure this replaces reported "Not enough clean echo to replay the
+    rule: 0 frames" next to a -47 dB room level -- two true statements about
+    a sample that did not exist, and no mention of the device. Nothing here
+    is a barge-in measurement, so none is printed.
+    """
+    probe.close()
+    seconds = len(probe.frames) * listener.FRAME_SECONDS
+    print(f"\nThe microphone stopped feeding the probe: {why}")
+    print(f"  {len(probe.frames)} frames captured ({seconds:.2f}s of audio) "
+          f"before it stopped.")
+    if said:
+        print("  ffmpeg said:")
+        for line in said:
+            print(f"    {line}")
+    else:
+        # Not an omission -- it separates a device that errored out from one
+        # that simply went quiet under a live ffmpeg, which are different
+        # faults with different fixes (see listener.STREAM_STALL_TIMEOUT).
+        print("  ffmpeg said nothing: it went quiet rather than erroring out.")
+    print(f"\n  No barge-in numbers are reported, because nothing here "
+          f"measures one.\n  Check that {listener.MICROPHONE_NAME} is plugged "
+          f"in and not held by another\n  program, then re-run.")
+    return 1
+
+
 def _summarize(probe: _Probe, marks, prompted: dict, args) -> int:
+    # Every bail-out closes the CSV. They used to fall out above write_csv()
+    # and close(), leaving a half-written file open until interpreter exit --
+    # which is why the abandoned barge run left a CSV holding a header and
+    # nothing else, with no hint that it had been given up on rather than
+    # simply having no rows to write.
     if not probe.frames:
+        # A backstop now: run()'s baseline check catches this first and names
+        # the device to go and look at.
+        probe.close()
         print("\nNo frames were captured at all -- check the microphone.")
         return 1
 
     origin = listener._stream_origin
     if origin is None:
+        probe.close()
         print("\nThe stream never produced an origin estimate.")
         return 1
 
@@ -419,6 +585,7 @@ def _summarize(probe: _Probe, marks, prompted: dict, args) -> int:
     baseline_span = next(((s, e) for s, e, name in spans if name == "baseline"), None)
 
     if not audible:
+        probe.close()
         print("\nPlayback never became audible, so there is nothing to compare.")
         return 1
 

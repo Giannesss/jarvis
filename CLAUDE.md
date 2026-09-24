@@ -98,7 +98,12 @@ only falling back to the brain when a skill doesn't match (see "Skills").
 - `tools/barge_probe.py` — standalone barge-in diagnostic, not part of the
   app: measures how loud Jarvis's own voice arrives at the microphone against
   how loud you are talking over it, and replays candidate thresholds over the
-  recorded frames. See "Playback".
+  recorded frames. See "Playback". Every phase is watched
+  (`STREAM_SILENT_TIMEOUT`, 3s — far tighter than the app's 15s, because here
+  audio is meant to be flowing continuously) and the run is abandoned with a
+  device diagnosis the moment the microphone stops feeding it, rather than
+  summarized as statistics; see the stderr note under "The recording clock"
+  for the run that earned that.
 - `tools/wake_score_probe.py` — standalone wake-word diagnostic, not part of
   the app: scores live or replayed audio with no threshold or debug floor in
   the way (free-running, prompted-attempts, and replay modes). See "Roadmap".
