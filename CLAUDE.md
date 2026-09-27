@@ -12,23 +12,49 @@ phases, with the model to use and the budget for each. It is the source of
 truth for what comes next; this file stays the source of truth for what is
 already built.
 
-**Current phase: Phase 4 — structure and safety.** Four steps: the skills
-registry (done), the policy layer and kill switch (done — see "Policy"), a
-durable scheduler for reminders and timers that survive a restart (done — see
-"Scheduler"), and a tag/category column across the memory tables so "τι έχω
-σήμερα" can pull from every area at once (done — see "Tags"). All four are
-built; the phase pointer moves to Phase 5 once they have been hand-tested on
-live audio, which is the roadmap's own rule and the one thing tests cannot
-stand in for.
+**Current phase: Phase 5 — deep research and expertise.** Five steps: a
+`research` skill that runs several searches on a topic through the Claude API
+with web search enabled; a *structured summary* of what it found — not a
+document dump — stored as a dated "expertise" row; `memory.recall()` surfacing
+those rows on related questions the way it already surfaces profile facts and
+notes; a refresh trigger («ξανακάνε έρευνα για…») so a stale topic can be
+redone on request; and populating real data early — this semester's courses,
+syllabus topics and exam dates, and a description of each business.
 
-**Phase 3 — a reply you can interrupt — is built, out of order, on
-`feature/streaming-interrupt`.** Four steps: a stoppable player (see
-"Playback"), a chunker, streaming replies (see "Streaming replies") and
-barge-in (see "Barge-in"). The operating point it needed —
-`BARGE_IN_MARGIN_DB=9` — came from `tools/barge_probe.py` rather than from a
-guess, and the probe took three revisions before it was measuring the right
-thing. Same rule as Phase 4: it is done when it has been hand-tested on live
-audio.
+**It depends on a phase that is not built.** The roadmap lists Phase 5 as
+requiring the Claude brain from Phase 2, and `BRAIN_PROVIDER="claude"` is
+still a placeholder in `_PROVIDERS` with no dependency and no key handling
+behind it (see "Providers"). So step 1 is the first thing in this project that
+reaches the network for *thinking* rather than for a voice — the "no cloud
+APIs, no API keys" line at the top of this file stops being true of the brain
+when it lands, and that is a decision to take deliberately rather than as a
+side effect.
+
+**Phase 3 — a reply you can interrupt — closed on 2026-09-27**, built out of
+order on `feature/streaming-interrupt` and merged to `master` when it closed.
+Four steps: a stoppable player (see "Playback"), a chunker, streaming replies
+(see "Streaming replies") and barge-in (see "Barge-in"). Hand-tested on live
+audio in wake-word mode, which is what closed it: streaming works, barge-in
+fired several times cleanly with no false fires, the words that interrupted
+him became the next command, and the recording-clock watermark (the last
+commit on that branch) was re-verified live — no negative durations and no
+spurious re-asks. The operating point it needed — `BARGE_IN_MARGIN_DB=9` —
+came from `tools/barge_probe.py` rather than from a guess, and the probe took
+three revisions before it was measuring the right thing; it is a property of
+this room and re-measuring beats copying the number.
+
+**Phase 4 — structure and safety — is built but has *not* been hand-tested on
+live audio.** Four steps, all four built: the skills registry, the policy
+layer and kill switch (see "Policy"), a durable scheduler for reminders and
+timers that survive a restart (see "Scheduler"), and a tag/category column
+across the memory tables so "τι έχω σήμερα" can pull from every area at once
+(see "Tags"). The pointer has moved past it anyway, so this is outstanding
+debt rather than a finished step — the roadmap's rule is that live audio is
+the one thing tests cannot stand in for, and the three things it would settle
+are the kill switch's fuzzy and bare rungs against a real transcription, a
+reminder surviving an actual restart and being caught up out loud, and the
+agenda answering «τι έχω σήμερα» across tables. Until then they are pinned by
+the suite only.
 
 Phase 1 closed on 2026-09-23 (`docs/PHASE1_STATUS.md`): the beep-reset bug and
 the too-high silence floor are fixed and confirmed live, and the remaining
