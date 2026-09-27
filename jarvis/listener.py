@@ -6,18 +6,24 @@ import io
 import math
 import queue
 import re
+import statistics
 import subprocess
 import tempfile
 import threading
 import time
 import wave
 from pathlib import Path
+from typing import Callable, NamedTuple
 
 from faster_whisper import WhisperModel
 
 from jarvis import wakeword
 from jarvis import diag
 from jarvis.config import (
+    BARGE_ECHO_WINDOW_SECONDS,
+    BARGE_IN_MARGIN_DB,
+    BARGE_MIN_PRIME_SECONDS,
+    BARGE_ONSET_SECONDS,
     DATA_DIR,
     MAX_RECORD_SECONDS,
     NO_SPEECH_TIMEOUT,
@@ -557,6 +563,299 @@ _frames_gated = 0
 _frames_evicted = 0
 
 
+# --- Barge-in. The third destination for a gated frame.
+#
+# A frame the capture gate refuses is audio recorded while Jarvis was audible.
+# Until now that was the end of it: counted and dropped. But "was the user
+# talking over him" can only be answered from exactly those frames, so they are
+# now shown to a decider on the way out. Nothing else about the gate changes --
+# what reaches the recording pipeline is unchanged, which is what keeps this
+# from being able to break the ordinary path.
+#
+# How long a hole of gated frames is kept for the pre-roll. Generous enough for
+# an interruption plus the reader's ~1s lag behind real time, bounded so a
+# twenty-second reply nobody interrupts does not accumulate one.
+BARGE_BUFFER_SECONDS = 8.0
+
+# How much audio before the detected onset goes into the pre-roll. The onset is
+# the first frame of a sustained run, so the attack of the first word is already
+# in it; this is one frame of margin for the breath in front of it.
+BARGE_PREROLL_LEAD = 0.16
+
+# How long take_barge_frames() waits for the reader to catch up past the end of
+# the gated span before giving up and returning what it has. Just over the
+# ~1.008s worst-case burst interval: the frames recorded around the abort have
+# not been *read* yet when the abort returns, and taking the buffer without
+# them leaves a hole in the middle of the interrupting sentence -- which is the
+# weld Whisper transcribes confidently and wrongly.
+BARGE_CATCHUP_TIMEOUT = 1.5
+
+
+class _BargeDecider:
+    """Whether someone is talking over Jarvis, from (timestamp, level) pairs.
+
+    A port of the rule tools/barge_probe.py measured and replayed, so the
+    number in .env means here exactly what the probe's table reported: each
+    frame's level minus the *running median* of recent audio, fired when it
+    holds above the margin for BARGE_ONSET_SECONDS.
+
+    Three things about it, all of them things the probe had to learn:
+
+      * **A median, not a mean.** A barge-in is a handful of loud frames
+        against a two-second window; a mean would be dragged up toward them
+        until they stopped clearing it.
+      * **The floor is Jarvis, and it must be established before the rule can
+        fire.** The probe primes the window from the echo-only phase in front
+        of the audio under test; getting that wrong (building the median out of
+        the frames being judged) made a clean +11.4 dB margin report MISSED at
+        every threshold. Live there is no separate phase, so the window is
+        primed by the first BARGE_MIN_PRIME_SECONDS of the reply -- and kept
+        between replies, because it estimates his voice through these speakers
+        in this room, which does not change between one sentence and the next.
+      * **The window keeps absorbing frames as it goes**, exactly as the
+        probe's replay does, and stops the moment it fires: four frames of
+        someone's voice cannot move a 25-frame median, but a whole
+        interruption left in the window would poison the floor for the next
+        reply.
+
+    Pure: no clock, no queue, no I/O. Tests drive it from a list of frames.
+    """
+
+    def __init__(
+        self,
+        margin_db: float | None = None,
+        onset_seconds: float | None = None,
+        window_seconds: float | None = None,
+        min_prime_seconds: float | None = None,
+    ) -> None:
+        self.margin_db = BARGE_IN_MARGIN_DB if margin_db is None else margin_db
+        onset = BARGE_ONSET_SECONDS if onset_seconds is None else onset_seconds
+        window = BARGE_ECHO_WINDOW_SECONDS if window_seconds is None else window_seconds
+        prime = BARGE_MIN_PRIME_SECONDS if min_prime_seconds is None else min_prime_seconds
+
+        self._onset_frames = max(1, int(onset / FRAME_SECONDS))
+        self._prime_frames = max(1, int(prime / FRAME_SECONDS))
+        self._window: "collections.deque[float]" = collections.deque(
+            maxlen=max(1, int(window / FRAME_SECONDS))
+        )
+
+        self.onset_at: float | None = None  # stream time the firing run began
+        self.delta_db = 0.0  # how far over the floor it was, when it fired
+        self.floor_db = 0.0  # the running median it cleared
+
+        self._run = 0
+        self._run_start: float | None = None
+
+    @property
+    def fired(self) -> bool:
+        return self.onset_at is not None
+
+    @property
+    def primed(self) -> bool:
+        return len(self._window) >= self._prime_frames
+
+    def feed(self, ts: float, level_db: float) -> bool:
+        """Feed one frame recorded while Jarvis was audible.
+
+        Returns True on the frame that completes a sustained run over the
+        margin -- once, and only once per decider arming.
+        """
+        if self.fired:
+            return False
+
+        floor = statistics.median(self._window) if self._window else None
+        self._window.append(level_db)
+
+        if floor is None or not self.primed:
+            # No floor worth comparing against yet. Not a miss: the run is
+            # reset so a level that was already high while the window filled
+            # cannot be counted as an interruption the moment it is ready.
+            self._run = 0
+            self._run_start = None
+            return False
+
+        if level_db - floor <= self.margin_db:
+            self._run = 0
+            self._run_start = None
+            return False
+
+        if self._run_start is None:
+            self._run_start = ts
+        self._run += 1
+        if self._run < self._onset_frames:
+            return False
+
+        self.onset_at = self._run_start
+        self.delta_db = level_db - floor
+        self.floor_db = floor
+        return True
+
+
+# The armed decider, its callback, and the frames it has seen. Written by the
+# reader thread and read by whoever is speaking, so the three move together
+# under one lock.
+_barge: _BargeDecider | None = None
+_barge_on_fire: "Callable[[], None] | None" = None
+_barge_frames: "collections.deque[tuple[float, bytes]] | None" = None
+_barge_lock = threading.Lock()
+
+# Kept across armings so only the session's first reply pays for priming. Reset
+# with the stream, because stream_time and the device both restart there.
+_barge_window: "collections.deque[float] | None" = None
+
+
+def arm_barge(on_fire: "Callable[[], None]") -> None:
+    """Watch the gated frames for someone talking over Jarvis, and call
+    on_fire() once when they are.
+
+    Called from the thread that is about to speak; on_fire runs on the reader
+    thread, so it must be cheap and thread-safe. speaker.stop() is both.
+
+    A no-op in every sense if nothing is speaking: the decider only ever sees
+    frames the capture gate refused, and the gate refuses nothing while Jarvis
+    is silent -- so arming across Edge TTS's network round trip costs nothing
+    and needs no separate "is he audible yet" question.
+    """
+    global _barge, _barge_on_fire, _barge_frames
+
+    decider = _BargeDecider()
+    if _barge_window is not None:
+        # Last reply's floor. See _BargeDecider's docstring: it is his voice
+        # through the same speakers, so it is still the right estimate.
+        decider._window.extend(_barge_window)
+
+    with _barge_lock:
+        _barge = decider
+        _barge_on_fire = on_fire
+        _barge_frames = collections.deque(
+            maxlen=max(1, int(BARGE_BUFFER_SECONDS / FRAME_SECONDS))
+        )
+
+
+class BargeResult(NamedTuple):
+    """What an interruption left behind.
+
+    `frames` is the interrupting audio as (stream_time, frame) pairs, empty
+    when the caller asked not to collect it (BARGE_PREROLL=false).
+    """
+
+    onset_at: float
+    delta_db: float
+    frames: list[tuple[float, bytes]]
+
+
+def disarm_barge(collect: bool = False) -> BargeResult | None:
+    """Stop watching. None if nothing interrupted; otherwise what it left.
+
+    One call rather than a disarm plus a separate read, because the frames live
+    in the armed state: asking for them afterwards is an ordering trap, and the
+    order would be wrong exactly once, in the case that matters.
+    """
+    global _barge, _barge_on_fire, _barge_frames, _barge_window
+
+    with _barge_lock:
+        decider = _barge
+
+    if decider is None:
+        return None
+
+    result = None
+    if decider.onset_at is not None:
+        frames = _collect_barge_frames(decider) if collect else []
+        result = BargeResult(decider.onset_at, decider.delta_db, frames)
+
+    with _barge_lock:
+        _barge = None
+        _barge_on_fire = None
+        _barge_frames = None
+
+    # Last reply's floor, kept for the next arming.
+    _barge_window = collections.deque(decider._window)
+    return result
+
+
+def barge_fired() -> bool:
+    """Whether the armed decider has fired. Safe to call while speaking."""
+    with _barge_lock:
+        return _barge is not None and _barge.fired
+
+
+def _feed_barge(ts: float, frame: bytes) -> None:
+    """Show one gated frame to the armed decider. Runs on the reader thread."""
+    with _barge_lock:
+        decider = _barge
+        if decider is None:
+            return
+        if _barge_frames is not None:
+            _barge_frames.append((ts, frame))
+        if decider.fired:
+            return
+        fired = decider.feed(ts, _frame_db(frame))
+        on_fire = _barge_on_fire
+
+    if not fired:
+        return
+
+    # Logged unconditionally, not under WAKE_DEBUG: a reply cut off is the
+    # loudest thing this project can do, and "why did he stop talking" has to
+    # be answerable from the log alone.
+    diag.log(
+        f"[barge] fired at {decider.onset_at:.2f}s: "
+        f"{decider.delta_db:.1f} dB over a {decider.floor_db:.1f} dB floor "
+        f"(margin {decider.margin_db:.1f} dB)"
+    )
+    if on_fire is not None:
+        try:
+            on_fire()
+        except Exception as e:
+            # The reader thread must survive anything: it is the only thing
+            # draining ffmpeg's stdout, and a dead reader stalls every consumer.
+            diag.log(f"[barge] stop callback failed: {e}")
+
+
+def _collect_barge_frames(
+    decider: _BargeDecider, timeout: float = BARGE_CATCHUP_TIMEOUT
+) -> list[tuple[float, bytes]]:
+    """The interrupting audio, from the detected onset onwards.
+
+    These frames were refused by the capture gate, so they are in no queue and
+    this is the only copy. Returned as (stream_time, frame) pairs rather than
+    bytes, so record_command() can feed them through _StopDecider on the clock
+    they were recorded on -- prepending them as opaque audio would leave the
+    decider waiting for an onset that has already happened, and a turn that had
+    words in it would come back "no_speech".
+
+    Waits for the reader to catch up past the end of the gated span first. It
+    runs up to ~1s of audio behind real time, so at the moment an abort returns
+    the frames around it have been recorded but not read; taking the buffer
+    without them puts a hole in the middle of the interrupting sentence.
+    """
+    from jarvis import speaker  # deferred: speaker imports FFMPEG_PATH from here
+
+    origin = _stream_origin
+    if origin is not None:
+        # The gate stays shut until ECHO_PAD after the last audible moment, so
+        # that is the recorded time the reader has to reach for the buffer to be
+        # complete. Bounded: a stream that has stopped feeding must not hang a
+        # turn here, and the wake-word wait's own watchdog is what catches that.
+        target = (time.perf_counter() - origin) + speaker.ECHO_PAD
+        deadline = time.perf_counter() + timeout
+        while (
+            _stream_frames_read * FRAME_SECONDS < target
+            and time.perf_counter() < deadline
+        ):
+            time.sleep(0.02)
+
+    with _barge_lock:
+        frames = list(_barge_frames or ())
+
+    if decider.onset_at is None:
+        return []
+
+    start = decider.onset_at - BARGE_PREROLL_LEAD
+    return [(ts, frame) for ts, frame in frames if ts >= start]
+
+
 def _stream_audio_reader(
     stdout, audio_queue: "queue.Queue[tuple[float, bytes] | None]"
 ) -> None:
@@ -586,6 +885,11 @@ def _stream_audio_reader(
             if _should_capture(stream_time):
                 _frames_evicted += _enqueue_bounded(audio_queue, (stream_time, frame))
             else:
+                # Recorded while Jarvis was audible. Counted and dropped as
+                # before -- but shown to the barge-in decider first, because
+                # these are the only frames that can answer whether someone is
+                # talking over him. A no-op unless something armed it.
+                _feed_barge(stream_time, frame)
                 _frames_gated += 1
     except Exception:
         pass
@@ -639,6 +943,7 @@ def start_stream() -> None:
     how to fall back)."""
     global _stream_process, _stream_threads, _stream_audio_queue, _stream_stderr_queue, _stream_frames_read
     global _stream_origin, _capture_floor, _frames_gated, _frames_evicted
+    global _barge, _barge_on_fire, _barge_frames, _barge_window
 
     with _stream_lock:
         if _stream_process is not None:
@@ -682,6 +987,13 @@ def start_stream() -> None:
         _capture_floor = 0.0
         _frames_gated = 0
         _frames_evicted = 0
+
+        # The barge-in floor is keyed to stream_time and to this device, so a
+        # restart invalidates both the estimate and anything still armed.
+        _barge = None
+        _barge_on_fire = None
+        _barge_frames = None
+        _barge_window = None
 
         audio_queue: "queue.Queue[tuple[float, bytes] | None]" = queue.Queue(
             maxsize=AUDIO_QUEUE_MAXSIZE
@@ -1175,6 +1487,7 @@ def _report_empty_transcription(info, audio: bytes) -> None:
 def record_command(
     preroll: bytes = b"",
     no_speech_timeout: float = NO_SPEECH_TIMEOUT,
+    preroll_frames: list[tuple[float, bytes]] | None = None,
 ) -> tuple[str | None, str]:
     """Record one spoken command off the persistent stream and transcribe it.
 
@@ -1191,7 +1504,16 @@ def record_command(
     when told.
 
     preroll is prepended to the audio and is used only on the WAKE_BEEP=false
-    path; follow-up turns in conversation mode always pass nothing.
+    path; follow-up turns in conversation mode always pass nothing. It is
+    deliberately opaque: it ends with the wake word, which is not speech this
+    turn should be measured from.
+
+    preroll_frames is the barge-in pre-roll, and is the opposite: timestamped
+    frames, fed through _StopDecider exactly like live ones. They have to be,
+    because they are the *start of the command* -- the words that interrupted
+    the reply. Prepended as opaque audio they would leave the decider waiting
+    for an onset that already happened, and a turn with words in it would come
+    back "no_speech" on the timeout.
 
     Returns (text, stop_reason), where stop_reason is one of "speech_end",
     "no_speech", "gap", "max", "timeout" or "stream_end" — the caller needs
@@ -1222,9 +1544,36 @@ def record_command(
     _debug(
         f"[rec] floor {SILENCE_THRESHOLD_DB} dB, no-speech timeout "
         f"{no_speech_timeout:.1f}s, pre-roll {len(preroll) / FRAME_BYTES:.0f} frames"
+        + (f", {len(preroll_frames)} barge frames" if preroll_frames else "")
     )
 
-    while True:
+    # The barge-in pre-roll, fed through the decider before the queue is read.
+    # Same four steps as the loop below, on frames that are already in hand: a
+    # hole between two of them is as real as one in the live stream, since the
+    # gate refused frames in between for the same reasons.
+    for ts, frame in preroll_frames or ():
+        if ts < _capture_floor:
+            continue
+        if first_frame_at is None:
+            first_frame_at = time.perf_counter()
+
+        verdict = decider.feed(ts, _frame_db(frame))
+        if verdict == "gap":
+            stop_reason = "gap"
+            break
+
+        if decider.pad_seconds:
+            audio += _silence(decider.pad_seconds)
+        audio += frame
+        captured_frames += 1
+
+        if verdict is not None:
+            # The interruption was the whole command and it has already ended
+            # -- "speech_end" here is the ordinary outcome for a short one.
+            stop_reason = verdict
+            break
+
+    while stop_reason == "running":
         # Checked every pass, not only when the queue starves. Living inside
         # the queue.Empty branch made it unreachable for exactly the failure
         # it existed for: a trickle of frames kept the queue non-empty while

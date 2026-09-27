@@ -39,7 +39,7 @@ class BrainHistoryOnErrorTests(unittest.TestCase):
         self.assertEqual(brain._history, before)
 
     def test_error_still_reaches_the_caller(self):
-        """The pop must not swallow the error: main._reply_to() reports it."""
+        """The pop must not swallow the error: main._answer() reports it."""
         with self._provider(side_effect=RuntimeError("boom")):
             with self.assertRaisesRegex(RuntimeError, "boom"):
                 brain.ask("γεια")

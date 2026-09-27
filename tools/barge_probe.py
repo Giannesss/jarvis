@@ -15,10 +15,10 @@ Read the summary in this order:
 
   * **the decision rule block**. This is the headline, because it is the only
     thing that reports the statistic the feature actually tests. The rule
-    compares one frame against a *running median* of recent audio, and speech
-    is bursty against its own median by 25-30 dB -- so the number that decides
-    the feature is not the gap between two medians, it is how far each signal
-    reaches above the running floor and *stays* there for ONSET_SECONDS:
+    compares one frame against a *running median* of recent audio, and a voice
+    is bursty against its own median -- so the number that decides the feature
+    is not the gap between two medians, it is how far each signal reaches above
+    the running floor and *stays* there for ONSET_SECONDS:
 
         echo alone reaches +X dB   -> any margin at or below X false-fires on
                                       Jarvis's own vowels
@@ -29,6 +29,11 @@ Read the summary in this order:
     the mic, and if it stays that way, barge-in has to be
     BARGE_IN_MODE=wakeword (say the wake word to interrupt).
 
+    Measured here, on the first run whose buckets were both real: X = +4 dB,
+    Y = +15 dB, and BARGE_IN_MARGIN_DB=9 is the operating point that came out
+    of it. That pair is what the app now ships; this probe is how to re-derive
+    it for another room, another mic gain, or another set of speakers.
+
   * **the would-have-fired table**, which is the same thing measured per
     candidate rather than as a bound. A FIRE during the echo-only phase is a
     reply cut off for nothing; a miss during the barge phase is an
@@ -37,10 +42,10 @@ Read the summary in this order:
 
   * **margin (speech p50 - echo p50)** is reported last and is *context, not
     a verdict*. It compares two medians, while the rule compares an
-    instantaneous frame to a median. The two can differ by the burstiness
-    figure above, so a healthy-looking margin here is routinely accompanied
-    by false fires at every candidate. That is not a contradiction; it is the
-    two panels measuring different things.
+    instantaneous frame to a median. The two can differ by however bursty the
+    signals are, so a healthy-looking margin here can sit beside false fires at
+    every candidate. That is not a contradiction; it is the two panels
+    measuring different things.
 
 Two modes. **Run --echo first, and give it a CSV.** The echo-only run is the
 one that establishes the false-fire bound, and it needs a long clean stretch
@@ -174,10 +179,11 @@ BARGE_WINDOW_SECONDS = 4.0
 # to count as the user having started talking.
 #
 # Measured against echo **p95**, not its median, and that is the whole guard:
-# the echo's ordinary vowel peaks already reach 25-30 dB over its own running
-# median (see CANDIDATE_MARGINS), so a detector keyed to the median would
-# place the window on Jarvis's own voice. p95 is the level he routinely
-# reaches, and 6 dB over it is a signal he does not produce.
+# the echo's own vowel peaks sit well above its median (measured at +4 dB over
+# the *running* median, and further still over the median of a whole phase --
+# see CANDIDATE_MARGINS), so a detector keyed to the median would place the
+# window on Jarvis's own voice. p95 is the level he routinely reaches, and 6 dB
+# over it is a signal he does not produce.
 #
 # This locates your voice; it does not judge whether it cleared his. Those
 # are different questions, and keeping them apart is what stops the summary
@@ -196,11 +202,20 @@ BARGE_ONSET_SEARCH_SECONDS = 12.0
 # Candidate margins the would-have-fired table reports on, in dB over the
 # running echo level.
 #
-# These start where they do because speech is bursty against its own running
-# median by 25-30 dB, so every candidate below about 18 dB fires on Jarvis's
-# own vowels -- a table that stopped at 15 dB reported a false fire on every
-# row and pointed at no usable operating point at all.
-CANDIDATE_MARGINS = (9.0, 12.0, 15.0, 18.0, 21.0, 24.0, 27.0)
+# They used to start at 9 dB, on the reasoning that speech is bursty against
+# its own running median by 25-30 dB and so every candidate below ~18 dB would
+# fire on Jarvis's own vowels. The first run measured against a real echo floor
+# (the one _find_onset was written for) says otherwise: the echo's own reach was
+# **+4 dB**, the barge's +15, and 9 and 12 dB both fired on the barge with no
+# false fire at all. The old lower bound was measuring a bucket of empty room,
+# not his voice.
+#
+# So the table now extends below the recommended operating point, because a
+# recommendation that sits on the lowest row is a recommendation the table
+# cannot actually confirm -- there is no way to see how much room is left under
+# it. 3 dB is low enough to false-fire on any room worth measuring, which is
+# what makes it a useful row rather than a wasted one.
+CANDIDATE_MARGINS = (3.0, 5.0, 7.0, 9.0, 12.0, 15.0, 18.0, 21.0, 24.0, 27.0)
 
 # How long a frame run must stay above the floor to count as a barge-in.
 # Longer than the recorder's ONSET_SECONDS (0.16s) on purpose: a door or a

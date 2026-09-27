@@ -300,7 +300,7 @@ class FrozenBehaviourTests(PolicyTestCase):
         self.assertTrue(skills.shutdown_requested)
 
     def test_frozen_does_not_reach_the_brain(self) -> None:
-        """_reply_to()'s frozen check is a backstop: intercept() already
+        """_answer()'s frozen check is a backstop: intercept() already
         refuses everything but a shutdown phrase, and the shutdown skill
         claims those, so nothing normally falls through to the brain while
         frozen. Pinned anyway -- it is the last thing standing between a
@@ -308,14 +308,21 @@ class FrozenBehaviourTests(PolicyTestCase):
         skills.handle("σταμάτα τα πάντα")
 
         with mock.patch.object(main.skills, "handle", return_value=None), \
-                mock.patch.object(main.brain, "ask") as ask:
-            self.assertIsNone(main._reply_to("κλείσε"))
+                mock.patch.object(main.brain, "ask") as ask, \
+                mock.patch.object(main.speaker, "speak") as speak:
+            # spoke=False is the "say nothing at all" answer, and the only one
+            # that is not also a reply.
+            self.assertFalse(main._answer("κλείσε").spoke)
         ask.assert_not_called()
+        speak.assert_not_called()
 
     def test_the_brain_is_reached_and_logged_when_not_frozen(self) -> None:
-        with mock.patch.object(main.brain, "ask", return_value="απάντηση") as ask:
-            self.assertEqual(main._reply_to("Πες μου ένα ανέκδοτο"), "απάντηση")
+        with mock.patch.object(main.brain, "ask", return_value="απάντηση") as ask, \
+                mock.patch.object(main, "STREAM_REPLIES", False), \
+                mock.patch.object(main.speaker, "speak") as speak:
+            self.assertTrue(main._answer("Πες μου ένα ανέκδοτο").spoke)
         ask.assert_called_once()
+        speak.assert_called_once_with("απάντηση")
 
         row = self.audit()[-1]
         self.assertEqual(

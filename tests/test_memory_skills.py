@@ -1,5 +1,5 @@
 """Tests that memory is actually *wired in* -- that skills.handle() dispatches
-to it and main._reply_to() injects it, rather than the pieces merely existing.
+to it and main._answer() injects it, rather than the pieces merely existing.
 
 The rest of the memory suite tests parse(), recall() and the CLI in isolation.
 This file exists because all of that can pass while nothing calls it: the
@@ -136,7 +136,7 @@ class NonInterferenceTests(MemorySkillTestCase):
         self.assertIsNotNone(skills.handle("Τι μέρα είναι;"))
 
     def test_non_memory_text_falls_through_to_the_brain(self) -> None:
-        # No trigger phrase: handle() must decline so main._reply_to() can
+        # No trigger phrase: handle() must decline so main._answer() can
         # hand the utterance to the brain.
         self.assertIsNone(skills.handle("Πες μου ένα ανέκδοτο"))
 
@@ -149,11 +149,13 @@ class NonInterferenceTests(MemorySkillTestCase):
 
 
 class InjectionTests(MemorySkillTestCase):
-    def test_reply_to_passes_recalled_memory_to_the_brain(self) -> None:
+    def test_the_recalled_memory_reaches_the_brain(self) -> None:
         skills.handle("Θυμήσου ότι με λένε Γιάννης")
 
+        # _whole_reply is the non-streaming half of main._answer(): the same
+        # recall_safe() -> brain.ask() call, without speaking the result.
         with mock.patch.object(brain, "ask", return_value="ok") as ask:
-            main._reply_to("Πες μου ένα ανέκδοτο")
+            main._whole_reply("Πες μου ένα ανέκδοτο")
 
         ask.assert_called_once()
         memory_block = ask.call_args[0][1]

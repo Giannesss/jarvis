@@ -1,4 +1,5 @@
 import time
+from typing import Iterator
 
 import ollama
 
@@ -154,23 +155,37 @@ if BRAIN_PROVIDER not in _PROVIDERS:
     )
 
 
-def ask(user_text: str, memory_block: str | None = None) -> str:
-    """memory_block is what jarvis/memory.py recalled for this turn.
+def _build_messages(user_text: str, memory_block: str | None) -> list[dict]:
+    """Append the user turn to history and splice in this turn's memory.
 
-    It is injected as a transient system message just after the frozen
-    prefix, and deliberately never appended to _history: remembered context
-    is rebuilt fresh every turn, so stale recalls can't pile up and the
-    history trim can't silently drop half of one.
+    The memory block is a *transient* system message just after the frozen
+    prefix, and deliberately never appended to _history: remembered context is
+    rebuilt fresh every turn, so stale recalls can't pile up and the history
+    trim can't silently drop half of one.
     """
     _history.append({"role": "user", "content": user_text})
 
-    messages = _history
-    if memory_block:
-        messages = (
-            _history[:_PREFIX_LEN]
-            + [{"role": "system", "content": f"{MEMORY_PREAMBLE}\n{memory_block}"}]
-            + _history[_PREFIX_LEN:]
-        )
+    if not memory_block:
+        return _history
+
+    return (
+        _history[:_PREFIX_LEN]
+        + [{"role": "system", "content": f"{MEMORY_PREAMBLE}\n{memory_block}"}]
+        + _history[_PREFIX_LEN:]
+    )
+
+
+def _trim_history() -> None:
+    _history[:] = _history[:_PREFIX_LEN] + _history[_PREFIX_LEN:][-MAX_HISTORY_MESSAGES:]
+
+
+def ask(user_text: str, memory_block: str | None = None) -> str:
+    """One whole reply, synthesized and spoken only once it is finished.
+
+    Still the path when STREAM_REPLIES is off, and the path every skill-free
+    non-streaming caller takes. See start_turn() for the streamed one.
+    """
+    messages = _build_messages(user_text, memory_block)
 
     try:
         reply = _PROVIDERS[BRAIN_PROVIDER](messages)
@@ -184,5 +199,139 @@ def ask(user_text: str, memory_block: str | None = None) -> str:
         raise
 
     _history.append({"role": "assistant", "content": reply})
-    _history[:] = _history[:_PREFIX_LEN] + _history[_PREFIX_LEN:][-MAX_HISTORY_MESSAGES:]
+    _trim_history()
     return reply
+
+
+def _stream_ollama(messages: list[dict], state: dict) -> Iterator[str]:
+    """Yield the reply in deltas, reporting how it ended in `state`.
+
+    The stop reason has to come back out of band: a generator's return value is
+    invisible to a `for` loop, and the caller needs "did the token cap cut this
+    off mid-sentence" to decide whether to speak the tail at all.
+    """
+    t0 = time.perf_counter()
+    first_at: float | None = None
+    final = None
+
+    for part in ollama.chat(
+        model=OLLAMA_MODEL,
+        messages=messages,
+        think=False,
+        stream=True,
+        keep_alive=KEEP_ALIVE,
+        options={"num_predict": MAX_REPLY_TOKENS, "temperature": TEMPERATURE},
+    ):
+        delta = part["message"]["content"] or ""
+        if delta and first_at is None:
+            first_at = time.perf_counter() - t0
+        if part.get("done"):
+            final = part
+        if delta:
+            yield delta
+
+    state["done_reason"] = final.get("done_reason") if final is not None else None
+
+    # First token on its own line, because it is the number this whole step
+    # exists to move: the non-streaming path could only ever report when the
+    # *last* token arrived, and the first one is what decides whether a reply
+    # feels immediate. Both clocks are kept, same discipline as the recording
+    # timing line.
+    first = f"{first_at:.2f}s" if first_at is not None else "never"
+    counters = (
+        f" (prompt {_stage(final, 'prompt_eval_count', 'prompt_eval_duration')}"
+        f", gen {_stage(final, 'eval_count', 'eval_duration')})"
+        if final is not None
+        else ""
+    )
+    diag.log(
+        f"[timing] Ollama stream: first token {first}, "
+        f"done {time.perf_counter() - t0:.2f}s{counters}"
+    )
+
+
+# Add "claude" / "openai" entries here as they gain streaming, same idiom as
+# _PROVIDERS. A provider absent from this dict is not a failure: start_turn()
+# is simply never used for it and main.py keeps the whole-reply path.
+_STREAM_PROVIDERS = {
+    "ollama": _stream_ollama,
+}
+
+
+def streaming_available() -> bool:
+    return BRAIN_PROVIDER in _STREAM_PROVIDERS
+
+
+class Turn:
+    """One streamed reply, and the history bookkeeping that goes with it.
+
+    The difference from ask() is not the streaming, it is the accounting. A
+    streamed reply can be cut off mid-word by a barge-in, so what the model
+    generated and what the user actually heard are two different strings -- and
+    the one that belongs in the history is the second. Asking the model to
+    continue from a sentence nobody heard makes its next answer read as a reply
+    to a question that was never answered.
+
+    So a Turn is opened, streamed, and then *settled* exactly once:
+
+        turn = brain.start_turn(text, memory)
+        for delta in turn.deltas(): ...
+        turn.commit(what_was_actually_spoken)   # or turn.abandon()
+
+    Leaving one unsettled leaves a user message in history with no answer
+    after it, which is the state ask()'s except clause exists to avoid.
+    """
+
+    def __init__(self, messages: list[dict]) -> None:
+        self._messages = messages
+        self._state: dict = {}
+        self._settled = False
+        self.generated = ""
+
+    @property
+    def truncated(self) -> bool:
+        """The token cap stopped it mid-sentence (see MAX_REPLY_TOKENS)."""
+        return self._state.get("done_reason") == "length"
+
+    def deltas(self) -> Iterator[str]:
+        provider = _STREAM_PROVIDERS[BRAIN_PROVIDER]
+        try:
+            for delta in provider(self._messages, self._state):
+                self.generated += delta
+                yield delta
+        except Exception:
+            # Same reasoning as ask(): as far as the conversation is concerned
+            # this turn never happened. The caller reports the error.
+            self.abandon()
+            raise
+
+    def commit(self, spoken: str) -> None:
+        """Record what was actually said. Nothing said means nothing happened.
+
+        An empty `spoken` pops the user message too, rather than leaving it
+        unanswered -- a reply interrupted before its first word is, to the
+        conversation, a question that was never asked.
+        """
+        if self._settled:
+            return
+        self._settled = True
+
+        text = spoken.strip()
+        if not text:
+            _history.pop()
+            return
+
+        _history.append({"role": "assistant", "content": text})
+        _trim_history()
+
+    def abandon(self) -> None:
+        """Drop the turn entirely: no answer is coming."""
+        if self._settled:
+            return
+        self._settled = True
+        _history.pop()
+
+
+def start_turn(user_text: str, memory_block: str | None = None) -> Turn:
+    """Begin a streamed reply. See Turn for the contract."""
+    return Turn(_build_messages(user_text, memory_block))

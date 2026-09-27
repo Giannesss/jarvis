@@ -69,6 +69,68 @@ STREAM_FIRST_CHUNK_MAX_CHARS = int(os.environ.get("STREAM_FIRST_CHUNK_MAX_CHARS"
 # A short sentence is merged into the next one instead.
 STREAM_MIN_CHUNK_CHARS = int(os.environ.get("STREAM_MIN_CHUNK_CHARS", "16"))
 
+# Whether a reply is spoken as it is generated (brain.start_turn -> Chunker ->
+# speaker.speak_stream) or synthesized whole and then played (brain.ask ->
+# speaker.speak). Off is the pre-streaming path, kept working rather than kept
+# around: it is the only way to hear a reply when the streaming pipeline is
+# itself the suspect, and it is what the Enter-press prompt is tested against.
+STREAM_REPLIES = os.environ.get("STREAM_REPLIES", "true").lower() == "true"
+
+# --- Barge-in (jarvis/listener.py _BargeDecider, armed from main.py). Talking
+# over Jarvis stops him mid-word instead of waiting him out.
+#
+# Every frame recorded while he is audible is refused by the capture gate
+# (listener._should_capture) -- and those are exactly the frames this has to
+# judge, so they are routed to the decider on their way to being dropped.
+#
+# BARGE_IN_MARGIN_DB is the whole feature: how far over the *running median* of
+# recent audio a level must sustain itself to count as someone talking over
+# him. Measured here with tools/barge_probe.py, on a clean run:
+#
+#     echo alone reaches  ~+4 dB   -> anything at or below this cuts a reply
+#                                     off for nothing (his own vowels)
+#     speech over him     ~+15 dB  -> anything above this misses you
+#
+# and the would-have-fired table agreed: 9 and 12 dB fired on the barge with
+# no false fire on echo-only audio, 15 dB and up missed the barge entirely. 9
+# sits 5 dB clear of the false-fire bound and 6 dB under the miss bound, which
+# is as close to the middle of a 4-15 dB band as a round number gets. Raise it
+# if a reply is ever cut off by nothing; lower it if talking over him is
+# ignored. Re-measure with the probe rather than guessing -- it is a property
+# of this room, these speakers, this mic gain and where they sit.
+BARGE_IN_ENABLED = os.environ.get("BARGE_IN_ENABLED", "true").lower() == "true"
+BARGE_IN_MARGIN_DB = float(os.environ.get("BARGE_IN_MARGIN_DB", "9"))
+
+# How long a level has to hold above the margin. 0.32s (4 frames), twice the
+# recorder's own ONSET_SECONDS, because this one is competing with a signal
+# that is already loud: a door, a desk knock or a chair must never cut off a
+# reply.
+BARGE_ONSET_SECONDS = float(os.environ.get("BARGE_ONSET_SECONDS", "0.32"))
+
+# The running level is a median over this much recent audio. A median, not a
+# mean: a barge-in is short and loud, and would drag a mean up toward itself
+# until it stopped being detectable.
+BARGE_ECHO_WINDOW_SECONDS = float(os.environ.get("BARGE_ECHO_WINDOW_SECONDS", "2.0"))
+
+# How much audio the window needs before the rule may fire at all. Without it
+# the first frames of a reply are judged against a median of one or two
+# samples of themselves, which is not a floor.
+#
+# The cost is a blind window at the very start of a reply -- but only of the
+# session's *first* reply: the window is kept between replies, because it
+# estimates Jarvis's own voice through the same speakers in the same room and
+# that does not change between one sentence and the next.
+BARGE_MIN_PRIME_SECONDS = float(os.environ.get("BARGE_MIN_PRIME_SECONDS", "1.0"))
+
+# Whether the words that interrupted him become the next command.
+#
+# They have to be kept deliberately: the capture gate refused them, so they
+# are nowhere else. On they are handed to record_command() as a pre-roll, and
+# the first second of that audio is you mixed with him -- which is the reason
+# this is a switch. Off, the interruption only stops the reply and the command
+# is whatever is said after it.
+BARGE_PREROLL = os.environ.get("BARGE_PREROLL", "true").lower() == "true"
+
 # Recording silence detection (see jarvis/listener.py). The floor separating
 # speech from room noise, in dBFS: _StopDecider compares each 80ms frame's RMS
 # against it, and ffmpeg's silencedetect takes the same number.

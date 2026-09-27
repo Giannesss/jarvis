@@ -1,8 +1,9 @@
 import shlex
-from typing import Callable
+from typing import Callable, NamedTuple
 
 from jarvis import (
     brain,
+    chunker,
     db,
     diag,
     listener,
@@ -15,9 +16,12 @@ from jarvis import (
     wakeword,
 )
 from jarvis.config import (
+    BARGE_IN_ENABLED,
+    BARGE_PREROLL,
     CONVERSATION_MODE,
     CONVERSATION_TIMEOUT,
     NO_SPEECH_TIMEOUT,
+    STREAM_REPLIES,
     WAKE_BEEP,
     WAKE_WORD_ENABLED,
 )
@@ -76,24 +80,51 @@ def _ask_confirm(question: str) -> bool:
     return is_yes(answer)
 
 
-def _reply_to(text: str) -> str | None:
-    """Skill first, brain only when no skill matches.
+class Answer(NamedTuple):
+    """One answered utterance.
 
-    A brain error comes back as BRAIN_ERROR_REPLY rather than None, so the
-    caller speaks it like any other reply. None is reserved for "say nothing
-    at all", which is only the frozen backstop below."""
-    reply = skills.handle(text)
-    if reply is not None:
-        return reply
+    `spoke` is False only for the frozen backstop -- "say nothing at all" --
+    which the caller has to tell apart from an ordinary reply. `barge` is what
+    interrupted it, if anything did.
+    """
 
-    if policy.is_frozen():
-        # Belt and braces. policy.intercept() already refuses everything but
-        # a shutdown phrase while frozen, so getting here means one that no
-        # skill claimed -- the brain still must not answer for it.
-        return None
+    spoke: bool
+    barge: "listener.BargeResult | None" = None
 
-    policy.record("brain", "allowed", "no_skill_matched")
 
+def _barge_armed() -> bool:
+    """Whether talking over Jarvis can stop him, right now.
+
+    Wake-word mode only. Barge-in judges the frames the capture gate refuses
+    while he is audible, and those only exist on the persistent stream; the
+    Enter-press path opens the microphone per utterance and is not recording at
+    all while he talks.
+    """
+    return BARGE_IN_ENABLED and _wake_word_active
+
+
+def _say(text: str) -> Answer:
+    """Speak one finished line -- a skill reply, a cue -- interruptibly.
+
+    speaker.stop() is the callback because it is the output half of barge-in
+    already: idempotent, safe from the reader thread, and it honours a stop
+    that arrives before there is anything to stop.
+    """
+    if not _barge_armed():
+        speaker.speak(text)
+        return Answer(True)
+
+    listener.arm_barge(speaker.stop)
+    try:
+        speaker.speak(text)
+    finally:
+        barge = listener.disarm_barge(collect=BARGE_PREROLL)
+
+    return Answer(True, barge)
+
+
+def _whole_reply(text: str) -> str:
+    """The brain's answer, synthesized only once it is finished."""
     try:
         # recall_safe never raises: a broken or locked database means no
         # memory this turn, not a failed reply.
@@ -103,6 +134,86 @@ def _reply_to(text: str) -> str | None:
         # next question starts clean rather than trailing an unanswered one.
         print(f"Σφάλμα κατά την κλήση στο τοπικό μοντέλο: {e}")
         return BRAIN_ERROR_REPLY
+
+
+def _stream_reply(text: str) -> Answer:
+    """The brain's answer, spoken as it is generated.
+
+    Three moving parts, each owning one question: brain.Turn streams the
+    deltas and settles the history, chunker.Chunker decides where a piece is
+    worth saying, and speaker.speak_stream turns pieces into one continuous
+    sound that can be cut off mid-word.
+
+    The history is committed from what was *heard*, not from what was
+    generated -- see brain.Turn. That is the whole reason this is not just
+    brain.ask() with a callback.
+    """
+    turn = brain.start_turn(text, memory.recall_safe(text))
+    cut = chunker.Chunker()
+    printed = False
+
+    def pieces():
+        for delta in turn.deltas():
+            yield from cut.feed(delta)
+
+        tail = cut.flush(truncated=turn.truncated)
+        if tail:
+            yield tail
+
+    def show(piece: str) -> None:
+        # Called as each piece reaches the device, so the terminal fills at the
+        # pace the speaker does -- and stops where the speaker stopped. Printing
+        # from pieces() instead would show sentences a barge-in means nobody
+        # ever hears, since generation runs a chunk or two ahead of playback.
+        nonlocal printed
+        print(("" if printed else "Jarvis: ") + piece, end=" ", flush=True)
+        printed = True
+
+    if _barge_armed():
+        listener.arm_barge(speaker.stop)
+
+    try:
+        result = speaker.speak_stream(pieces(), on_chunk=show)
+    except Exception as e:
+        # The stream itself failed (Ollama down, the intermittent CUDA error).
+        # turn.deltas() has already dropped the turn from history; abandon() is
+        # idempotent and makes that true however the failure arrived.
+        turn.abandon()
+        if printed:
+            print()
+        print(f"Σφάλμα κατά την κλήση στο τοπικό μοντέλο: {e}")
+        return _say(BRAIN_ERROR_REPLY)
+    finally:
+        barge = listener.disarm_barge(collect=BARGE_PREROLL) if _barge_armed() else None
+
+    if printed:
+        print(" [διακοπή]" if result.aborted else "")
+
+    turn.commit(result.spoken)
+    return Answer(True, barge)
+
+
+def _answer(text: str) -> Answer:
+    """Answer one utterance out loud: skill first, brain only when none match."""
+    reply = skills.handle(text)
+    if reply is not None:
+        print(f"Jarvis: {reply}")
+        return _say(reply)
+
+    if policy.is_frozen():
+        # Belt and braces. policy.intercept() already refuses everything but
+        # a shutdown phrase while frozen, so getting here means one that no
+        # skill claimed -- the brain still must not answer for it.
+        return Answer(False)
+
+    policy.record("brain", "allowed", "no_skill_matched")
+
+    if STREAM_REPLIES and brain.streaming_available():
+        return _stream_reply(text)
+
+    reply = _whole_reply(text)
+    print(f"Jarvis: {reply}")
+    return _say(reply)
 
 
 def _converse(preroll: bytes) -> bool:
@@ -120,12 +231,19 @@ def _converse(preroll: bytes) -> bool:
     # the WAKE_BEEP=false path (no beep, nothing flushed). Follow-up turns
     # never replay it.
     turn_preroll = b"" if WAKE_BEEP else preroll
+    # The words that interrupted the last reply, if one was interrupted: they
+    # are the start of this command and live nowhere else, since the capture
+    # gate refused them while Jarvis was audible. See listener.take/disarm.
+    barge_frames: list[tuple[float, bytes]] | None = None
     timeout = NO_SPEECH_TIMEOUT
     gap_retries = 0
 
     while True:
-        text, stop_reason = listener.record_command(turn_preroll, timeout)
+        text, stop_reason = listener.record_command(
+            turn_preroll, timeout, preroll_frames=barge_frames
+        )
         turn_preroll = b""
+        barge_frames = None
         timeout = CONVERSATION_TIMEOUT
 
         if text is None:
@@ -150,21 +268,32 @@ def _converse(preroll: bytes) -> bool:
             speaker.speak("Εντάξει.")
             return True
 
-        reply = _reply_to(text)
-        if reply is None:
+        answer = _answer(text)
+        if not answer.spoke:
             listener.flush()
             if not CONVERSATION_MODE:
                 return True
             continue
-
-        print(f"Jarvis: {reply}")
-        speaker.speak(reply)
 
         if skills.shutdown_requested:
             return False
 
         if not CONVERSATION_MODE:
             return True
+
+        if answer.barge is not None:
+            # He was talked over. Do *not* flush: the floor would be raised
+            # past the second the user is still speaking in, throwing away the
+            # rest of the sentence that stopped him. The audible part of it is
+            # already out of the pipeline (the capture gate refused it) and
+            # comes back as the pre-roll instead.
+            barge_frames = answer.barge.frames or None
+            diag.log(
+                f"[barge] interrupted at {answer.barge.onset_at:.2f}s "
+                f"({answer.barge.delta_db:.1f} dB over the floor), "
+                f"{len(answer.barge.frames)} frames kept"
+            )
+            continue
 
         # Drop whatever was captured around the reply, so the next turn
         # can't record Jarvis's own voice as the user's command.
@@ -301,12 +430,7 @@ def main() -> None:
 
             print(f"Εσύ: {text}")
 
-            reply = _reply_to(text)
-            if reply is None:
-                continue
-
-            print(f"Jarvis: {reply}")
-            speaker.speak(reply)
+            _answer(text)
 
             if skills.shutdown_requested:
                 break

@@ -85,6 +85,17 @@ class PlayerTestCase(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+        # device=None below deliberately exercises _resolve_device, which reads
+        # PLAYBACK_DEVICE -- so without this the suite's result depends on
+        # whatever is in the developer's .env matching the *fake* DEVICES list
+        # above, which it has no reason to: a real PLAYBACK_DEVICE=G27F raised
+        # PlaybackUnavailable in 12 of these tests while the monitor was
+        # plugged in and working. Empty means "PortAudio's own default", the one
+        # value that cannot fail to resolve.
+        device_patcher = mock.patch.object(player, "PLAYBACK_DEVICE", "")
+        device_patcher.start()
+        self.addCleanup(device_patcher.stop)
+
     def _player(self) -> player.Player:
         sink = player.Player(self.SAMPLERATE, device=None, blocksize=self.BLOCK)
         sink.start()

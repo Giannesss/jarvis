@@ -26,6 +26,7 @@ produced the 0.05s reading in the first place.
 from __future__ import annotations
 
 import array
+import collections
 import contextlib
 import io
 import queue
@@ -249,6 +250,80 @@ class StaleAudioTests(RecordCommandTestCase):
         self.assertEqual(reason, "speech_end")
         self.assertIsNone(text)  # no segments came back from the stub
         model.assert_called_once()  # but it did reach Whisper
+
+
+class BargePrerollTests(RecordCommandTestCase):
+    """The audio that interrupted a reply, handed back as the start of a turn.
+
+    Those frames were refused by the capture gate while Jarvis was audible, so
+    they exist nowhere else -- and they are the beginning of the command, not
+    context in front of it. Prepending them as opaque bytes (the way the
+    wake-word pre-roll is prepended, since that one ends with the wake word)
+    would leave _StopDecider waiting for an onset that already happened.
+    """
+
+    def test_the_preroll_starts_the_turn_rather_than_padding_it(self) -> None:
+        # The user interrupted, said their whole phrase over him, and stopped.
+        # Nothing arrives live afterwards but silence.
+        preroll = stream(10.0, "LLLLLL")
+        self.fill(stream(10.48, "." * 14))
+
+        with mock.patch.object(listener, "_get_model") as model:
+            model.return_value.transcribe.return_value = ([], None)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                text, reason = listener.record_command(
+                    no_speech_timeout=0.5, preroll_frames=preroll
+                )
+
+        # "speech_end", not "no_speech": the words in the pre-roll are what
+        # started the turn, and the live silence is what ended it.
+        self.assertEqual(reason, "speech_end")
+        model.assert_called_once()  # it reached Whisper
+        self.assertIsNone(text)  # the stub returned no segments
+
+    def test_a_short_interruption_can_be_the_whole_command(self) -> None:
+        # Nothing live at all: the queue is empty and the phrase is entirely in
+        # the pre-roll, ending with enough quiet to close the turn.
+        preroll = stream(10.0, "LLLL" + "." * 14)
+
+        with mock.patch.object(listener, "_get_model") as model:
+            model.return_value.transcribe.return_value = ([], None)
+            with contextlib.redirect_stdout(io.StringIO()):
+                _text, reason = listener.record_command(
+                    no_speech_timeout=0.5, preroll_frames=preroll
+                )
+
+        self.assertEqual(reason, "speech_end")
+        model.assert_called_once()
+
+    def test_preroll_frames_below_the_floor_are_still_dropped(self) -> None:
+        # A flush during the reply outranks the pre-roll: the watermark means
+        # "everything before this instant is stale", whoever is holding it.
+        listener._capture_floor = 20.0
+        self.fill(stream(20.0, "." * 10))
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            text, reason = listener.record_command(
+                no_speech_timeout=0.5, preroll_frames=stream(10.0, "LLLLLL")
+            )
+
+        self.assertIsNone(text)
+        self.assertEqual(reason, "no_speech")
+
+    def test_a_hole_inside_the_preroll_is_still_a_hole(self) -> None:
+        # The catch-up wait in _collect_barge_frames exists to prevent this,
+        # but if it ever fires the turn must be re-asked rather than welded
+        # together and transcribed.
+        preroll = stream(10.0, "LL") + stream(12.0, "LLLL")
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            text, reason = listener.record_command(
+                no_speech_timeout=0.5, preroll_frames=preroll
+            )
+
+        self.assertIsNone(text)
+        self.assertEqual(reason, "gap")
 
 
 class StarvedStreamTests(RecordCommandTestCase):
@@ -763,6 +838,17 @@ class DeviceOpenTests(unittest.TestCase):
 
         self.assertIsNotNone(listener._stream_process)
         self.assertEqual(listener._stream_frames_read, 0)
+
+    def test_a_restart_forgets_the_barge_in_floor(self) -> None:
+        # The floor is a level estimate keyed to stream_time and to this
+        # device; a restart invalidates both. Everything else keyed to
+        # stream_time is reset here for the same reason.
+        listener._barge_window = collections.deque([-45.0] * 25)
+        self.addCleanup(setattr, listener, "_barge_window", None)
+
+        self.start(_FakeProcess([QUIET], [], exit_code=None))
+
+        self.assertIsNone(listener._barge_window)
 
 
 class StderrLineTests(unittest.TestCase):

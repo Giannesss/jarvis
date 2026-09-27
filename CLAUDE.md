@@ -21,6 +21,15 @@ built; the phase pointer moves to Phase 5 once they have been hand-tested on
 live audio, which is the roadmap's own rule and the one thing tests cannot
 stand in for.
 
+**Phase 3 — a reply you can interrupt — is built, out of order, on
+`feature/streaming-interrupt`.** Four steps: a stoppable player (see
+"Playback"), a chunker, streaming replies (see "Streaming replies") and
+barge-in (see "Barge-in"). The operating point it needed —
+`BARGE_IN_MARGIN_DB=9` — came from `tools/barge_probe.py` rather than from a
+guess, and the probe took three revisions before it was measuring the right
+thing. Same rule as Phase 4: it is done when it has been hand-tested on live
+audio.
+
 Phase 1 closed on 2026-09-23 (`docs/PHASE1_STATUS.md`): the beep-reset bug and
 the too-high silence floor are fixed and confirmed live, and the remaining
 20-30s trigger latency is explained as model/accent fit rather than a bug —
@@ -52,16 +61,20 @@ voice model downloaded into `models/`. Enter at the prompt to record, `exit`/`qu
    (`WHISPER_MODEL` from `.env`, default `"small"`; CPU, int8,
    `language="el"`).
 3. **LLM reply** — `jarvis/brain.py` sends the running chat history to a
-   local Ollama model (`ollama.chat`) with a system prompt asking for short,
+   local Ollama model with a system prompt asking for short,
    natural-sounding replies (no markdown, no calling itself an AI unless
    asked) and refusing to invent the user's own facts (see "Grounding").
    The prompt doesn't say anything about which language to reply
-   in — see "Language" for how that's actually handled.
+   in — see "Language" for how that's actually handled. Two entry points:
+   `ask()` returns a finished reply (`ollama.chat`), and `start_turn()`
+   streams one (`stream=True`) for the path below.
 4. **Text-to-speech** — `jarvis/speaker.py` synthesizes the reply with
    Microsoft Edge TTS by default (`TTS_ENGINE=edge`), falling back to
    offline Piper if Edge synthesis fails (e.g. no internet) or if
    `TTS_ENGINE=piper`. Both hand raw PCM to `jarvis/player.py`, which can be
-   stopped mid-word — see "Playback".
+   stopped mid-word — see "Playback". With `STREAM_REPLIES` on (the default)
+   the reply is spoken *as it is generated*, in pieces cut by
+   `jarvis/chunker.py` — see "Streaming replies".
 
 `main.py` wires these together in a loop, trying `jarvis/skills.py` first and
 only falling back to the brain when a skill doesn't match (see "Skills").
@@ -75,8 +88,12 @@ only falling back to the brain when a skill doesn't match (see "Skills").
   the kill switch, the audit log, and `python -m jarvis.policy` (also backing
   `:policy` at the prompt). See "Policy".
 - `jarvis/brain.py` — Ollama chat call + conversation history + system prompt.
-- `jarvis/speaker.py` — Edge/Piper synthesis, the speech lock, and the
-  audible-interval bookkeeping the capture gate reads.
+  `ask()` for a finished reply, `start_turn()` → `Turn` for a streamed one
+  (see "Streaming replies").
+- `jarvis/chunker.py` — pure: cuts a token stream into pieces worth speaking.
+- `jarvis/speaker.py` — Edge/Piper synthesis, the speech lock, the
+  audible-interval bookkeeping the capture gate reads, and `speak_stream()`,
+  which turns a stream of text pieces into one continuous, stoppable sound.
 - `jarvis/player.py` — the output device: one PortAudio stream per utterance,
   fed from a queue, abortable mid-word. See "Playback".
 - `jarvis/config.py` — loads `.env` (via `python-dotenv`) into `OLLAMA_MODEL` and `PIPER_MODEL_PATH`.
@@ -98,7 +115,7 @@ only falling back to the brain when a skill doesn't match (see "Skills").
 - `tools/barge_probe.py` — standalone barge-in diagnostic, not part of the
   app: measures how loud Jarvis's own voice arrives at the microphone against
   how loud you are talking over it, and replays candidate thresholds over the
-  recorded frames. See "Playback". Every phase is watched
+  recorded frames. Where `BARGE_IN_MARGIN_DB` came from — see "Barge-in". Every phase is watched
   (`STREAM_SILENT_TIMEOUT`, 3s — far tighter than the app's 15s, because here
   audio is meant to be flowing continuously) and the run is abandoned with a
   device diagnosis the moment the microphone stops feeding it, rather than
@@ -238,7 +255,150 @@ speak.
 `tests/test_player.py` drives the callback by hand, one block at a time,
 with `sounddevice` faked in `sys.modules` — the same way
 `tests/test_record_timing.py` drives `_StopDecider` from a list. Nothing in
-the suite opens an audio device.
+the suite opens an audio device. It also patches `PLAYBACK_DEVICE` to empty:
+`device=None` deliberately exercises `_resolve_device`, and without the patch
+whether the suite passes depends on what is in `.env` and which speakers are
+plugged in.
+
+## Streaming replies
+
+`STREAM_REPLIES` (on by default) speaks a reply as it is generated instead of
+waiting for all of it. Three parts, each owning one question, wired together
+in `main._stream_reply()`:
+
+- **`brain.start_turn()` → `Turn`** streams the deltas and settles the
+  history. `ask()` is unchanged and is still the path when `STREAM_REPLIES` is
+  off or a provider has no streaming entry (`_STREAM_PROVIDERS`, same idiom as
+  `_PROVIDERS`).
+- **`chunker.Chunker`** decides where a piece is worth saying. Pure, no I/O,
+  driven from a list in tests. See its module docstring for why the *first*
+  chunk is allowed to be a clause rather than a sentence — measured, it moved
+  the first spoken words from +6.3s to +3.3s, and sentence-granular streaming
+  alone would have bought ~0.5s.
+- **`speaker.speak_stream()`** turns pieces into one sound. One `Player` for
+  the whole reply, so a seam between two chunks is a buffer hand-off.
+
+**The history is committed from what was *heard*, not from what was
+generated.** That is the whole reason `Turn` exists rather than a callback on
+`ask()`. A reply cut off halfway was, to the user, only its first half, and a
+model told it said the rest answers the next question as though the user had
+heard it. `Turn` is settled exactly once — `commit(spoken)` or `abandon()` —
+and an empty `spoken` pops the user's message too, because a question answered
+by silence is a question never asked (the same reasoning `ask()`'s `except`
+clause already followed).
+
+Which chunks count is `speaker._heard()`: **a chunk is spoken once half of it
+has played.** The halves are not symmetric — `played_seconds` is what reached
+the device rather than the speaker cone, so it already leans towards crediting
+a few milliseconds Jarvis nearly said. Dropping a sentence the user heard in
+full makes the next reply repeat it; keeping one they heard the first word of
+makes it refer back to something they never got.
+
+Three smaller things are deliberate:
+
+- **The terminal prints from `on_chunk`, not from the generator.** Generation
+  runs a chunk or two ahead of playback, so printing as pieces are *produced*
+  shows sentences that an interruption a moment later means nobody ever hears.
+  `speak_stream` calls `on_chunk` as each piece is handed to the device.
+- **The abort is checked before the next piece is pulled.** Pulling is what
+  waits on the model, so checking afterwards cost one more chunk of generation
+  and one more synthesis round trip after the reply was already over.
+- **A samplerate change mid-reply costs exactly one seam.** A running
+  PortAudio stream cannot change rate, so Edge failing halfway and Piper
+  taking over at a different rate opens a second player. Logged, because it is
+  the only case in which a reply legitimately has a join in it.
+
+`tests/test_brain_stream.py` and `tests/test_speak_stream.py` pin both halves;
+neither opens a device or reaches a model.
+
+## Barge-in
+
+Talking over Jarvis stops him mid-word. Off at the Enter prompt and on in
+wake-word mode (`BARGE_IN_ENABLED`), because it judges audio that only exists
+on the persistent stream.
+
+**The frames it judges are the ones the capture gate throws away.**
+`_should_capture` refuses everything recorded while Jarvis is audible — and
+that is exactly the audio that can answer "is this him or is this you". So
+`_stream_audio_reader` now shows each refused frame to `_BargeDecider` on its
+way to being counted in `_frames_gated`. Nothing else about the gate changes:
+what reaches the recording pipeline is identical, which is what keeps this
+from being able to break the ordinary path.
+
+**The rule is the one `tools/barge_probe.py` measured**, so
+`BARGE_IN_MARGIN_DB` means here exactly what the probe's would-have-fired
+table reported: each frame's level minus the **running median** of recent
+audio, fired when it holds above the margin for `BARGE_ONSET_SECONDS` (0.32s,
+twice the recorder's own onset, because this one competes with a signal that
+is already loud). Measured on the first run whose buckets were both real:
+
+```
+echo alone reaches  ~+4 dB   -> the false-fire bound
+speech over him    ~+15 dB   -> the miss bound
+9 and 12 dB fired on the barge with no false fire; 15 dB and up missed it
+```
+
+9 sits 5 dB clear of the first and 6 under the second. It is a property of
+this room, these speakers, this mic gain and where they sit — re-measure with
+the probe rather than guessing.
+
+Four things are deliberate:
+
+- **A median, not a mean.** A barge-in is a handful of loud frames against a
+  two-second window; a mean would be dragged up toward them until they stopped
+  clearing it.
+- **The floor must exist before the rule can fire** (`BARGE_MIN_PRIME_SECONDS`),
+  or the first frames of a reply are judged against a median of themselves.
+  The probe learned this the hard way in the opposite direction: building the
+  median out of the frames under test made a clean +11.4 dB margin report
+  MISSED at every threshold. The cost is a blind window at the start of a
+  reply — **but only the session's first**, because the window is kept between
+  replies. It estimates his voice through these speakers in this room, which
+  does not change between one sentence and the next. A stream restart clears
+  it, since `stream_time` and the device both restart there.
+- **`speaker.stop()` is the callback**, called on the reader thread. It is the
+  output half of barge-in already: idempotent, cheap, and it honours a stop
+  that arrives before there is anything to stop. Anything it raises is logged
+  and swallowed — that thread is the only one draining ffmpeg's stdout, and a
+  dead reader starves every consumer.
+- **The reaction is bounded below by ffmpeg, not by the rule.** dshow hands
+  over ~1s of audio per burst, so the abort lands ~1.0–1.3s of audio-time
+  after the user starts talking, and `player.abort()` silences him within a
+  blocksize (~23ms) of that. The probe's figures are recorded-time and say
+  nothing about this.
+
+**The words that interrupted him become the next command** (`BARGE_PREROLL`).
+They have to be kept deliberately: the capture gate refused them, so the
+decider's ring buffer is the only copy. `disarm_barge(collect=True)` returns
+them as `(stream_time, frame)` pairs from the onset (minus one frame of lead),
+and `record_command(preroll_frames=...)` feeds them **through `_StopDecider`**
+rather than prepending them as opaque audio the way the wake-word pre-roll is
+prepended — that one ends with the wake word, while these are the start of the
+utterance, and a decider left waiting for an onset that already happened
+returns `no_speech` on a turn that had words in it.
+
+Two consequences worth carrying forward:
+
+- **An interrupted reply is never followed by `listener.flush()`.** The flush
+  is what stops Jarvis recording his own voice as the next command, but after
+  a barge-in it would raise the floor past the second the user is still
+  speaking in and throw away the rest of the sentence that stopped him. The
+  audible part is already out of the pipeline; the pre-roll is how it comes
+  back. `ConversationWiringTests` pins this, both ways.
+- **Before the buffer is taken, the reader is given time to catch up.** It runs
+  up to ~1s of audio behind real time, so at the moment an abort returns, the
+  frames around it have been recorded but not read. Taking the buffer without
+  them puts a hole in the middle of the interrupting sentence — the weld
+  Whisper transcribes confidently and wrongly.
+
+Known limits, accepted rather than solved: a false fire (someone else talking,
+a TV) costs the rest of one reply, which is the cheap direction; and the first
+second of audio in the pre-roll is you mixed with him, which is what
+`BARGE_PREROLL=false` exists for.
+
+`tests/test_barge_decider.py` drives the rule from a list of dB levels, the
+way `_StopDecider` is driven, and pins the arming, the kept audio and the
+conversation wiring.
 
 ## Wake word
 
@@ -523,7 +683,10 @@ length changes. `_gap_blame()` already computes it.
 ways and they are identical by the time a consumer notices: the capture gate
 refused it (`_frames_gated`), the queue overran and `_enqueue_bounded`
 dropped the oldest to make room (`_frames_evicted`, otherwise completely
-silent), or ffmpeg never produced it. `_gap_blame()` turns the two counters
+silent), or ffmpeg never produced it. (A gated frame is no longer only
+counted: it is shown to the barge-in decider first, since audio recorded while
+Jarvis was audible is the only audio that can say whether someone is talking
+over him. See "Barge-in".) `_gap_blame()` turns the two counters
 into the answer, and the gap line carries where in the wait the hole opened,
 which separates a structural one at the start of a cycle from one that opens
 mid-wait. A 5s heartbeat reports that the wait is still being fed; it is
@@ -539,6 +702,11 @@ reply so Jarvis never records its own voice as the next command. (The capture
 gate already drops frames *recorded* while he was audible; the flush raises
 the floor past everything older than the end of the reply. See "The recording
 clock" — both are answering the same question on the same clock now.)
+
+After every reply *he finished*, that is. An **interrupted** one is
+deliberately not flushed: the floor would be raised past the second the user is
+still speaking in, taking the rest of the sentence that stopped him with it.
+See "Barge-in".
 
 A turn that comes back `"gap"` is re-asked rather than answered: Jarvis says
 «Δεν σε άκουσα καλά, πες το ξανά.» and records again, up to `MAX_GAP_RETRIES`
