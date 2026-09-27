@@ -4,7 +4,13 @@ from typing import Iterator
 import ollama
 
 from jarvis import diag
-from jarvis.config import BRAIN_PROVIDER, OLLAMA_MODEL
+from jarvis.config import (
+    ANTHROPIC_API_KEY,
+    BRAIN_PROVIDER,
+    CLAUDE_FALLBACK_OLLAMA,
+    CLAUDE_MODEL,
+    OLLAMA_MODEL,
+)
 
 SYSTEM_PROMPT = (
     "Είσαι ο Τζάρβις, ένας φιλικός φωνητικός βοηθός. Μιλάς στον κόσμο σαν "
@@ -143,9 +149,188 @@ def _ask_ollama(messages: list[dict]) -> str:
     return reply
 
 
-# Add "claude" / "openai" entries here later (not implemented yet).
+# --- The Claude brain -------------------------------------------------------
+#
+# Two entry points, the same two Ollama has (_ask_claude / _stream_claude), so
+# ask() and Turn never learn which brain answered. What is genuinely different
+# is the message format, and that difference is one pure function.
+
+# What "the token cap cut this off mid-sentence" is called here. Ollama got
+# there first and Turn.truncated reads its word, so the Messages API's
+# "max_tokens" is translated at this provider's edge rather than downstream.
+STOP_TRUNCATED = "length"
+
+# Printed when a turn is answered by the local model instead. Announced, never
+# silent -- see _may_fall_back().
+CLAUDE_FALLBACK_NOTICE = "Το Claude δεν απάντησε ({reason}), χρήση τοπικού μοντέλου."
+
+# HTTP statuses worth trying the local model for: a timeout, a conflict, a rate
+# limit, or the API itself being unwell.
+_TRANSIENT_STATUSES = frozenset({408, 409, 429})
+
+# The SDK failures that carry no status, because nothing reached Anthropic at
+# all. Matched by module and class *name* rather than by class, so this module
+# never has to import `anthropic` in order to classify an error -- which is what
+# lets the test suite (and anyone on the default BRAIN_PROVIDER) run with the
+# SDK not installed at all.
+_TRANSIENT_ERROR_NAMES = frozenset(
+    {"APIConnectionError", "APITimeoutError", "APIConnectionTimeoutError"}
+)
+
+# Built on first use, not at import. With BRAIN_PROVIDER=ollama the SDK is never
+# needed, and importing this module has to stay cheap -- skills.py pulls it in
+# transitively. Same lazy-singleton idiom as speaker._get_voice() and
+# listener._get_model(), with the import deferred alongside it for the same
+# reason.
+_client = None
+
+
+def _get_client():
+    global _client
+
+    if _client is None:
+        import anthropic
+
+        _client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+    return _client
+
+
+def _to_messages_api(messages: list[dict]) -> tuple[str, list[dict]]:
+    """Ollama's flat message list, in the shape the Messages API wants.
+
+    Ollama accepts a system message anywhere in the list. The Messages API takes
+    one top-level `system` and a `messages` list that must not carry the role at
+    all -- a mid-conversation system message is an Opus 5 / 4.8 feature and a
+    400 on Haiku 4.5. That matters because it is exactly where _build_messages()
+    splices this turn's recalled memory.
+
+    So every system message is joined into `system`, in order: SYSTEM_PROMPT
+    first, then the transient memory block. That is the right place for it
+    rather than a workaround -- MEMORY_PREAMBLE exists precisely so the model
+    reads recalled facts as background it already knows instead of as something
+    the user just said.
+
+    Pure, and it never touches _history: what it is handed is the list
+    _build_messages() already returned, so the frozen-prefix and
+    transient-memory contract that ask() and Turn rest on is untouched.
+    """
+    system = "\n\n".join(
+        message["content"] for message in messages if message["role"] == "system"
+    )
+    turns = [message for message in messages if message["role"] != "system"]
+    return system, turns
+
+
+def _normalize_stop(stop_reason: str | None) -> str | None:
+    return STOP_TRUNCATED if stop_reason == "max_tokens" else stop_reason
+
+
+def _usage(usage) -> str:
+    """Token counts for the diagnostic log, tolerant of missing fields.
+
+    Same role as _stage() on the Ollama side: a slow turn is either a large
+    prompt or a long generation, and the two have different fixes. Counts and
+    timings only -- the log holds no transcribed text, whichever brain answered.
+    """
+    sent = getattr(usage, "input_tokens", None)
+    back = getattr(usage, "output_tokens", None)
+    return (
+        f"in {sent if sent is not None else '?'} tok, "
+        f"out {back if back is not None else '?'} tok"
+    )
+
+
+def _is_transient(error: Exception) -> bool:
+    """Whether this failure is worth answering from the local model instead.
+
+    The asymmetry is the whole rule. A transient failure -- no internet, a rate
+    limit, a 5xx -- is exactly what the roadmap's offline fallback is for. A 401
+    or a 400 is not: it will never fix itself, and answering from qwen3 anyway
+    would mean every reply quietly comes from the local model while you believe
+    you are talking to Claude. That is a wrong answer nobody can see, which is
+    the expensive kind; a spoken error is the cheap one.
+
+    So anything unclassifiable is deliberately *not* transient -- a bug of our
+    own that never reached the network included.
+    """
+    status = getattr(error, "status_code", None)
+    if status is not None:
+        return status in _TRANSIENT_STATUSES or status >= 500
+
+    return (
+        type(error).__module__.split(".")[0] == "anthropic"
+        and type(error).__name__ in _TRANSIENT_ERROR_NAMES
+    )
+
+
+def _may_fall_back(error: Exception) -> bool:
+    """Decide, and say so on the terminal when the answer is yes.
+
+    The announcement is not decoration: speaker.py prints «Edge TTS απέτυχε ...,
+    χρήση Piper.» for the same reason. A fallback nobody is told about is a
+    different assistant answering under Claude's name.
+    """
+    if not (CLAUDE_FALLBACK_OLLAMA and _is_transient(error)):
+        return False
+
+    reason = type(error).__name__
+    print(CLAUDE_FALLBACK_NOTICE.format(reason=reason))
+    diag.log(f"[timing] Claude failed ({reason}), answering from Ollama")
+    return True
+
+
+def _ask_claude(messages: list[dict]) -> str:
+    """One whole reply from the Messages API. Same contract as _ask_ollama.
+
+    Three things are deliberately *not* sent, and the reason is the same for all
+    three: CLAUDE_MODEL is a knob, and a request that is only valid for today's
+    value of it is a trap.
+
+      * `temperature` -- removed on Sonnet 5 and Opus 5, a 400 there. The prompt
+        already does this job (SYSTEM_PROMPT asks for one or two short
+        sentences), which is why the Ollama path's TEMPERATURE has no twin here.
+      * `thinking` -- omitted, which on Haiku 4.5 means none at all. Naming it
+        would have to be model-specific: the 5-series reads an absent parameter
+        as adaptive thinking, and a 120-token spoken reply has no latency budget
+        for reasoning.
+      * `output_config` -- its `effort` is rejected outright on Haiku 4.5.
+
+    MAX_REPLY_TOKENS carries over unchanged: same cap, same reason, and the same
+    _trim_to_last_sentence() when it bites.
+    """
+    system, turns = _to_messages_api(messages)
+
+    t0 = time.perf_counter()
+    try:
+        response = _get_client().messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=MAX_REPLY_TOKENS,
+            system=system,
+            messages=turns,
+        )
+    except Exception as error:
+        if not _may_fall_back(error):
+            raise
+        return _ask_ollama(messages)
+
+    diag.log(
+        f"[timing] Claude response: {time.perf_counter() - t0:.2f}s "
+        f"({_usage(getattr(response, 'usage', None))})"
+    )
+
+    # Never content[0].text: a reply can arrive as several text blocks, and a
+    # non-text block among them has to be skipped rather than crashed on.
+    reply = "".join(block.text for block in response.content if block.type == "text")
+    if _normalize_stop(response.stop_reason) == STOP_TRUNCATED:
+        reply = _trim_to_last_sentence(reply)
+    return reply
+
+
+# Add an "openai" entry here later (not implemented yet).
 _PROVIDERS = {
     "ollama": _ask_ollama,
+    "claude": _ask_claude,
 }
 
 if BRAIN_PROVIDER not in _PROVIDERS:
@@ -153,6 +338,26 @@ if BRAIN_PROVIDER not in _PROVIDERS:
         f"Unknown BRAIN_PROVIDER {BRAIN_PROVIDER!r}; expected one of "
         f"{sorted(_PROVIDERS)}. Check your .env file."
     )
+
+
+def _check_key(provider: str, api_key: str) -> None:
+    """A missing key is a startup failure, not a per-question one.
+
+    Same reasoning as the unknown-BRAIN_PROVIDER check above, and the same
+    place: raising here happens at import, which is startup, before main()'s
+    per-request handling can turn it into a spoken «δεν μπορώ να απαντήσω» once
+    per question for the rest of the run. Checking a string needs no SDK, so
+    this lands well before _get_client() would import one.
+    """
+    if provider == "claude" and not api_key.strip():
+        raise ValueError(
+            "BRAIN_PROVIDER=claude needs ANTHROPIC_API_KEY, which is empty or "
+            "unset. Add it to your .env file (see .env.example), or set "
+            "BRAIN_PROVIDER=ollama to use the local model."
+        )
+
+
+_check_key(BRAIN_PROVIDER, ANTHROPIC_API_KEY)
 
 
 def _build_messages(user_text: str, memory_block: str | None) -> list[dict]:
@@ -250,11 +455,67 @@ def _stream_ollama(messages: list[dict], state: dict) -> Iterator[str]:
     )
 
 
-# Add "claude" / "openai" entries here as they gain streaming, same idiom as
-# _PROVIDERS. A provider absent from this dict is not a failure: start_turn()
-# is simply never used for it and main.py keeps the whole-reply path.
+def _stream_claude(messages: list[dict], state: dict) -> Iterator[str]:
+    """Yield the reply in deltas, reporting how it ended in `state`.
+
+    Same contract as _stream_ollama, out-of-band stop reason included -- a
+    generator's return value is invisible to a `for` loop.
+
+    The fallback is narrower here than in _ask_claude, and deliberately so: it
+    is allowed only *before the first delta*. Once a word has reached the
+    speakers there is no way to start over on the local model without saying it
+    twice, so a failure mid-reply stays a failure -- Turn.deltas() drops the
+    turn and main._stream_reply() speaks its error line, which is exactly what
+    happens today when Ollama dies mid-stream.
+    """
+    system, turns = _to_messages_api(messages)
+
+    t0 = time.perf_counter()
+    first_at: float | None = None
+    final = None
+
+    try:
+        with _get_client().messages.stream(
+            model=CLAUDE_MODEL,
+            max_tokens=MAX_REPLY_TOKENS,
+            system=system,
+            messages=turns,
+        ) as stream:
+            for delta in stream.text_stream:
+                if not delta:
+                    continue
+                if first_at is None:
+                    first_at = time.perf_counter() - t0
+                yield delta
+
+            final = stream.get_final_message()
+    except Exception as error:
+        if first_at is not None or not _may_fall_back(error):
+            raise
+        # _stream_ollama sets state["done_reason"] itself, so the caller still
+        # learns how this reply ended -- from whichever brain produced it.
+        yield from _stream_ollama(messages, state)
+        return
+
+    state["done_reason"] = _normalize_stop(getattr(final, "stop_reason", None))
+
+    # First token on its own, for the reason the Ollama line keeps it there: it
+    # is the number streaming exists to move, and the only one that says whether
+    # a reply felt immediate.
+    first = f"{first_at:.2f}s" if first_at is not None else "never"
+    diag.log(
+        f"[timing] Claude stream: first token {first}, "
+        f"done {time.perf_counter() - t0:.2f}s "
+        f"({_usage(getattr(final, 'usage', None))})"
+    )
+
+
+# Add an "openai" entry here as it gains streaming, same idiom as _PROVIDERS. A
+# provider absent from this dict is not a failure: start_turn() is simply never
+# used for it and main.py keeps the whole-reply path.
 _STREAM_PROVIDERS = {
     "ollama": _stream_ollama,
+    "claude": _stream_claude,
 }
 
 

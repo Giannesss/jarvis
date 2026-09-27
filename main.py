@@ -132,7 +132,7 @@ def _whole_reply(text: str) -> str:
     except Exception as e:
         # brain.ask() has already dropped this turn from its history, so the
         # next question starts clean rather than trailing an unanswered one.
-        print(f"Σφάλμα κατά την κλήση στο τοπικό μοντέλο: {e}")
+        print(f"Σφάλμα κατά την κλήση στο μοντέλο: {e}")
         return BRAIN_ERROR_REPLY
 
 
@@ -181,7 +181,7 @@ def _stream_reply(text: str) -> Answer:
         turn.abandon()
         if printed:
             print()
-        print(f"Σφάλμα κατά την κλήση στο τοπικό μοντέλο: {e}")
+        print(f"Σφάλμα κατά την κλήση στο μοντέλο: {e}")
         return _say(BRAIN_ERROR_REPLY)
     finally:
         barge = listener.disarm_barge(collect=BARGE_PREROLL) if _barge_armed() else None

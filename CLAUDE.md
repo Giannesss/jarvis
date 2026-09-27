@@ -1,8 +1,29 @@
 # Jarvis
 
-Local, offline Greek-speaking voice assistant. No cloud APIs, no API keys.
-Voice output can optionally use Microsoft's online Edge TTS (falls back to
-offline Piper if it's unavailable); everything else stays local.
+Greek-speaking voice assistant, local by default. Speech recognition, memory,
+skills, the policy layer and the audit log never leave the machine.
+
+Two parts can optionally use an online service, each behind its own switch and
+each with a local fallback:
+
+- **the brain** — `BRAIN_PROVIDER=claude` sends the conversation to Anthropic's
+  Messages API and needs `ANTHROPIC_API_KEY`; the default `ollama` runs a local
+  model and needs neither a key nor a network. See "Providers".
+- **the voice** — `TTS_ENGINE=edge` (the default) sends the reply *text* to
+  Microsoft to be spoken, falling back to offline Piper when that fails.
+
+So "no cloud APIs, no API keys", which this line used to say, is now a
+configuration rather than a property: true of the brain at its default setting,
+and never quite true of the voice. With `BRAIN_PROVIDER=ollama`, nothing you
+*say* reaches Anthropic.
+
+**What the Claude brain sends, when it is selected:** the system prompt, the
+few-shot examples, up to `MAX_HISTORY_MESSAGES` of the conversation, and the
+recalled memory block — which is to say saved facts about you. Nothing else;
+there are no tools and no file access. `memory.is_sensitive()` already refuses
+to *store* passwords, PINs, cards and IBANs, so they cannot be recalled into a
+prompt either — that guard was written for the database and turns out to be the
+one that matters here too.
 
 ## Roadmap
 
@@ -21,14 +42,30 @@ notes; a refresh trigger («ξανακάνε έρευνα για…») so a stal
 redone on request; and populating real data early — this semester's courses,
 syllabus topics and exam dates, and a description of each business.
 
-**It depends on a phase that is not built.** The roadmap lists Phase 5 as
-requiring the Claude brain from Phase 2, and `BRAIN_PROVIDER="claude"` is
-still a placeholder in `_PROVIDERS` with no dependency and no key handling
-behind it (see "Providers"). So step 1 is the first thing in this project that
-reaches the network for *thinking* rather than for a voice — the "no cloud
-APIs, no API keys" line at the top of this file stops being true of the brain
-when it lands, and that is a decision to take deliberately rather than as a
-side effect.
+**Its prerequisite is built; Phase 5 itself is not started.** The roadmap lists
+Phase 5 as requiring the Claude brain from Phase 2, so that half of Phase 2 was
+built first — see below. None of Phase 5's own five steps exists yet, and step 1
+is where «δεν έχεις πρόσβαση στο ίντερνετ» in `SYSTEM_PROMPT` stops being true
+and has to change: a brain reached *over* the network still cannot look anything
+up, but one holding a web-search tool can.
+
+**Phase 2's brain half — the Claude API as a real `BRAIN_PROVIDER` — is built,
+out of order, because Phase 5 needs it.** Three of the roadmap's five steps for
+it are not code (create a key with a monthly spend cap, put it in `.env`, keep
+qwen3:8b as an offline fallback), and the shape of the change follows from the
+third: the local model does not go away, it becomes the fallback, exactly the
+way Piper sits behind Edge TTS. `claude-haiku-4-5` is the default, the roadmap's
+own pick, and the model with the fewest surprises for a ≤120-token spoken reply.
+See "Providers" for the rules; `tests/test_brain_claude.py` pins them against a
+fake client.
+
+**It has not been hand-tested on live audio**, which needs a key and spends real
+money — so by the same rule as Phase 3 and Phase 4 it is not done. What that
+test has to cover: a plain question, a recall (do the remembered facts actually
+reach the reply), one of the five grounding questions that used to draw invented
+answers, and a barge-in mid-reply, since the streamed path is wired too.
+Phase 2's *voice* half (ElevenLabs) is untouched, and `TTS_ENGINE`'s
+`"elevenlabs"` is still a placeholder.
 
 **Phase 3 — a reply you can interrupt — closed on 2026-09-27**, built out of
 order on `feature/streaming-interrupt` and merged to `master` when it closed.
@@ -86,8 +123,9 @@ voice model downloaded into `models/`. Enter at the prompt to record, `exit`/`qu
 2. **Speech-to-text** — same file, transcribes with `faster_whisper`
    (`WHISPER_MODEL` from `.env`, default `"small"`; CPU, int8,
    `language="el"`).
-3. **LLM reply** — `jarvis/brain.py` sends the running chat history to a
-   local Ollama model with a system prompt asking for short,
+3. **LLM reply** — `jarvis/brain.py` sends the running chat history to
+   whichever brain `BRAIN_PROVIDER` names — a local Ollama model by default,
+   or the Claude API — with a system prompt asking for short,
    natural-sounding replies (no markdown, no calling itself an AI unless
    asked) and refusing to invent the user's own facts (see "Grounding").
    The prompt doesn't say anything about which language to reply
@@ -113,9 +151,9 @@ only falling back to the brain when a skill doesn't match (see "Skills").
 - `jarvis/policy.py` — the `Skill`/`Permission` types, the permission gate,
   the kill switch, the audit log, and `python -m jarvis.policy` (also backing
   `:policy` at the prompt). See "Policy".
-- `jarvis/brain.py` — Ollama chat call + conversation history + system prompt.
-  `ask()` for a finished reply, `start_turn()` → `Turn` for a streamed one
-  (see "Streaming replies").
+- `jarvis/brain.py` — the brain call (Ollama or the Claude API, see
+  "Providers") + conversation history + system prompt. `ask()` for a finished
+  reply, `start_turn()` → `Turn` for a streamed one (see "Streaming replies").
 - `jarvis/chunker.py` — pure: cuts a token stream into pieces worth speaking.
 - `jarvis/speaker.py` — Edge/Piper synthesis, the speech lock, the
   audible-interval bookkeeping the capture gate reads, and `speak_stream()`,
@@ -178,9 +216,14 @@ only falling back to the brain when a skill doesn't match (see "Skills").
 
 ## Config
 
-All settings live in `.env` (copy from `.env.example`): `OLLAMA_MODEL`, `PIPER_MODEL_PATH`.
-The mic device name, record duration, and FFmpeg path are hardcoded constants at the
-top of `jarvis/listener.py`.
+All settings live in `.env` (copy from `.env.example`) and are read in one
+place, `jarvis/config.py`, each with a comment saying why its value is what it
+is. `ANTHROPIC_API_KEY` is the only secret among them: read from the
+environment, never printed, never written to `data/jarvis.log`, and only read at
+all when `BRAIN_PROVIDER=claude`.
+
+The mic device name and the FFmpeg path are hardcoded constants at the top of
+`jarvis/listener.py`.
 
 ## Providers
 
@@ -188,10 +231,77 @@ top of `jarvis/listener.py`.
 `BRAIN_PROVIDER` and `TTS_ENGINE` (both in `.env`, see `.env.example`).
 
 - Brain: `BRAIN_PROVIDER` selects from `_PROVIDERS` in `jarvis/brain.py`.
-  Only `"ollama"` is implemented. An unknown value raises `ValueError` at
-  import time (startup), before the app's request-level error handling can
-  swallow it. `"claude"` / `"openai"` are placeholders for later — adding
-  them means a new function plus a new dict entry, no other changes.
+  `"ollama"` (local) and `"claude"` (Anthropic's Messages API) are both
+  implemented; `"openai"` is a placeholder for later — adding it means a new
+  function plus a new dict entry, no other changes. An unknown value raises
+  `ValueError` at import time (startup), before the app's request-level error
+  handling can swallow it. **So does `BRAIN_PROVIDER=claude` with no
+  `ANTHROPIC_API_KEY`** (`_check_key()`), and for the same reason: a missing key
+  is one clear message at startup, where the alternative is a spoken «δεν μπορώ
+  να απαντήσω» once per question for the rest of the run.
+  The `anthropic` SDK is imported *lazily*, inside `_get_client()` — with
+  `BRAIN_PROVIDER=ollama` it is never needed, importing `brain` must stay cheap
+  (`skills.py` pulls it in transitively), and the test suite therefore runs on a
+  machine that has never installed it. Same lazy-singleton idiom as
+  `speaker._get_voice()`.
+
+### The Claude brain
+
+Four things about it are deliberate, and three of them are about *not* sending
+something.
+
+- **The message format is one pure function** (`_to_messages_api`). Ollama takes
+  a flat list with `system` messages anywhere in it; the Messages API takes a
+  top-level `system` and a `messages` list that may not carry the role at all —
+  a mid-conversation system message is an Opus 5 / 4.8 feature and a 400 on
+  Haiku 4.5. That is not an edge case here: it is exactly where
+  `_build_messages()` splices the recalled memory, on every turn that recalls
+  anything. So every system message is joined into `system` in order, the frozen
+  prompt first and the memory block after it — which is also where it belongs,
+  since `MEMORY_PREAMBLE` exists precisely to make recalled facts read as
+  background rather than as something the user just said. `_history` is never
+  touched, so `ask()` and `Turn`'s contract is unchanged and its tests pass
+  untouched.
+- **No `temperature`, no `thinking`, no `output_config`.** `CLAUDE_MODEL` is a
+  knob, and a request only valid for today's value of it is a trap:
+  `temperature` is rejected outright on Sonnet 5 and Opus 5, `effort` on Haiku
+  4.5, and an *absent* `thinking` means "none" on Haiku 4.5 but "adaptive" on
+  the 5-series — which a 120-token spoken reply has no latency budget for. The
+  prompt already asks for one or two short sentences, so the Ollama path's
+  `TEMPERATURE` has no twin here.
+- **The stop-reason vocabulary stays Ollama's, translated at this provider's
+  edge.** `Turn.truncated` reads `"length"`; the Messages API says
+  `"max_tokens"`. `_normalize_stop()` is the one line that keeps everything
+  downstream from knowing which brain answered, and `MAX_REPLY_TOKENS` (120)
+  carries over unchanged — same cap, same `_trim_to_last_sentence()` when it
+  bites.
+- **A transient failure falls back to Ollama; anything else raises.** This is
+  the roadmap's "keep qwen3:8b as an offline fallback"
+  (`CLAUDE_FALLBACK_OLLAMA`), and it is the same shape as Edge → Piper: the
+  fallback is literally the other provider function, called with the same
+  message list, and it is **announced on the terminal** the way «Edge TTS
+  απέτυχε …, χρήση Piper.» is. A fallback nobody is told about is a different
+  assistant answering under Claude's name.
+
+  Which failures, and why the line is drawn there (`_is_transient`): 408/409/429
+  and 5xx fall back, as do the SDK's connection and timeout errors. A 401, 403
+  or 400 **raises** — it will never fix itself, and answering from qwen3 anyway
+  would mean every reply quietly comes from the local model while you believe
+  you are talking to Claude. That is a wrong answer with nothing on the terminal
+  to show for it; a spoken error is the cheap direction. **Anything
+  unclassifiable raises too**, a bug of our own included. Classification is by
+  HTTP status plus the exception's module and class *name*, never by catching
+  `anthropic`'s classes — that is what lets this module classify an error
+  without importing the SDK, and the suite run without it installed.
+
+  **Streaming falls back only before the first delta.** Once a word has reached
+  the speakers there is no way to start over on the local model without saying
+  it twice, so a failure mid-reply stays a failure: `Turn` drops the turn and
+  `main._stream_reply()` speaks its error line, exactly as it already does when
+  Ollama dies mid-stream.
+
+`tests/test_brain_claude.py` pins all of it against a fake client. Nothing in
+the suite reaches the API, needs a key, or needs the SDK installed.
 - Voice: `TTS_ENGINE` selects from `_VOICE_PROVIDERS` in `jarvis/speaker.py`.
   Only `"edge"` is implemented there; `"piper"` (or any unrecognized value)
   isn't in the dict and is used directly as the always-available fallback.

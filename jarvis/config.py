@@ -9,8 +9,42 @@ OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3:8b")
 PIPER_MODEL_PATH = os.environ.get("PIPER_MODEL_PATH", "models/el_GR-joy-medium.onnx")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
 
-# "ollama" (local, only one implemented). See CLAUDE.md "Providers".
+# "ollama" (local, the default) or "claude" (Anthropic's Messages API, which
+# is online and needs a key). See CLAUDE.md "Providers". An unrecognized value
+# raises at import time, i.e. at startup.
 BRAIN_PROVIDER = os.environ.get("BRAIN_PROVIDER", "ollama")
+
+# --- The Claude brain (BRAIN_PROVIDER=claude, see jarvis/brain.py).
+#
+# Everything in this block is inert while BRAIN_PROVIDER is "ollama": no key is
+# needed, no SDK is imported, and nothing said to Jarvis leaves the machine.
+#
+# The key is read from the environment (.env, loaded above) and nowhere else.
+# It is never printed, never logged, and never written to data/jarvis.log. A
+# missing key while BRAIN_PROVIDER=claude is a *startup* failure rather than a
+# per-question one -- see brain._check_key().
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+
+# Haiku 4.5 is the roadmap's own pick for everyday use -- cheap and fast, which
+# is what a one-or-two-sentence spoken reply wants. It is also the model with
+# the fewest surprises for this shape of request: omitting the `thinking`
+# parameter means no thinking at all, whereas the 5-series models think
+# adaptively unless explicitly told not to, and a 120-token spoken answer has
+# no latency budget for it. Change this and re-read brain._ask_claude()'s note
+# on what is deliberately *not* sent.
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5")
+
+# Whether a *transient* Claude failure -- no internet, a rate limit, a 5xx --
+# is answered from the local Ollama model for that one turn, the same way Edge
+# TTS falls back to Piper. This is the roadmap's Phase 2 step 5, "keep qwen3:8b
+# as an offline fallback".
+#
+# Transient only. A bad key or a malformed request raises instead: falling back
+# there would mean every reply quietly comes from qwen3 while you believe you
+# are talking to Claude. See brain._is_transient().
+CLAUDE_FALLBACK_OLLAMA = (
+    os.environ.get("CLAUDE_FALLBACK_OLLAMA", "true").lower() == "true"
+)
 
 # "edge" (online, Microsoft Edge TTS, male voice by default) or "piper"
 # (offline, falls back to this automatically if edge synthesis fails).
