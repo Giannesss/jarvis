@@ -103,7 +103,21 @@ only falling back to the brain when a skill doesn't match (see "Skills").
   audio is meant to be flowing continuously) and the run is abandoned with a
   device diagnosis the moment the microphone stops feeding it, rather than
   summarized as statistics; see the stderr note under "The recording clock"
-  for the run that earned that. `tests/test_barge_probe.py` pins the phase
+  for the run that earned that. The speech bucket **follows a detected onset,
+  not the prompt** (`_find_onset`): it opens on the first audio to hold
+  `ONSET_DETECT_OVER_ECHO_P95_DB` (6 dB) over the echo's p95 for
+  `ONSET_SECONDS`, and runs `BARGE_WINDOW_SECONDS` (4.0s) from there. It was
+  pinned to the prompt — a 0.6s lead plus a 2.5s window — until a run answered
+  after 5.8s: the bucket came back holding 2.6s of empty room, reported its
+  +1.9 dB margin as though it had measured a voice, and filed the voice itself
+  (peaking -14.1 dB) as `post`. Recomputed against a real echo floor the same
+  burst reached +25.8 dB over a +11.9 dB false-fire bound — so the run read as
+  evidence against a feature it was actually evidence for. The replay is also
+  primed on the audible frames immediately before the onset rather than the
+  pre-prompt echo, which was worth another 9.2 dB on that run. Finding no
+  onset falls back to the fixed lead and says so loudly: the original defect
+  was reporting an empty bucket in silence.
+  `tests/test_barge_probe.py` pins the phase
   bucketing on synthetic frames — unusual for a diagnostic, and there because
   the buckets were once accused of dropping every frame when the real fault
   was the microphone. It asserts through the CSV, which is written by the same

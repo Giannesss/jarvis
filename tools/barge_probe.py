@@ -69,10 +69,22 @@ records the wall-clock spans during which a sound was actually audible (it is
 what the capture gate reads), so the phases are cut from those, and frames
 inside the reply but outside them are reported as `synthesis` and dropped.
 
-**The barge bucket is bounded.** It covers BARGE_WINDOW_SECONDS after the
-prompt and no more. Left to run to the end of the reply it is mostly Jarvis
-again -- you say one phrase and he keeps talking for another fifteen seconds
--- and its median then measures the mixture ratio rather than your voice.
+**The barge bucket follows your voice, and is bounded.** It opens on a
+detected speech onset -- the first audio to hold ONSET_DETECT_OVER_ECHO_P95_DB
+over the echo's p95 for ONSET_SECONDS -- and covers BARGE_WINDOW_SECONDS from
+there and no more. The bound is because a bucket left to run to the end of the
+reply is mostly Jarvis again: you say one phrase and he keeps talking for
+another fifteen seconds, and its median then measures the mixture ratio rather
+than your voice. The onset is because the bound used to be measured from the
+*prompt*, which quietly assumed you answer a printed line in under three
+seconds; the run that did not is written up in _find_onset. If no onset is
+found the window falls back to the fixed lead and the summary says so loudly,
+which is the part that run was missing.
+
+So answer the prompt at whatever pace you like, but **at your normal volume
+and your usual distance from the mic**. Leaning in or raising your voice
+produces a threshold that will not fire when you actually interrupt, which is
+a worse outcome than a slow reaction -- and a slow reaction now costs nothing.
 
 **The capture gate is deliberately bypassed.** listener._should_capture drops
 every frame recorded while Jarvis is audible -- which is precisely the audio
@@ -125,15 +137,21 @@ PASSAGE = (
     "Αν θέλεις σου τα λέω ένα ένα με τη σειρά, ή σου στέλνω μια λίστα."
 )
 
-# Frames in this window right after the prompt belong to neither bucket.
+# Fallback only: where the window goes when no speech onset could be found.
+#
+# Frames between the prompt and your first word belong to neither bucket.
 # Nobody starts talking the instant they are told to, so this stretch is
 # still clean echo -- but counting it as echo would stretch the phase past
 # the moment the user actually began, and counting it as speech would drag
 # the speech median down toward the echo. Both directions corrupt the one
 # number this probe exists to produce, so it is simply dropped.
+#
+# It used to be the *only* anchor, with the window opening here and closing
+# BARGE_WINDOW_SECONDS later whether or not anyone had spoken yet. See
+# _find_onset for the run that cost.
 BARGE_REACTION_LEAD = 0.6
 
-# How much audio after the reaction lead counts as "you over Jarvis".
+# How much audio after the onset counts as "you over Jarvis".
 #
 # This bound is the whole difference between measuring your voice and
 # measuring a mixture. You are asked for one ordinary phrase; the reply runs
@@ -144,8 +162,36 @@ BARGE_REACTION_LEAD = 0.6
 # and moving with how long you happened to speak.
 #
 # Generous enough for a phrase said at a normal pace, short enough that it
-# cannot swallow the rest of the reply.
-BARGE_WINDOW_SECONDS = 2.5
+# cannot swallow the rest of the reply. 2.5s while the window was pinned to
+# the prompt, and widened once it began following the onset instead: the
+# reason to keep it tight was that a late start would otherwise walk the
+# window off the end of your voice, and anchoring it to the onset removes
+# exactly that failure. What is left is a safety margin over how long one
+# ordinary phrase takes.
+BARGE_WINDOW_SECONDS = 4.0
+
+# How far above the echo's own loudest frames a level has to sustain itself
+# to count as the user having started talking.
+#
+# Measured against echo **p95**, not its median, and that is the whole guard:
+# the echo's ordinary vowel peaks already reach 25-30 dB over its own running
+# median (see CANDIDATE_MARGINS), so a detector keyed to the median would
+# place the window on Jarvis's own voice. p95 is the level he routinely
+# reaches, and 6 dB over it is a signal he does not produce.
+#
+# This locates your voice; it does not judge whether it cleared his. Those
+# are different questions, and keeping them apart is what stops the summary
+# from being circular -- see the note _summarize prints when it detects.
+ONSET_DETECT_OVER_ECHO_P95_DB = 6.0
+
+# How long after the prompt to keep looking for the user's voice.
+#
+# Generous, because the cost of the two outcomes is not symmetric: looking
+# too briefly is what produced a summary measuring nothing at all, while
+# looking too long can only pick up a later noise, which shows up as a low
+# barge reach rather than a confident wrong one. Live, a reaction of 5.8s
+# went unmeasured under a 3.1s window.
+BARGE_ONSET_SEARCH_SECONDS = 12.0
 
 # Candidate margins the would-have-fired table reports on, in dB over the
 # running echo level.
@@ -282,6 +328,69 @@ def _reach(prime: list[float], test: list[float]) -> float:
     return max(
         min(deltas[i:i + onset]) for i in range(len(deltas) - onset + 1)
     )
+
+
+def _find_onset(
+    frames: list[tuple[float, float]],
+    audible: list[tuple[float, float]],
+    prompt_at: float,
+    echo: list[float],
+) -> tuple[float | None, float]:
+    """Find the frame the user actually started talking on.
+
+    Returns `(stream_time or None, the level it was looking for)`.
+
+    **The window used to be pinned to the prompt**, opening
+    BARGE_REACTION_LEAD after it and closing BARGE_WINDOW_SECONDS later --
+    3.1s in total, whether or not anyone had spoken in it. A live run then
+    reacted in 5.8s. The barge bucket came back holding 2.6s of empty room
+    (p50 -65.9 dB against that run's own silent baseline of -66.5), the
+    summary reported a +1.9 dB margin as though it had measured a voice, and
+    the voice itself -- peaking at -14.1 dB, 22 dB above the loudest echo
+    frame of the run before it -- sat in `post`, discarded as "he is still
+    talking". The margin was noise against noise, and the run read as
+    evidence that level-based barge-in could not work here. Recomputed from
+    the CSV against a real echo floor, the same burst reached +25.8 dB over a
+    +11.9 dB false-fire bound.
+
+    So the window follows the voice instead of the clock, and a slow reaction
+    costs nothing.
+
+    Two things keep it honest:
+
+    * **It only looks inside the audible intervals.** The quantity wanted is
+      you *over* Jarvis; a phrase said into a gap between his sentences is
+      not the measurement, and a run of frames broken by a seam is not an
+      onset.
+    * **It cannot find Jarvis.** The threshold is ONSET_DETECT_OVER_ECHO_P95_DB
+      over the echo's p95 -- see that constant for why p95 and not the median.
+
+    Failing to find anything returns None, and the caller falls back to the
+    fixed lead and *says so*. That matters more than the fallback itself:
+    the run this exists for produced an empty bucket in silence, and the one
+    thing it could not do was tell anyone.
+    """
+    if not echo:
+        return None, float("nan")
+    floor = _percentile(echo, 0.95) + ONSET_DETECT_OVER_ECHO_P95_DB
+    deadline = prompt_at + BARGE_ONSET_SEARCH_SECONDS
+    needed = _onset_frames()
+    run: list[float] = []
+    for stream_time, level in frames:
+        if stream_time < prompt_at:
+            continue
+        if stream_time >= deadline:
+            break
+        if not any(s <= stream_time < e for s, e in audible):
+            run = []
+            continue
+        if level < floor:
+            run = []
+            continue
+        run.append(stream_time)
+        if len(run) >= needed:
+            return run[0], floor
+    return None, floor
 
 
 class _Probe:
@@ -589,13 +698,35 @@ def _summarize(probe: _Probe, marks, prompted: dict, args) -> int:
         print("\nPlayback never became audible, so there is nothing to compare.")
         return 1
 
+    def is_audible(t: float) -> bool:
+        return any(s <= t < e for s, e in audible)
+
     barge_at = None
+    prompt_at = None
+    onset_floor = float("nan")
+    detected = False
     if args.barge:
         if "at" not in prompted:
             print("\nThe speak prompt never fired, so only the echo was measured.")
         else:
-            barge_at = to_stream(prompted["at"]) + BARGE_REACTION_LEAD
-    lead_start = barge_at - BARGE_REACTION_LEAD if barge_at is not None else None
+            prompt_at = to_stream(prompted["at"])
+            # The detector's idea of "the echo" is the clean stretch before
+            # the prompt -- the same frames the echo bucket will hold, worked
+            # out here because the bucket does not exist until `label` runs.
+            pre_prompt = [
+                level
+                for t, level in probe.frames
+                if t < prompt_at and is_audible(t)
+            ]
+            found, onset_floor = _find_onset(
+                probe.frames, audible, prompt_at, pre_prompt
+            )
+            detected = found is not None
+            barge_at = found if detected else prompt_at + BARGE_REACTION_LEAD
+    # Everything from the prompt to your first word is dropped, however long
+    # that turned out to be. Under the fixed lead this was always exactly
+    # BARGE_REACTION_LEAD; anchored to a detected onset it is the real wait.
+    lead_start = prompt_at if barge_at is not None else None
     barge_end = barge_at + BARGE_WINDOW_SECONDS if barge_at is not None else None
 
     def label(t: float) -> str:
@@ -634,12 +765,60 @@ def _summarize(probe: _Probe, marks, prompted: dict, args) -> int:
     echo = buckets["echo"]
     barge = buckets["barge"]
 
+    # The floor the live decider would actually be holding when you started:
+    # the audible audio in the ECHO_WINDOW_SECONDS immediately before the
+    # onset, not the pre-prompt echo.
+    #
+    # With the window pinned to the prompt those were the same frames. Once a
+    # reaction can be seconds long they are not, and the difference is not
+    # cosmetic: on the run that motivated this, playback was inaudible for
+    # the first 12s, so the median in front of the burst was the room floor
+    # (-66.2 dB) where the real echo level a minute earlier was -57.1 dB.
+    # Priming on the wrong one of those overstates the barge reach by 9.2 dB
+    # -- in the flattering direction, which is the one to refuse.
+    # Counted in audible frames rather than over a wall-clock lookback, which
+    # is what the live decider's own deque does: a synthesis seam hands it no
+    # frames at all, so its median goes on holding the ones from before the
+    # seam. A lookback of ECHO_WINDOW_SECONDS instead returns almost nothing
+    # when the onset happens to follow a seam -- 12 frames in the test that
+    # caught this -- and then falls back to the pre-prompt echo, which is the
+    # very audio this exists to stop using.
+    barge_prime = echo
+    if barge_at is not None:
+        before_onset = [
+            level for t, level in probe.frames if t < barge_at and is_audible(t)
+        ]
+        if before_onset:
+            barge_prime = before_onset[-_window_frames():]
+
     print("\n" + "=" * 72)
     print("LEVELS")
     print(_describe("room (silent)", baseline))
     print(_describe("Jarvis only (echo)", echo))
     if args.barge:
         print(_describe("you over Jarvis", barge))
+
+    if args.barge and barge_at is not None and prompt_at is not None:
+        if detected:
+            print(f"\n  Speech onset found {barge_at - prompt_at:.2f}s after the "
+                  f"prompt: {onset_floor:.1f} dB held for "
+                  f"{ONSET_SECONDS:.2f}s.\n  The {BARGE_WINDOW_SECONDS:.1f}s window "
+                  f"is anchored there rather than at the prompt, so a slow\n  start "
+                  f"costs nothing.")
+            print(f"\n  Read the barge column below with that in mind: the window was "
+                  f"placed by\n  finding audio {ONSET_DETECT_OVER_ECHO_P95_DB:.0f} dB "
+                  f"over the echo's p95, so it is no surprise to see it fire\n  at the "
+                  f"low candidates. The number that is *not* self-fulfilling is how "
+                  f"far\n  it reaches -- that is measured, not assumed.")
+        else:
+            print(f"\n  !! No speech onset found within "
+                  f"{BARGE_ONSET_SEARCH_SECONDS:.0f}s of the prompt "
+                  f"(nothing held {onset_floor:.1f} dB\n     for "
+                  f"{ONSET_SECONDS:.2f}s), so the window fell back to the fixed "
+                  f"{BARGE_REACTION_LEAD:.1f}s lead.")
+            print("     If you did speak, the barge bucket above is room tone and "
+                  "every number\n     derived from it is meaningless. Check the CSV "
+                  "for where your voice landed.")
 
     dropped = [
         (name, len(buckets[name]))
@@ -648,10 +827,11 @@ def _summarize(probe: _Probe, marks, prompted: dict, args) -> int:
     ]
     if dropped:
         print("\n  dropped from both buckets:")
+        anchor = "your first word" if detected else "the fixed lead"
         why = {
             "synthesis": "inside speak() but silent -- Edge TTS on the network",
-            "reaction": "reaction time after the prompt",
-            "post": f"more than {BARGE_WINDOW_SECONDS:.1f}s after the prompt"
+            "reaction": "between the prompt and your first word",
+            "post": f"more than {BARGE_WINDOW_SECONDS:.1f}s after {anchor}"
                     " -- he is still talking",
         }
         for name, count in dropped:
@@ -676,7 +856,7 @@ def _summarize(probe: _Probe, marks, prompted: dict, args) -> int:
         print(f"     -> a margin at or below {echo_reach:.0f} dB false-fires on his "
               f"own vowels")
         if barge:
-            barge_reach = _reach(echo, barge)
+            barge_reach = _reach(barge_prime, barge)
             print(f"  you over Jarvis      {barge_reach:+6.1f} dB")
             print(f"     -> a margin above {barge_reach:.0f} dB misses you")
             if barge_reach > echo_reach:
@@ -699,7 +879,7 @@ def _summarize(probe: _Probe, marks, prompted: dict, args) -> int:
             false_fire, false_at = _would_fire(echo_prime, echo_test, candidate)
             left = f"FIRE at +{false_at:.2f}s (false)" if false_fire else "silent (good)"
             if barge:
-                hit, hit_at = _would_fire(echo, barge, candidate)
+                hit, hit_at = _would_fire(barge_prime, barge, candidate)
                 right = f"FIRE at +{hit_at:.2f}s (good)" if hit else "MISSED"
             else:
                 right = "(not measured)"
