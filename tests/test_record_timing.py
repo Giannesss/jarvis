@@ -201,8 +201,13 @@ class RecordCommandTestCase(unittest.TestCase):
         return text, reason, time.perf_counter() - started, out.getvalue()
 
     def audio_seconds(self, output: str) -> float:
-        """The audio half of the "[timing] Recording" line."""
-        match = re.search(r"/ ([\d.]+)s audio", output)
+        """The audio half of the "[timing] Recording" line.
+
+        The sign is part of the match on purpose: without it this helper reads
+        "-12.80s audio" back as 12.80 and hides the very number that gave the
+        backlog bug away (see BargePrerollTests).
+        """
+        match = re.search(r"/ (-?[\d.]+)s audio", output)
         self.assertIsNotNone(match, output)
         return float(match.group(1))
 
@@ -310,6 +315,95 @@ class BargePrerollTests(RecordCommandTestCase):
 
         self.assertIsNone(text)
         self.assertEqual(reason, "no_speech")
+
+    def test_the_backlog_from_before_the_interruption_is_never_fed_after_it(
+        self,
+    ) -> None:
+        """An interrupted reply is deliberately never flushed, so the queue
+        still holds everything the capture gate let through earlier in it.
+
+        Fed after the pre-roll -- which was recorded a good deal later -- that
+        backlog runs the decider's clock backwards. Measured live: "0.00s wall
+        / -12.80s audio", 14 pre-roll frames from 35.20s followed by a backlog
+        frame from 22.32s.
+
+        The negative number was the tell, not the damage. Here the stale quiet
+        satisfies SILENCE_DURATION on its own, so the turn ends on audio
+        recorded before the user opened their mouth: Whisper is handed the
+        interrupting words welded to a second of old room noise, and the rest
+        of the sentence is still in the queue when the turn is already over.
+        """
+        # Everything that passed the gate during the previous reply, oldest
+        # first: the seconds before he became audible, then a pause between
+        # two chunks while Edge synthesized the next one.
+        self.fill(stream(9.5, "." * 20))
+        self.fill(stream(22.4, "." * 6))
+
+        # The words that stopped him, and the rest of the sentence live.
+        preroll = stream(35.2, "LLLL")
+        self.fill(stream(35.2 + 4 * FRAME, "." * 14))
+
+        with mock.patch.object(listener, "_get_model") as model:
+            model.return_value.transcribe.return_value = ([], None)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                _text, reason = listener.record_command(
+                    no_speech_timeout=0.5, preroll_frames=preroll
+                )
+
+        # "speech_end" before the fix too -- but ended by the stale quiet,
+        # eleven seconds before the user said anything. The audio number
+        # below is what tells the two apart.
+        self.assertEqual(reason, "speech_end")
+        model.assert_called_once()
+
+        # The turn spans the interruption and the quiet that ended it, and
+        # nothing before either. Negative before the fix.
+        audio = self.audio_seconds(out.getvalue())
+        self.assertGreater(audio, 0.0)
+        self.assertAlmostEqual(audio, 1.36, delta=FRAME)
+
+    def test_a_hole_inside_the_backlog_is_not_charged_to_this_turn(self) -> None:
+        # The other live shape of the same bug, and the expensive one. The
+        # backlog is broken by the reply's own playback -- seconds of gated
+        # audio -- and once it is fed after the pre-roll that hole is charged
+        # to this turn: "gap", so Jarvis asks again for a command the user has
+        # already given and been interrupted for.
+        self.fill(stream(21.0, "." * 6))
+        self.fill(stream(30.0, "." * 6))  # 8.4s of it spent speaking
+
+        preroll = stream(35.2, "LLLL")
+        self.fill(stream(35.2 + 4 * FRAME, "." * 14))
+
+        with mock.patch.object(listener, "_get_model") as model:
+            model.return_value.transcribe.return_value = ([], None)
+            with contextlib.redirect_stdout(io.StringIO()):
+                _text, reason = listener.record_command(
+                    no_speech_timeout=0.5, preroll_frames=preroll
+                )
+
+        self.assertEqual(reason, "speech_end")  # "gap" before the fix
+        model.assert_called_once()
+
+    def test_live_audio_after_the_preroll_is_still_heard(self) -> None:
+        # The watermark must not become a deaf spot, the same way the capture
+        # floor must not: everything recorded after the pre-roll is the rest
+        # of the sentence that interrupted him.
+        preroll = stream(35.2, "LL")
+        self.fill(stream(35.2 + 2 * FRAME, "LLLLLL" + "." * 14))
+
+        with mock.patch.object(listener, "_get_model") as model:
+            model.return_value.transcribe.return_value = ([], None)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                _text, reason = listener.record_command(
+                    no_speech_timeout=0.5, preroll_frames=preroll
+                )
+
+        self.assertEqual(reason, "speech_end")
+        # 8 loud frames plus the silence that closed the turn -- the live ones
+        # are in there, not just the two from the pre-roll.
+        self.assertGreater(self.audio_seconds(out.getvalue()), 8 * FRAME)
 
     def test_a_hole_inside_the_preroll_is_still_a_hole(self) -> None:
         # The catch-up wait in _collect_barge_frames exists to prevent this,

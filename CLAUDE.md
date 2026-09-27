@@ -377,7 +377,7 @@ prepended — that one ends with the wake word, while these are the start of the
 utterance, and a decider left waiting for an onset that already happened
 returns `no_speech` on a turn that had words in it.
 
-Two consequences worth carrying forward:
+Three consequences worth carrying forward:
 
 - **An interrupted reply is never followed by `listener.flush()`.** The flush
   is what stops Jarvis recording his own voice as the next command, but after
@@ -390,6 +390,28 @@ Two consequences worth carrying forward:
   frames around it have been recorded but not read. Taking the buffer without
   them puts a hole in the middle of the interrupting sentence — the weld
   Whisper transcribes confidently and wrongly.
+- **Not flushing leaves a backlog in the queue, so the turn carries its own
+  watermark.** Nothing drains the audio queue while Jarvis is talking, and the
+  capture gate is only shut while he is *audible* — so a reply's transcription,
+  its Edge round trip, its Ollama generation and every gap between chunks put
+  live frames in the queue. Ordinarily `flush()` drops them; after a barge-in
+  it deliberately cannot. Those frames are recorded *before* the pre-roll, so
+  feeding them after it ran `_StopDecider`'s clock backwards: measured live,
+  `0.00s wall / -12.80s audio` — 14 pre-roll frames from 35.20s, then a
+  backlog frame from 22.32s. `_StopDecider` cannot catch this itself, because
+  a backwards step makes `gap` negative and negative is never a hole. The cost
+  was never the number: whichever way the backlog is shaped, this turn is
+  charged for it — its stale quiet reaches `SILENCE_DURATION` and ends the
+  turn before the user has finished the sentence, or the hole the reply's own
+  playback left in it reads as a `"gap"` and the turn is re-asked. The live run
+  did the second, which is why no transcription line follows it in the log.
+  So `record_command()` keeps a local `floor`, starting at `_capture_floor` and
+  rising past each pre-roll frame it feeds: **nothing recorded before what the
+  decider has already seen may be fed after it.** It is a watermark for one
+  turn rather than a flush, which is the whole point — everything recorded
+  *after* the pre-roll is the rest of the interrupting sentence and still
+  arrives. Only this path can raise it, so every other path is unchanged.
+  `BargePrerollTests` pins both shapes of the bug and the deaf-spot direction.
 
 Known limits, accepted rather than solved: a false fire (someone else talking,
 a TV) costs the rest of one reply, which is the cheap direction; and the first

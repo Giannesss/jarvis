@@ -1515,6 +1515,10 @@ def record_command(
     for an onset that already happened, and a turn with words in it would come
     back "no_speech" on the timeout.
 
+    Feeding them also raises this turn's own watermark past them, because the
+    pre-roll comes from later in the stream than what the queue is still
+    holding -- see the comment on `floor` below.
+
     Returns (text, stop_reason), where stop_reason is one of "speech_end",
     "no_speech", "gap", "max", "timeout" or "stream_end" — the caller needs
     it to tell "you finished talking" from "you never started" from "what
@@ -1536,6 +1540,26 @@ def record_command(
     last_level_print = t0
     first_frame_at: float | None = None  # wall clock, for the invariant below
 
+    # This turn's own watermark, in recorded time. It starts at the global
+    # capture floor and rises past whatever the pre-roll feeds.
+    #
+    # Only the barge-in path can raise it, and only because that path is the
+    # one with no flush() behind it: flushing after an interruption would put
+    # the floor past the second the user is still speaking in (see "Barge-in"
+    # in CLAUDE.md), so the queue still holds every frame that passed the gate
+    # *earlier in the reply* -- the seconds before Jarvis became audible, and
+    # the gaps between chunks while Edge was synthesizing the next one.
+    #
+    # The pre-roll is recorded later than all of it, so feeding that backlog
+    # afterwards ran the decider's clock backwards. Measured live: "0.00s wall
+    # / -12.80s audio" -- 14 pre-roll frames from 35.20s, then a backlog frame
+    # from 22.32s -- and it cost more than a wrong number. Whichever way that
+    # backlog is shaped, this turn is charged for it: its stale quiet ends the
+    # turn before the user has finished the sentence, or the hole the reply's
+    # own playback left in it reads as a "gap" and the turn is re-asked. The
+    # live run did the second, and no transcription line follows it in the log.
+    floor = _capture_floor
+
     # The backstop for "audio stopped arriving", in wall clock because that
     # is the failure it catches. Generous: every real stop is the decider's.
     wall_budget = MAX_RECORD_SECONDS + no_speech_timeout
@@ -1552,8 +1576,9 @@ def record_command(
     # hole between two of them is as real as one in the live stream, since the
     # gate refused frames in between for the same reasons.
     for ts, frame in preroll_frames or ():
-        if ts < _capture_floor:
+        if ts < floor:
             continue
+        floor = ts  # nothing recorded before this may be fed after it
         if first_frame_at is None:
             first_frame_at = time.perf_counter()
 
@@ -1592,8 +1617,8 @@ def record_command(
             break
 
         ts, frame = item
-        if ts < _capture_floor:
-            continue  # recorded before the last flush; stale by definition
+        if ts < floor:
+            continue  # before the last flush, or before the pre-roll: stale
 
         if first_frame_at is None:
             first_frame_at = time.perf_counter()
