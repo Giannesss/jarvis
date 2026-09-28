@@ -1,4 +1,4 @@
-"""One-off data seed for Phase 5 step 5 (see CLAUDE.md "Roadmap").
+r"""One-off data seed for Phase 5 step 5 (see CLAUDE.md "Roadmap").
 
 Inserts the 1st-semester course list from the user's own program-of-studies
 schedule (χειμερινό εξάμηνο, ακαδ. έτος 2026-2027) into the `courses` table,
@@ -29,7 +29,16 @@ Run once, locally, against the real database:
 
 from __future__ import annotations
 
-from jarvis import db, memory
+import sys
+from pathlib import Path
+
+# Same fix tools/barge_probe.py already needed: running this file directly
+# (rather than "python -m tools.seed_...") puts only this file's own
+# directory on sys.path, not the project root -- so "from jarvis import"
+# fails with ModuleNotFoundError unless the root is added first.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from jarvis import db, memory  # noqa: E402
 
 SEMESTER = "1ο εξάμηνο, χειμερινό 2026-2027"
 
