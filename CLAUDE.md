@@ -59,9 +59,16 @@ minute later the next run announced `[sched] Όσο ήμουν κλειστός 
 still-`pending` row as `missed` and speaking it before the main loop starts,
 exactly as "Scheduler" describes.
 
-**Two debts remain**, pinned by the suite only: the kill switch's fuzzy and
-bare rungs against a real transcription, and the agenda answering «τι έχω
-σήμερα» across tables.
+**The agenda is now confirmed live too**, closing the third debt: «Θυμήσου
+ότι έχω εξέταση σήμερα στα μαθηματικά» saved to `exams` («Το σημείωσα στις
+εξετάσεις σου.»), «Θυμήσου ότι σε δύο ώρες πρέπει να πιω νερό» saved to
+`reminders` via the delay-inside-the-body rung («Εντάξει, θα σου το
+θυμίσω.»), and «Τι έχω σήμερα» answered with both rows pulled together from
+their two different tables in one sentence, alongside three older reminders
+in their fired/missed states with the right status suffixes.
+
+**One debt remains**, pinned by the suite only: the kill switch's fuzzy and
+bare rungs against a real transcription.
 
 Phase 1 closed on 2026-09-23 (`docs/PHASE1_STATUS.md`): the beep-reset bug and
 the too-high silence floor are fixed and confirmed live, and the remaining
