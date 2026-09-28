@@ -55,8 +55,18 @@ those rows the way they already surface profile facts and notes (step 3). Step
 4, the refresh trigger, is also built — «ξανακάνε έρευνα για…» upserts the same
 row rather than piling up duplicates. Step 5, populating real data (this
 semester's courses, syllabus topics and exam dates, each business's
-description), is not started: that is content, not code, and is the last thing
-left in this phase.
+description), is content, not code, and is the last thing left in this
+phase — now started: the 1st-semester course list (7 courses, from the
+user's own program-of-studies schedule) is in the real `courses` table via
+`tools/seed_courses_2026_2027_sem1.py`. Syllabus topics, exam dates and
+business descriptions are still to come, as the user sends them.
+
+That schedule also carries day/time/room/professor detail the `courses`
+table has no columns for — a weekly recurring timetable is a different
+shape of data from the single-dated `exams`/`reminders` the agenda already
+handles, and isn't captured yet. Flagged to the user rather than dropped or
+silently bolted on; picking it up is a real feature (a new table plus
+agenda wiring), not a data-entry task, so it waits for a decision to do it.
 
 Untested by design, not by oversight: this is real network traffic with a real
 bill attached (`$10`/1000 searches plus tokens), so it is the first live
