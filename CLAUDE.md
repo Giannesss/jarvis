@@ -43,18 +43,25 @@ came from `tools/barge_probe.py` rather than from a guess, and the probe took
 three revisions before it was measuring the right thing; it is a property of
 this room and re-measuring beats copying the number.
 
-**Phase 4 — structure and safety — is built but has *not* been hand-tested on
-live audio.** Four steps, all four built: the skills registry, the policy
-layer and kill switch (see "Policy"), a durable scheduler for reminders and
-timers that survive a restart (see "Scheduler"), and a tag/category column
-across the memory tables so "τι έχω σήμερα" can pull from every area at once
-(see "Tags"). The pointer has moved past it anyway, so this is outstanding
-debt rather than a finished step — the roadmap's rule is that live audio is
-the one thing tests cannot stand in for, and the three things it would settle
-are the kill switch's fuzzy and bare rungs against a real transcription, a
-reminder surviving an actual restart and being caught up out loud, and the
-agenda answering «τι έχω σήμερα» across tables. Until then they are pinned by
-the suite only.
+**Phase 4 — structure and safety — is built, and one of its three live-test
+debts is now settled.** Four steps, all four built: the skills registry, the
+policy layer and kill switch (see "Policy"), a durable scheduler for
+reminders and timers that survive a restart (see "Scheduler"), and a
+tag/category column across the memory tables so "τι έχω σήμερα" can pull from
+every area at once (see "Tags"). The pointer moved past it before any of the
+three live tests the roadmap's own rule demands, so this remained outstanding
+debt rather than a finished step.
+
+**Reminder restart-survival is now confirmed live**, closing the second debt:
+a timer was set, the window was closed before it fired, and well past a
+minute later the next run announced `[sched] Όσο ήμουν κλειστός έληξε ένα
+χρονόμετρο.` at startup, before Enter was pressed — `catch_up()` claiming a
+still-`pending` row as `missed` and speaking it before the main loop starts,
+exactly as "Scheduler" describes.
+
+**Two debts remain**, pinned by the suite only: the kill switch's fuzzy and
+bare rungs against a real transcription, and the agenda answering «τι έχω
+σήμερα» across tables.
 
 Phase 1 closed on 2026-09-23 (`docs/PHASE1_STATUS.md`): the beep-reset bug and
 the too-high silence floor are fixed and confirmed live, and the remaining
