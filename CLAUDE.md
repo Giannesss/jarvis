@@ -64,6 +64,21 @@ bill attached (`$10`/1000 searches plus tokens), so it is the first live
 own hand-test rule applies before it counts as closed, the same as Phase 3 and
 Phase 4 before it.
 
+**The first two of the three live tests have now run; the third (recall)
+has not.** «Κάνε έρευνα για γυμναστήρια στην Ξάνθη», confirmed with a bare
+«Ναι», came back through `brain.research()` with a real, well-formed Greek
+summary (five short sentences, no list formatting) about actual gyms in
+Ξάνθη — the CONFIRM gate, the server-side `web_search` tool and
+`_final_text()`'s preamble-stripping are all confirmed live. The refresh
+trigger also fired, but exposed the "same words, not same subject" upsert
+boundary written up under "Research" — a genuine limit, not a bug. The
+hand test also found one real gap, now fixed: «Κάνε ξανά έρευνα για …» (verb,
+"again", "research", in that order) didn't match either pattern and fell
+through to the brain, because only «ξανακάνε έρευνα» (the two glued into one
+recognized word) was recognized; `RE_RESEARCH_REFRESH` now accepts both.
+Still outstanding: asking a later, unrelated-sounding question to see
+whether `memory.recall()` actually surfaces the researched topic.
+
 **Phase 2's brain half — the Claude API as a real `BRAIN_PROVIDER` — is built,
 out of order, because Phase 5 needs it.** Three of the roadmap's five steps for
 it are not code (create a key with a monthly spend cap, put it in `.env`, keep
@@ -1591,13 +1606,20 @@ returned rather than silently dropped.
 an action (a real API call, a real charge) rather than filing a fact, so
 `memory.parse_research()` is its own pure function returning `(topic,
 is_refresh)` — `RE_RESEARCH` for «κάνε έρευνα για …» / «ερεύνησε …» / «ψάξε
-στο ίντερνετ για …», `RE_RESEARCH_REFRESH` for «ξανακάνε έρευνα για …», tried
-first. The two can never both match the same utterance: "ξανακάνε" is one
-word to the recognizer, so it never starts with "κανε" the way `RE_RESEARCH`'s
-anchor requires — the same non-overlap `RE_TRIGGER`'s rungs rely on. The topic
-is read back through `Norm.group()`, verbatim (accents, capitals), for the
-same reason every other capture in `memory.py` is: `"το ΕΚΠΑ"` searches better
-than `"το εκπα"`.
+στο ίντερνετ για …», `RE_RESEARCH_REFRESH` for «ξανακάνε έρευνα για …» *and*
+«κάνε ξανά έρευνα για …», tried first. A live hand test asked for the second
+spelling and it fell through to the brain, because only the glued-word form
+was recognized; `RE_RESEARCH_REFRESH` now carries both as alternatives.
+Neither can be shadowed by `RE_RESEARCH` by accident, and not for the same
+reason: "ξανακάνε" is one word to the recognizer, so it never starts with
+"κανε" the way `RE_RESEARCH`'s anchor requires — the same non-overlap
+`RE_TRIGGER`'s rungs rely on — while "κάνε ξανά έρευνα" *does* start with
+"κανε", but `RE_RESEARCH`'s own alternative demands "ερευνα" immediately
+after it and "ξανά" sits in between, so it would refuse the string even if
+tried first. Checking refresh first is still what makes relying on that
+second argument unnecessary. The topic is read back through `Norm.group()`,
+verbatim (accents, capitals), for the same reason every other capture in
+`memory.py` is: `"το ΕΚΠΑ"` searches better than `"το εκπα"`.
 
 **The `expertise` table is keyed by topic, upserted, not appended.**
 `memory.save_expertise()` is the same shape as `save()`'s `profile` branch:
@@ -1614,6 +1636,20 @@ and the spoken `memory_recall` skill already read. `db.CONTENT_TABLES` and
 `topic_key` is protected from direct edits (`mem._PROTECTED_COLUMNS`), since
 editing it by hand would desync it from `topic` and silently break the next
 upsert.
+
+**The upsert is keyed on the spoken topic, not on "the same subject" —
+known boundary, found live.** A refresh whose topic Whisper transcribes
+differently from the original request (different words, not just a
+different fold) gets a different `topic_key` and lands as a *second* row
+rather than updating the first, even though a person would call it the same
+topic. Measured live: «Ξανακάνε έρευνα για γυμναστήρια στην Ξάνθη» came back
+mangled as «...για γη μου να στείρει, ας την ξάνθει» — the refresh verb
+still matched (the comma survived via `_JOIN`), but the captured topic no
+longer normalizes to the same key as the original research, so it upserts
+into a row of its own instead of refreshing the gyms-in-Xanthi row. Nothing
+here can fix that from the trigger side — the topic *is* whatever was
+said — so it stays a known limit rather than a bug to close: re-asking in
+the same words is what makes a refresh land on the right row.
 
 **`research` is the first live `Permission.CONFIRM` skill** (see "Policy" —
 every other registered skill is `SAFE`). This is real network traffic with a

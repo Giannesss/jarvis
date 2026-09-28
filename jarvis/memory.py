@@ -514,13 +514,24 @@ RE_BIZ_PLAIN = _re(_BIZ_HEAD + r"\s*(?P<note>.+)$")
 # a payload, with Norm keeping the topic verbatim (accents, capitals) for the
 # search query brain.research() sends.
 #
-# The refresh form is checked first. It cannot be shadowed by RE_RESEARCH
-# by accident the way RE_TRIGGER's rungs can shadow each other: "ξανακάνε" is
-# one word to the recognizer, so it never starts with "κανε" the way
-# RE_RESEARCH's anchor requires, and the two patterns simply never both
-# match the same utterance.
+# The refresh form is checked first, and has two spellings of "again":
+# "ξανακάνε έρευνα" (ξανα glued to κανε, one word to the recognizer) and the
+# more natural "κάνε ξανά έρευνα" (κανε, then ξανα, then ερευνα) -- a live
+# hand test asked it exactly that way and it fell through to the brain
+# because only the first spelling was recognized.
+#
+# Neither can be shadowed by RE_RESEARCH by accident. "ξανακάνε..." never
+# starts with "κανε" the way RE_RESEARCH's anchor requires, so that
+# alternative simply never reaches it. "κάνε ξανά ερευνα" does start with
+# "κανε", but RE_RESEARCH's own alternative demands "ερευνα" immediately
+# after it (_GAP only spans whitespace/punctuation, never another word), and
+# "ξανα" sits in between -- so RE_RESEARCH would refuse this string even if
+# it were tried first. Checking refresh first is still what makes that
+# argument unnecessary to rely on.
 RE_RESEARCH_REFRESH = _re(
-    rf"^(?:τζαρβισ{_GAP})?ξανα{_JOIN}κανε{_GAP}ερευνα{_GAP}(?:για{_GAP})?(?P<topic>.+)$"
+    rf"^(?:τζαρβισ{_GAP})?"
+    rf"(?:ξανα{_JOIN}κανε{_GAP}ερευνα|κανε{_GAP}ξανα{_GAP}ερευνα)"
+    rf"{_GAP}(?:για{_GAP})?(?P<topic>.+)$"
 )
 RE_RESEARCH = _re(
     rf"^(?:τζαρβισ{_GAP})?"

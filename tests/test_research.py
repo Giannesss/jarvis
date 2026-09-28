@@ -58,6 +58,25 @@ class ParseResearchTests(unittest.TestCase):
         self.assertEqual(topic, "τα μαθηματικά")
         self.assertTrue(is_refresh)
 
+    def test_refresh_trigger_second_spelling(self) -> None:
+        # "Κάνε ξανά έρευνα" -- verb, then "ξανά", then "έρευνα" -- is the
+        # more natural way to ask for a refresh, and a live hand test found
+        # it fell through to the brain because only "ξανακάνε" (one glued
+        # word) was recognized.
+        topic, is_refresh = memory.parse_research(
+            "Κάνε ξανά έρευνα για τα μαθηματικά"
+        )
+        self.assertEqual(topic, "τα μαθηματικά")
+        self.assertTrue(is_refresh)
+
+    def test_second_refresh_spelling_does_not_leak_into_plain_research(self) -> None:
+        # RE_RESEARCH must not also claim this string when tried on its own:
+        # its "κανε ερευνα" alternative demands "ερευνα" immediately after
+        # "κανε", and "ξανα" sits in between here.
+        self.assertIsNone(memory.RE_RESEARCH.match(
+            memory.normalize("Κάνε ξανά έρευνα για τα μαθηματικά")
+        ))
+
     def test_leading_jarvis_address_is_skipped(self) -> None:
         topic, is_refresh = memory.parse_research(
             "Τζάρβις, κάνε έρευνα για το ελληνικό ποδόσφαιρο"
