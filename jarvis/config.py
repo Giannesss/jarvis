@@ -46,6 +46,31 @@ CLAUDE_FALLBACK_OLLAMA = (
     os.environ.get("CLAUDE_FALLBACK_OLLAMA", "true").lower() == "true"
 )
 
+# --- The research skill (Phase 5 step 1, jarvis/brain.py research()).
+#
+# Always the Claude API, whatever BRAIN_PROVIDER is set to -- Ollama has no
+# way to reach the internet at all, so there is no local fallback to offer
+# here the way _ask_claude/_stream_claude do. A missing ANTHROPIC_API_KEY is
+# therefore a per-call refusal (brain.ResearchUnavailable), not the
+# import-time failure BRAIN_PROVIDER=claude gets: research is opt-in on its
+# own, independently of which brain answers ordinary questions.
+#
+# Defaults to CLAUDE_MODEL rather than a separate model of its own -- research
+# is a new knob, not a reason to introduce a second one before there is a
+# reason to tell them apart.
+CLAUDE_RESEARCH_MODEL = os.environ.get("CLAUDE_RESEARCH_MODEL", CLAUDE_MODEL)
+
+# How many searches the web_search tool may run for one research request.
+# Each one is billed ($10/1000, plus tokens) whether or not it finds anything,
+# so this is a cost cap as much as a quality one.
+RESEARCH_MAX_SEARCHES = int(os.environ.get("RESEARCH_MAX_SEARCHES", "5"))
+
+# Generous compared to MAX_REPLY_TOKENS: this has to cover the search-tool
+# preambles and citations along the way, not just the final summary, and
+# unlike a spoken conversational reply there is no streaming latency budget
+# to protect.
+RESEARCH_MAX_TOKENS = int(os.environ.get("RESEARCH_MAX_TOKENS", "1024"))
+
 # "edge" (online, Microsoft Edge TTS, male voice by default) or "piper"
 # (offline, falls back to this automatically if edge synthesis fails).
 TTS_ENGINE = os.environ.get("TTS_ENGINE", "edge")

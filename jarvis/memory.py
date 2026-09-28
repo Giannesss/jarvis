@@ -503,6 +503,56 @@ RE_BIZ_NEED = _re(
 )
 RE_BIZ_PLAIN = _re(_BIZ_HEAD + r"\s*(?P<note>.+)$")
 
+
+# --- The research skill (Phase 5 step 1) ------------------------------------
+#
+# Not a rung in parse()'s ladder below: this triggers an action -- jarvis/
+# skills.py's research skill calls brain.research() -- rather than filing a
+# fact, so it stays a separate, pure function returning (topic, is_refresh)
+# instead of a Parsed for save(). Written here anyway, alongside the other
+# trigger patterns, because it is the same job: turning a spoken trigger into
+# a payload, with Norm keeping the topic verbatim (accents, capitals) for the
+# search query brain.research() sends.
+#
+# The refresh form is checked first. It cannot be shadowed by RE_RESEARCH
+# by accident the way RE_TRIGGER's rungs can shadow each other: "ξανακάνε" is
+# one word to the recognizer, so it never starts with "κανε" the way
+# RE_RESEARCH's anchor requires, and the two patterns simply never both
+# match the same utterance.
+RE_RESEARCH_REFRESH = _re(
+    rf"^(?:τζαρβισ{_GAP})?ξανα{_JOIN}κανε{_GAP}ερευνα{_GAP}(?:για{_GAP})?(?P<topic>.+)$"
+)
+RE_RESEARCH = _re(
+    rf"^(?:τζαρβισ{_GAP})?"
+    rf"(?:κανε{_GAP}ερευνα|ερευνησε|ψαξε{_GAP}στο{_GAP}ιντερνετ)"
+    rf"{_GAP}(?:για{_GAP})?(?P<topic>.+)$"
+)
+
+
+def parse_research(text: str) -> tuple[str, bool] | None:
+    """(topic, is_refresh) for a research trigger, or None.
+
+    Pure and offline, like parse(): recognizes the trigger and pulls out the
+    topic verbatim, never touches the network or the database. jarvis/
+    skills.py's research skill calls brain.research(topic) with what this
+    returns, once the CONFIRM prompt is answered yes (see CLAUDE.md
+    "Research").
+    """
+    view = Norm.of(text)
+
+    match = RE_RESEARCH_REFRESH.match(view.norm)
+    if match:
+        topic = view.group(match, "topic")
+        return (topic, True) if topic else None
+
+    match = RE_RESEARCH.match(view.norm)
+    if match:
+        topic = view.group(match, "topic")
+        return (topic, False) if topic else None
+
+    return None
+
+
 # Appended to a row's `norm` so the row stays findable by the generic word
 # that classified it, even when the pattern consumed that word. Without this,
 # "η επιχείρησή μου χρειάζεται λογιστή" is filed under businesses but cannot
@@ -914,6 +964,54 @@ def save(parsed: Parsed, conn: sqlite3.Connection) -> int:
     return cursor.lastrowid
 
 
+def save_expertise(topic: str, summary: str, conn: sqlite3.Connection) -> int:
+    """Upsert a dated "expertise" row. Returns the new (or updated) row id.
+
+    Keyed by the topic's normalized form, the same shape save()'s profile
+    branch uses: researching a topic again updates this row in place rather
+    than piling up duplicate summaries, which is what makes the refresh
+    trigger ("ξανακάνε έρευνα για...") mean something. `norm` covers topic
+    *and* summary, unlike `topic_key`, which is exact and only for the
+    upsert -- so a keyword search over unrelated wording can still find it.
+    """
+    ts = db.now_iso()
+    topic_key = normalize(topic)
+    norm = normalize(f"{topic} {summary}")
+
+    conn.execute(
+        "INSERT INTO expertise"
+        " (topic, topic_key, summary, norm, tags, created_at, updated_at)"
+        " VALUES (:topic, :topic_key, :summary, :norm, :tags, :ts, :ts)"
+        " ON CONFLICT(topic_key) DO UPDATE SET"
+        " topic=excluded.topic, summary=excluded.summary, norm=excluded.norm,"
+        " tags=excluded.tags, updated_at=excluded.updated_at",
+        {
+            "topic": topic,
+            "topic_key": topic_key,
+            "summary": summary,
+            "norm": norm,
+            "tags": tags_for("expertise", norm),
+            "ts": ts,
+        },
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT id FROM expertise WHERE topic_key = ?", (topic_key,)
+    ).fetchone()
+    return row["id"]
+
+
+def get_expertise(topic: str, conn: sqlite3.Connection) -> sqlite3.Row | None:
+    """The existing row for this topic, if any.
+
+    Lets the research skill tell a first save from a refresh in what it says
+    back, without needing save_expertise() to report which one happened.
+    """
+    return conn.execute(
+        "SELECT * FROM expertise WHERE topic_key = ?", (normalize(topic),)
+    ).fetchone()
+
+
 # --- Stemming and recall ---------------------------------------------------
 
 # Longest first, so "ματα" is tried before "ατα" before "α". Normalized and
@@ -1162,6 +1260,8 @@ _SEARCHABLE = (
      lambda r: f"Επιχείρηση{' ' + r['name'] if r['name'] else ''}: {r['note']}"),
     ("reminders", "SELECT id, text, due_at, created_at FROM reminders WHERE norm LIKE ?",
      lambda r: f"Υπενθύμιση {r['due_at'][:10]}: {r['text']}"),
+    ("expertise", "SELECT id, topic, summary, created_at FROM expertise WHERE norm LIKE ?",
+     lambda r: f"Έρευνα για {r['topic']}: {r['summary']}"),
 )
 
 

@@ -133,6 +133,24 @@ CREATE TABLE IF NOT EXISTS policy_state (
     updated_at TEXT NOT NULL
 );
 
+-- A dated "expertise" row (Phase 5 step 2): the structured summary
+-- research() produced for one topic, not the search transcript itself.
+-- topic_key is the topic alone, normalized, and UNIQUE -- researching the
+-- same topic again (the "ξανακάνε έρευνα για..." refresh trigger) updates
+-- this row in place rather than piling up duplicate summaries. norm covers
+-- topic *and* summary, so a keyword search over unrelated wording can still
+-- surface it -- see memory.save_expertise() and memory._SEARCHABLE.
+CREATE TABLE IF NOT EXISTS expertise (
+    id         INTEGER PRIMARY KEY,
+    topic      TEXT NOT NULL,
+    topic_key  TEXT NOT NULL UNIQUE,
+    summary    TEXT NOT NULL,
+    norm       TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    tags       TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders (status, due_at);
 CREATE INDEX IF NOT EXISTS idx_exams_due ON exams (due_date);
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit (ts);
@@ -149,6 +167,7 @@ CONTENT_TABLES = {
     "exams": "course",
     "businesses": "note",
     "reminders": "text",
+    "expertise": "summary",
 }
 
 

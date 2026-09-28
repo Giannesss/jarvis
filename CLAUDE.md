@@ -42,12 +42,27 @@ notes; a refresh trigger («ξανακάνε έρευνα για…») so a stal
 redone on request; and populating real data early — this semester's courses,
 syllabus topics and exam dates, and a description of each business.
 
-**Its prerequisite is built; Phase 5 itself is not started.** The roadmap lists
-Phase 5 as requiring the Claude brain from Phase 2, so that half of Phase 2 was
-built first — see below. None of Phase 5's own five steps exists yet, and step 1
+**Its prerequisite is built, and steps 1-3 of Phase 5 are now code — not yet
+hand-tested on live audio.** The roadmap lists Phase 5 as requiring the Claude
+brain from Phase 2, so that half of Phase 2 was built first — see below. Step 1
 is where «δεν έχεις πρόσβαση στο ίντερνετ» in `SYSTEM_PROMPT` stops being true
-and has to change: a brain reached *over* the network still cannot look anything
-up, but one holding a web-search tool can.
+for one specific action: a brain reached *over* the network still cannot look
+anything up on its own (that sentence still governs ordinary replies), but
+`brain.research()` holding the web-search tool can. See "Research" for what is
+built: the `research` skill (step 1), the structured summary stored as a dated
+`expertise` row (step 2), and `memory.recall()`/`memory.search()` surfacing
+those rows the way they already surface profile facts and notes (step 3). Step
+4, the refresh trigger, is also built — «ξανακάνε έρευνα για…» upserts the same
+row rather than piling up duplicates. Step 5, populating real data (this
+semester's courses, syllabus topics and exam dates, each business's
+description), is not started: that is content, not code, and is the last thing
+left in this phase.
+
+Untested by design, not by oversight: this is real network traffic with a real
+bill attached (`$10`/1000 searches plus tokens), so it is the first live
+`Permission.CONFIRM` skill rather than `SAFE` — see "Policy" — and the roadmap's
+own hand-test rule applies before it counts as closed, the same as Phase 3 and
+Phase 4 before it.
 
 **Phase 2's brain half — the Claude API as a real `BRAIN_PROVIDER` — is built,
 out of order, because Phase 5 needs it.** Three of the roadmap's five steps for
@@ -937,7 +952,10 @@ carries an empty tuple for that reason: its real triggers are
 `memory.parse()`'s ladder, and listing a few here would be a fiction.
 
 Implemented, in the order `handle()` tries them: shutting Jarvis down; saving
-to memory and reading it back (both in "Memory" below); a spoken timer that
+to memory and reading it back (both in "Memory" below); running a web
+research and storing a structured summary (see "Research" — `research`
+carries an empty tuple too, for the same reason `memory_save` does:
+`memory.parse_research()` owns the real triggers); a spoken timer that
 announces itself when it fires (a `reminders` row now, see "Scheduler");
 current time / date;
 and opening a website (`SKILL_SITES` in `config.py`) or a local app
@@ -971,10 +989,13 @@ the whole layer is testable without a microphone.
 
 **Deny by default.** `Skill.permission` defaults to `Permission.BLOCKED`, so
 a skill added later without naming a permission cannot run. An unrecognised
-permission value is blocked too. All seven registered skills are `SAFE` —
-none sends, deletes, spends or reaches outside the machine. The `CONFIRM`
-and `BLOCKED` paths are built and tested but carry no live skill yet; they
-are what Phase 7's file move/rename/delete plugs into.
+permission value is blocked too. Seven of the eight registered skills are
+`SAFE` — none of them sends, deletes, spends or reaches outside the machine.
+`research` (see "Research") is the first live `CONFIRM` skill: real network
+traffic with a real bill attached, so it is recognised and asked about before
+it runs rather than run on match the way a `SAFE` skill is. `BLOCKED` still
+carries no live skill; it is what Phase 7's file move/rename/delete plugs
+into.
 
 **A `CONFIRM` skill needs a `matches()` and a `confirm_prompt`.** The
 existing handlers answer "did you match?" by *doing the thing*, which is fine
@@ -1532,6 +1553,85 @@ concurrent writer) into `BACKUP_DIR` (`data/backups/`), keeping the newest
 Jarvis from starting, and on `:mem backup`. Filenames are microsecond-stamped
 so they are unique and sort chronologically — pruning deletes the oldest by
 name, and a coarser stamp let a pruned name be reused and overwritten.
+
+## Research
+
+Phase 5 steps 1-4 (see "Roadmap"): «κάνε έρευνα για …» runs several web
+searches on a topic through the Claude API and speaks back a structured
+summary, which is also kept as a dated `expertise` row so later questions can
+draw on it. Not yet hand-tested on live audio — built and unit-tested only.
+
+**Always the Claude API, whatever `BRAIN_PROVIDER` is set to.** Ollama has no
+way to reach the internet at all, so there is no local fallback the way
+`_ask_claude`/`_stream_claude` have one — `brain.research()` either reaches
+Anthropic or raises `ResearchUnavailable`, which the skill speaks verbatim. A
+missing `ANTHROPIC_API_KEY` is therefore a per-*call* refusal here, not the
+import-time failure `BRAIN_PROVIDER=claude` gets from `brain._check_key()`:
+research is opt-in on its own, independently of which brain answers ordinary
+questions, and `CLAUDE_RESEARCH_MODEL`/`RESEARCH_MAX_SEARCHES`/
+`RESEARCH_MAX_TOKENS` (`jarvis/config.py`) are its own knobs, defaulting to
+`CLAUDE_MODEL` rather than inventing a second model setting before there is a
+reason to tell them apart.
+
+**web_search is a server tool.** Anthropic runs the searches itself and feeds
+the results back inside the one `messages.create()` call
+(`tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses":
+RESEARCH_MAX_SEARCHES}]`) — there is no client-side tool-use loop for this
+process to drive, unlike a tool it would have to execute itself. `RESEARCH_
+SYSTEM_PROMPT` asks for the reply to be *only* the structured summary, but the
+model still writes "I'll search for..." text between search rounds, so
+`brain._final_text()` keeps only the text blocks *after* the last
+`web_search_tool_result` block — everything before that is thinking out loud
+about what to search next, not the finding. Falls back to every text block
+when there was no search at all, so a reply that never searched is still
+returned rather than silently dropped.
+
+**The trigger is parsed, not matched by substring**, the same shape as
+`memory.parse()`'s ladder but deliberately not part of it: research triggers
+an action (a real API call, a real charge) rather than filing a fact, so
+`memory.parse_research()` is its own pure function returning `(topic,
+is_refresh)` — `RE_RESEARCH` for «κάνε έρευνα για …» / «ερεύνησε …» / «ψάξε
+στο ίντερνετ για …», `RE_RESEARCH_REFRESH` for «ξανακάνε έρευνα για …», tried
+first. The two can never both match the same utterance: "ξανακάνε" is one
+word to the recognizer, so it never starts with "κανε" the way `RE_RESEARCH`'s
+anchor requires — the same non-overlap `RE_TRIGGER`'s rungs rely on. The topic
+is read back through `Norm.group()`, verbatim (accents, capitals), for the
+same reason every other capture in `memory.py` is: `"το ΕΚΠΑ"` searches better
+than `"το εκπα"`.
+
+**The `expertise` table is keyed by topic, upserted, not appended.**
+`memory.save_expertise()` is the same shape as `save()`'s `profile` branch:
+`topic_key` (the topic alone, normalized) is `UNIQUE`, so researching a topic
+again — the refresh trigger — updates the row in place rather than piling up
+duplicate summaries, which is what "a stale topic can be redone on request"
+(the roadmap's wording for step 4) actually means. `norm` is built from
+*topic and summary together*, unlike `topic_key`, so a keyword search over a
+word that only appears inside the summary can still surface the row — wired
+into `memory._SEARCHABLE` (step 3), the same list `recall()`'s keyword hits
+and the spoken `memory_recall` skill already read. `db.CONTENT_TABLES` and
+`mem.py`'s `_summarize()`/`_refresh_norm()` all know about it too, so
+`:mem list/show/edit/del expertise` work like any other table — except
+`topic_key` is protected from direct edits (`mem._PROTECTED_COLUMNS`), since
+editing it by hand would desync it from `topic` and silently break the next
+upsert.
+
+**`research` is the first live `Permission.CONFIRM` skill** (see "Policy" —
+every other registered skill is `SAFE`). This is real network traffic with a
+real bill attached, unlike anything else in `SKILLS`, so `policy.dispatch()`
+only reaches `_handle_research()` once `RESEARCH_CONFIRM_PROMPT` ("Αυτό θα
+ψάξει στο διαδίκτυο και έχει κόστος. Να προχωρήσω;") has been answered yes —
+`_research_matches()` recognizes the trigger without acting, exactly what
+`Skill.matches` exists for. If the research itself succeeds but the database
+write fails, the finding is still spoken: losing the row is worse hidden than
+said out loud, since it was already paid for either way.
+
+`tests/test_research.py` pins all of it: the parser (including the refresh/
+plain non-overlap and the verbatim topic), the `expertise` upsert against a
+real temp database, `brain._final_text()`/`brain.research()` against a fake
+client (same idiom as `tests/test_brain_claude.py` — no key, no SDK, no
+network needed to run it), and the skill wired through `policy.dispatch()`'s
+CONFIRM gate end to end (confirmed, declined, no asker installed, the
+`ResearchUnavailable` and generic-error paths, and the audit row).
 
 ## Normalization
 

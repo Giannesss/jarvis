@@ -9,7 +9,10 @@ from jarvis.config import (
     BRAIN_PROVIDER,
     CLAUDE_FALLBACK_OLLAMA,
     CLAUDE_MODEL,
+    CLAUDE_RESEARCH_MODEL,
     OLLAMA_MODEL,
+    RESEARCH_MAX_SEARCHES,
+    RESEARCH_MAX_TOKENS,
 )
 
 SYSTEM_PROMPT = (
@@ -325,6 +328,97 @@ def _ask_claude(messages: list[dict]) -> str:
     if _normalize_stop(response.stop_reason) == STOP_TRUNCATED:
         reply = _trim_to_last_sentence(reply)
     return reply
+
+
+# --- Research (Phase 5 step 1) ----------------------------------------------
+#
+# A one-off lookup, not a conversational turn: no history, no memory block,
+# and never touches _history. Always the Claude API, whatever BRAIN_PROVIDER
+# is set to -- this is the one place "δεν έχεις πρόσβαση στο ίντερνετ" in
+# SYSTEM_PROMPT stops being true (see CLAUDE.md "Grounding"), and Ollama has
+# nothing to fall back to, unlike _ask_claude/_stream_claude. A missing key is
+# therefore a per-*call* refusal here rather than the import-time failure
+# BRAIN_PROVIDER=claude gets from _check_key(): research is opt-in on its own.
+
+
+class ResearchUnavailable(Exception):
+    """Raised before reaching the client at all (no key) or when a search
+    came back with nothing to say, so the research skill can speak a plain
+    Greek reason instead of crashing on a bare SDK error."""
+
+
+RESEARCH_SYSTEM_PROMPT = (
+    "Κάνεις έρευνα στο διαδίκτυο για τον χρήστη πάνω σε ένα θέμα. "
+    "Χρησιμοποίησε το εργαλείο αναζήτησης όσες φορές χρειάζεται. Στο τέλος "
+    "γράψε ΜΟΝΟ μια δομημένη περίληψη στα Ελληνικά, 3 έως 6 σύντομες "
+    "προτάσεις με τα πιο σημαντικά και πιο πρόσφατα ευρήματα -- σκέτες "
+    "προτάσεις σαν προφορικός λόγος, όχι λίστα με παύλες ή markdown. Μην "
+    "γράψεις τίποτα πριν ή μετά την περίληψη -- όχι «θα ψάξω για...», όχι "
+    "«ελπίζω να βοήθησε» -- πήγαινε κατευθείαν στα ευρήματα."
+)
+
+
+def _final_text(content) -> str:
+    """The summary itself, not the "I'll search for..." preambles the model
+    writes between search calls.
+
+    Everything *after* the last web_search_tool_result block is what the
+    model wrote once it had all its evidence in hand; text before that is it
+    thinking out loud about what to search next, not the structured summary
+    the caller asked for. Falls back to every text block when there was no
+    search result at all (index stays -1), so a reply that never searched is
+    still returned rather than silently dropped.
+    """
+    last_result = -1
+    for i, block in enumerate(content):
+        if getattr(block, "type", None) == "web_search_tool_result":
+            last_result = i
+
+    parts = [
+        block.text
+        for i, block in enumerate(content)
+        if i > last_result and getattr(block, "type", None) == "text"
+    ]
+    return "\n".join(part.strip() for part in parts if part and part.strip())
+
+
+def research(topic: str) -> str:
+    """Run several web searches on `topic` and return a structured summary.
+
+    web_search is a *server* tool: Anthropic runs the searches and feeds the
+    results back to the model inside this one request, so there is no
+    client-side tool-use loop to drive here, unlike a tool this process would
+    have to execute itself.
+    """
+    if not ANTHROPIC_API_KEY.strip():
+        raise ResearchUnavailable(
+            "Χρειάζομαι ένα ANTHROPIC_API_KEY στο .env για να ψάξω στο "
+            "διαδίκτυο."
+        )
+
+    t0 = time.perf_counter()
+    response = _get_client().messages.create(
+        model=CLAUDE_RESEARCH_MODEL,
+        max_tokens=RESEARCH_MAX_TOKENS,
+        system=RESEARCH_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": f"Θέμα έρευνας: {topic}"}],
+        tools=[
+            {
+                "type": "web_search_20250305",
+                "name": "web_search",
+                "max_uses": RESEARCH_MAX_SEARCHES,
+            }
+        ],
+    )
+    diag.log(
+        f"[timing] Claude research: {time.perf_counter() - t0:.2f}s "
+        f"({_usage(getattr(response, 'usage', None))})"
+    )
+
+    summary = _final_text(response.content)
+    if not summary:
+        raise ResearchUnavailable("Η έρευνα δεν επέστρεψε κάτι χρήσιμο.")
+    return summary
 
 
 # Add an "openai" entry here later (not implemented yet).

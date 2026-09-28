@@ -27,8 +27,11 @@ from jarvis.text import is_yes
 _READABLE = tuple(db.CONTENT_TABLES) + ("audit",)
 _WRITABLE = tuple(db.CONTENT_TABLES)
 
-# Never editable from the CLI: identity and provenance.
-_PROTECTED_COLUMNS = {"id", "created_at", "norm"}
+# Never editable from the CLI: identity and provenance. topic_key is
+# expertise's identity column (its upsert key, see memory.save_expertise()) --
+# editing it directly would desync it from `topic`, so only `topic` itself is
+# editable and topic_key stays derived.
+_PROTECTED_COLUMNS = {"id", "created_at", "norm", "topic_key"}
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -214,6 +217,8 @@ def _summarize(table: str, row: sqlite3.Row) -> str:
         return f"{row['due_at']} [{row['status']}] {row['text']}"
     if table == "courses":
         return f"{row['name']}" + (f" ({row['semester']})" if row["semester"] else "")
+    if table == "expertise":
+        return f"{row['topic']}: {row['summary']}"
     return str(row[db.CONTENT_TABLES.get(table, "id")])
 
 
@@ -224,7 +229,8 @@ def _refresh_norm(conn: sqlite3.Connection, table: str, row_id: int) -> None:
     if row is None or "norm" not in row.keys():
         return
 
-    parts = [str(row[col]) for col in ("key", "name", "course", "topic", "note", "text", "value")
+    parts = [str(row[col]) for col in
+             ("key", "name", "course", "topic", "note", "text", "value", "summary")
              if col in row.keys() and row[col]]
     conn.execute(
         f"UPDATE {table} SET norm = ? WHERE id = ?",
