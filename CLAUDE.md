@@ -1,8 +1,11 @@
 # Jarvis
 
-Local, offline Greek-speaking voice assistant. No cloud APIs, no API keys.
-Voice output can optionally use Microsoft's online Edge TTS (falls back to
-offline Piper if it's unavailable); everything else stays local.
+Local, offline Greek-speaking voice assistant, by default. Voice output can
+optionally use Microsoft's online Edge TTS (falls back to offline Piper if
+it's unavailable). The brain can optionally use the real Anthropic API
+instead of the local Ollama model (`BRAIN_PROVIDER=claude`) — opt-in, off by
+default, and the one deliberate exception to "no cloud APIs, no API keys":
+see "Providers".
 
 ## Roadmap
 
@@ -21,14 +24,17 @@ notes; a refresh trigger («ξανακάνε έρευνα για…») so a stal
 redone on request; and populating real data early — this semester's courses,
 syllabus topics and exam dates, and a description of each business.
 
-**It depends on a phase that is not built.** The roadmap lists Phase 5 as
-requiring the Claude brain from Phase 2, and `BRAIN_PROVIDER="claude"` is
-still a placeholder in `_PROVIDERS` with no dependency and no key handling
-behind it (see "Providers"). So step 1 is the first thing in this project that
-reaches the network for *thinking* rather than for a voice — the "no cloud
-APIs, no API keys" line at the top of this file stops being true of the brain
-when it lands, and that is a decision to take deliberately rather than as a
-side effect.
+**The Phase 2 dependency it needed is now met.** The roadmap lists Phase 5 as
+requiring the Claude brain from Phase 2, and `BRAIN_PROVIDER="claude"` is now
+a real provider in `_PROVIDERS`/`_STREAM_PROVIDERS` (`jarvis/brain.py`), with
+the `anthropic` dependency in `requirements.txt` and an import-time key check
+(see "Providers"). It is opt-in — `BRAIN_PROVIDER` still defaults to
+`"ollama"` in `.env.example` — but switching it on is the first thing in this
+project that reaches the network for *thinking* rather than for a voice, and
+that was taken as a deliberate decision rather than a side effect, after
+walking through the cost (Anthropic API billing, a spend limit set on the
+key) and the trade-off it makes to "no cloud APIs, no API keys". None of the
+five `research`-skill steps themselves are built yet.
 
 **Phase 3 — a reply you can interrupt — closed on 2026-09-27**, built out of
 order on `feature/streaming-interrupt` and merged to `master` when it closed.
@@ -207,10 +213,34 @@ top of `jarvis/listener.py`.
 `BRAIN_PROVIDER` and `TTS_ENGINE` (both in `.env`, see `.env.example`).
 
 - Brain: `BRAIN_PROVIDER` selects from `_PROVIDERS` in `jarvis/brain.py`.
-  Only `"ollama"` is implemented. An unknown value raises `ValueError` at
-  import time (startup), before the app's request-level error handling can
-  swallow it. `"claude"` / `"openai"` are placeholders for later — adding
-  them means a new function plus a new dict entry, no other changes.
+  `"ollama"` (the default) and `"claude"` are both implemented; `"openai"` is
+  still a placeholder — adding it means a new function plus a new dict entry,
+  no other changes. An unknown value raises `ValueError` at import time
+  (startup), before the app's request-level error handling can swallow it.
+  `"claude"` sends the conversation to the real Anthropic API
+  (`ANTHROPIC_API_KEY`, `CLAUDE_MODEL`, default `claude-haiku-4-5-20251001`)
+  instead of the local model — real network, real cost per reply (see the
+  roadmap's budget plan), the one deliberate exception to "no cloud APIs, no
+  API keys". `BRAIN_PROVIDER=claude` with `ANTHROPIC_API_KEY` empty raises
+  `ValueError` at import time too, same reasoning as the unknown-provider
+  check it sits beside — a startup that will fail on the first turn should
+  fail before that. `_get_claude_client()` is a lazy singleton, same idiom as
+  `speaker._get_voice()`: the `anthropic` import is deferred so importing
+  `brain.py` stays cheap when `BRAIN_PROVIDER=ollama`. `_split_system()`
+  turns the flat Ollama-style message list (including the frozen-prefix
+  system messages and the transient memory-block one, see "Memory") into
+  Anthropic's separate `system` string plus a system-free `messages` list,
+  since Anthropic's API takes system as a top-level argument, not a
+  `"system"`-role message. Both `_ask_claude()` (non-streaming) and
+  `_stream_claude()` (streaming, registered in `_STREAM_PROVIDERS`) go
+  through it. `_stream_claude()` translates Anthropic's `stop_reason` vocabulary
+  (`end_turn`, `max_tokens`) to Ollama's (`stop`, `length`) before setting
+  `state["done_reason"]`, so `Turn.truncated` — which only ever checks for
+  `"length"` — stays provider-agnostic. `tests/test_brain_claude.py` pins
+  `_split_system`, both provider functions (including the max-tokens trim
+  behavior and the stop-reason translation) and the import-time guard, via
+  `importlib.reload()` the same way `tests/test_speaker_lazy.py` pins the
+  Piper lazy-load.
 - Voice: `TTS_ENGINE` selects from `_VOICE_PROVIDERS` in `jarvis/speaker.py`.
   Only `"edge"` is implemented there; `"piper"` (or any unrecognized value)
   isn't in the dict and is used directly as the always-available fallback.

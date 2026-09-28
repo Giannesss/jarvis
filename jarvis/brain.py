@@ -4,7 +4,7 @@ from typing import Iterator
 import ollama
 
 from jarvis import diag
-from jarvis.config import BRAIN_PROVIDER, OLLAMA_MODEL
+from jarvis.config import ANTHROPIC_API_KEY, BRAIN_PROVIDER, CLAUDE_MODEL, OLLAMA_MODEL
 
 SYSTEM_PROMPT = (
     "Είσαι ο Τζάρβις, ένας φιλικός φωνητικός βοηθός. Μιλάς στον κόσμο σαν "
@@ -143,15 +143,77 @@ def _ask_ollama(messages: list[dict]) -> str:
     return reply
 
 
-# Add "claude" / "openai" entries here later (not implemented yet).
+# Lazy singleton, same idiom as speaker._get_voice() and listener._get_model():
+# `anthropic` is only imported, and the key only checked, if BRAIN_PROVIDER is
+# actually "claude". Ollama stays the zero-network default, so nothing about
+# using it should ever require the anthropic package to be installed.
+_claude_client = None
+
+
+def _get_claude_client():
+    global _claude_client
+    if _claude_client is None:
+        import anthropic
+
+        _claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    return _claude_client
+
+
+def _split_system(messages: list[dict]) -> tuple[str, list[dict]]:
+    """Anthropic's API takes the system prompt as its own `system` argument,
+    never inside `messages` -- unlike Ollama, which takes a "system"-role
+    message anywhere in the list. brain.py splices the memory block in as a
+    second system message after the frozen prefix (see _build_messages), so
+    there can be more than one; joined in order, they read as one prompt with
+    the memory block appended, which is exactly what they are.
+    """
+    system_parts = [m["content"] for m in messages if m["role"] == "system"]
+    convo = [m for m in messages if m["role"] != "system"]
+    return "\n\n".join(system_parts), convo
+
+
+def _ask_claude(messages: list[dict]) -> str:
+    system, convo = _split_system(messages)
+    client = _get_claude_client()
+
+    t0 = time.perf_counter()
+    response = client.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=MAX_REPLY_TOKENS,
+        temperature=TEMPERATURE,
+        system=system,
+        messages=convo,
+    )
+    diag.log(
+        f"[timing] Claude response: {time.perf_counter() - t0:.2f}s "
+        f"(in {response.usage.input_tokens} tok, "
+        f"out {response.usage.output_tokens} tok)"
+    )
+
+    reply = "".join(block.text for block in response.content if block.type == "text")
+    if response.stop_reason == "max_tokens":
+        reply = _trim_to_last_sentence(reply)
+    return reply
+
+
+# Add an "openai" entry here later the same way (not implemented yet).
 _PROVIDERS = {
     "ollama": _ask_ollama,
+    "claude": _ask_claude,
 }
 
 if BRAIN_PROVIDER not in _PROVIDERS:
     raise ValueError(
         f"Unknown BRAIN_PROVIDER {BRAIN_PROVIDER!r}; expected one of "
         f"{sorted(_PROVIDERS)}. Check your .env file."
+    )
+
+# Failing here, at import time, is deliberate and matches the unknown-provider
+# check above: a missing key would otherwise surface as a confusing error on
+# the first turn, mid-conversation, rather than at startup where it belongs.
+if BRAIN_PROVIDER == "claude" and not ANTHROPIC_API_KEY:
+    raise ValueError(
+        "BRAIN_PROVIDER=claude requires ANTHROPIC_API_KEY to be set in .env"
     )
 
 
@@ -250,11 +312,50 @@ def _stream_ollama(messages: list[dict], state: dict) -> Iterator[str]:
     )
 
 
-# Add "claude" / "openai" entries here as they gain streaming, same idiom as
-# _PROVIDERS. A provider absent from this dict is not a failure: start_turn()
-# is simply never used for it and main.py keeps the whole-reply path.
+def _stream_claude(messages: list[dict], state: dict) -> Iterator[str]:
+    """Yield the reply in deltas, same contract as _stream_ollama.
+
+    Anthropic's stop_reason vocabulary ("end_turn", "max_tokens", ...) is
+    translated to "length" for the one value Turn.truncated actually checks,
+    so that property stays provider-agnostic rather than leaking Anthropic's
+    wording into brain.py's one caller.
+    """
+    system, convo = _split_system(messages)
+    client = _get_claude_client()
+
+    t0 = time.perf_counter()
+    first_at: float | None = None
+
+    with client.messages.stream(
+        model=CLAUDE_MODEL,
+        max_tokens=MAX_REPLY_TOKENS,
+        temperature=TEMPERATURE,
+        system=system,
+        messages=convo,
+    ) as stream:
+        for delta in stream.text_stream:
+            if delta and first_at is None:
+                first_at = time.perf_counter() - t0
+            if delta:
+                yield delta
+        final = stream.get_final_message()
+
+    state["done_reason"] = "length" if final.stop_reason == "max_tokens" else final.stop_reason
+
+    first = f"{first_at:.2f}s" if first_at is not None else "never"
+    diag.log(
+        f"[timing] Claude stream: first token {first}, "
+        f"done {time.perf_counter() - t0:.2f}s "
+        f"(in {final.usage.input_tokens} tok, out {final.usage.output_tokens} tok)"
+    )
+
+
+# Add an "openai" entry here as it gains streaming, same idiom as _PROVIDERS.
+# A provider absent from this dict is not a failure: start_turn() is simply
+# never used for it and main.py keeps the whole-reply path.
 _STREAM_PROVIDERS = {
     "ollama": _stream_ollama,
+    "claude": _stream_claude,
 }
 
 

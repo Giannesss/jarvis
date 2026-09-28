@@ -9,8 +9,19 @@ OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3:8b")
 PIPER_MODEL_PATH = os.environ.get("PIPER_MODEL_PATH", "models/el_GR-joy-medium.onnx")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
 
-# "ollama" (local, only one implemented). See CLAUDE.md "Providers".
+# "ollama" (local, default) or "claude" (Anthropic API, needs
+# ANTHROPIC_API_KEY below). See CLAUDE.md "Providers".
 BRAIN_PROVIDER = os.environ.get("BRAIN_PROVIDER", "ollama")
+
+# Only read when BRAIN_PROVIDER=claude. Empty by default so importing this
+# module never requires a key; jarvis/brain.py raises at import time if
+# BRAIN_PROVIDER=claude and this is empty, rather than failing mid-turn.
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+
+# Haiku 4.5 by default, per the roadmap's budget plan: cheap enough for
+# everyday short voice replies, with Sonnet 5 as the documented upgrade for
+# harder requests (not yet wired -- there is no complexity routing here).
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
 
 # "edge" (online, Microsoft Edge TTS, male voice by default) or "piper"
 # (offline, falls back to this automatically if edge synthesis fails).

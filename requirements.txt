@@ -1,4 +1,5 @@
 ollama
+anthropic
 speechrecognition
 piper-tts
 edge-tts
