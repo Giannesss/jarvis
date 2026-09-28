@@ -43,32 +43,37 @@ came from `tools/barge_probe.py` rather than from a guess, and the probe took
 three revisions before it was measuring the right thing; it is a property of
 this room and re-measuring beats copying the number.
 
-**Phase 4 — structure and safety — is built, and one of its three live-test
-debts is now settled.** Four steps, all four built: the skills registry, the
-policy layer and kill switch (see "Policy"), a durable scheduler for
-reminders and timers that survive a restart (see "Scheduler"), and a
-tag/category column across the memory tables so "τι έχω σήμερα" can pull from
-every area at once (see "Tags"). The pointer moved past it before any of the
-three live tests the roadmap's own rule demands, so this remained outstanding
-debt rather than a finished step.
+**Phase 4 — structure and safety — closed on 2026-09-28.** Four steps: the
+skills registry, the policy layer and kill switch (see "Policy"), a durable
+scheduler for reminders and timers that survive a restart (see "Scheduler"),
+and a tag/category column across the memory tables so "τι έχω σήμερα" can
+pull from every area at once (see "Tags"). The pointer had moved past it
+before any of the three live tests the roadmap's own rule demands, leaving it
+as debt rather than a finished step; all three are now settled:
 
-**Reminder restart-survival is now confirmed live**, closing the second debt:
-a timer was set, the window was closed before it fired, and well past a
-minute later the next run announced `[sched] Όσο ήμουν κλειστός έληξε ένα
-χρονόμετρο.` at startup, before Enter was pressed — `catch_up()` claiming a
-still-`pending` row as `missed` and speaking it before the main loop starts,
-exactly as "Scheduler" describes.
-
-**The agenda is now confirmed live too**, closing the third debt: «Θυμήσου
-ότι έχω εξέταση σήμερα στα μαθηματικά» saved to `exams` («Το σημείωσα στις
-εξετάσεις σου.»), «Θυμήσου ότι σε δύο ώρες πρέπει να πιω νερό» saved to
-`reminders` via the delay-inside-the-body rung («Εντάξει, θα σου το
-θυμίσω.»), and «Τι έχω σήμερα» answered with both rows pulled together from
-their two different tables in one sentence, alongside three older reminders
-in their fired/missed states with the right status suffixes.
-
-**One debt remains**, pinned by the suite only: the kill switch's fuzzy and
-bare rungs against a real transcription.
+- **Reminder restart-survival.** A timer was set, the window was closed
+  before it fired, and well past a minute later the next run announced
+  `[sched] Όσο ήμουν κλειστός έληξε ένα χρονόμετρο.` at startup, before Enter
+  was pressed — `catch_up()` claiming a still-`pending` row as `missed` and
+  speaking it before the main loop starts, exactly as "Scheduler" describes.
+- **The agenda across tables.** «Θυμήσου ότι έχω εξέταση σήμερα στα
+  μαθηματικά» saved to `exams` («Το σημείωσα στις εξετάσεις σου.»), «Θυμήσου
+  ότι σε δύο ώρες πρέπει να πιω νερό» saved to `reminders` via the
+  delay-inside-the-body rung («Εντάξει, θα σου το θυμίσω.»), and «Τι έχω
+  σήμερα» answered with both rows pulled together from their two different
+  tables in one sentence, alongside three older reminders in their
+  fired/missed states with the right status suffixes.
+- **The kill switch's fuzzy and bare rungs.** «Στα μάτα τα πάντα» (Whisper's
+  mangling of «σταμάτα τα πάντα», normalizing to the exact string the fuzzy
+  rung was built to catch) froze it, after two near-misses with a wrong
+  object correctly stayed unfrozen; a bare «Πάγω σε» (mangled «Πάγωσε»)
+  froze it again on the other rung. While frozen, an unrelated phrase and a
+  wrong shutdown verb form were both refused; the real shutdown trigger
+  («Κλήσε», which folds to the same normalized string as «κλείσε» through
+  the iotacism fold) still passed through and shut it down cleanly, and the
+  freeze — which survived that shutdown in the database, as documented —
+  was cleared afterward with `python -m jarvis.policy unlock` from a fresh
+  terminal.
 
 Phase 1 closed on 2026-09-23 (`docs/PHASE1_STATUS.md`): the beep-reset bug and
 the too-high silence floor are fixed and confirmed live, and the remaining
