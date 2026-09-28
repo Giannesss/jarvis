@@ -59,10 +59,13 @@ own pick, and the model with the fewest surprises for a ≤120-token spoken repl
 See "Providers" for the rules; `tests/test_brain_claude.py` pins them against a
 fake client.
 
-**It has not been hand-tested on live audio**, which needs a key and spends real
-money — so by the same rule as Phase 3 and Phase 4 it is not done. What that
-test has to cover: a plain question, a recall (do the remembered facts actually
-reach the reply), one of the five grounding questions that used to draw invented
+**Partly hand-tested on live audio; not yet closed.** A plain general-knowledge
+question («Πες μου μερικά πράγματα για την Αθήνα») and a follow-up both came
+back through `[timing] Claude stream: ...` (not Ollama), streamed normally,
+with a correct answer and a sensible first-token time (0.6–2.7s) — so the
+wiring itself, end to end, is confirmed live. Still outstanding, per the same
+rule as Phase 3 and Phase 4: a recall (do the remembered facts actually reach
+the reply), one of the five grounding questions that used to draw invented
 answers, and a barge-in mid-reply, since the streamed path is wired too.
 Phase 2's *voice* half (ElevenLabs) is untouched, and `TTS_ENGINE`'s
 `"elevenlabs"` is still a placeholder.
@@ -80,18 +83,37 @@ came from `tools/barge_probe.py` rather than from a guess, and the probe took
 three revisions before it was measuring the right thing; it is a property of
 this room and re-measuring beats copying the number.
 
-**Phase 4 — structure and safety — is built but has *not* been hand-tested on
-live audio.** Four steps, all four built: the skills registry, the policy
-layer and kill switch (see "Policy"), a durable scheduler for reminders and
-timers that survive a restart (see "Scheduler"), and a tag/category column
-across the memory tables so "τι έχω σήμερα" can pull from every area at once
-(see "Tags"). The pointer has moved past it anyway, so this is outstanding
-debt rather than a finished step — the roadmap's rule is that live audio is
-the one thing tests cannot stand in for, and the three things it would settle
-are the kill switch's fuzzy and bare rungs against a real transcription, a
-reminder surviving an actual restart and being caught up out loud, and the
-agenda answering «τι έχω σήμερα» across tables. Until then they are pinned by
-the suite only.
+**Phase 4 — structure and safety — closed on 2026-09-28.** Four steps: the
+skills registry, the policy layer and kill switch (see "Policy"), a durable
+scheduler for reminders and timers that survive a restart (see "Scheduler"),
+and a tag/category column across the memory tables so "τι έχω σήμερα" can
+pull from every area at once (see "Tags"). The pointer had moved past it
+before any of the three live tests the roadmap's own rule demands, leaving it
+as debt rather than a finished step; all three are now settled:
+
+- **Reminder restart-survival.** A timer was set, the window was closed
+  before it fired, and well past a minute later the next run announced
+  `[sched] Όσο ήμουν κλειστός έληξε ένα χρονόμετρο.` at startup, before Enter
+  was pressed — `catch_up()` claiming a still-`pending` row as `missed` and
+  speaking it before the main loop starts, exactly as "Scheduler" describes.
+- **The agenda across tables.** «Θυμήσου ότι έχω εξέταση σήμερα στα
+  μαθηματικά» saved to `exams` («Το σημείωσα στις εξετάσεις σου.»), «Θυμήσου
+  ότι σε δύο ώρες πρέπει να πιω νερό» saved to `reminders` via the
+  delay-inside-the-body rung («Εντάξει, θα σου το θυμίσω.»), and «Τι έχω
+  σήμερα» answered with both rows pulled together from their two different
+  tables in one sentence, alongside three older reminders in their
+  fired/missed states with the right status suffixes.
+- **The kill switch's fuzzy and bare rungs.** «Στα μάτα τα πάντα» (Whisper's
+  mangling of «σταμάτα τα πάντα», normalizing to the exact string the fuzzy
+  rung was built to catch) froze it, after two near-misses with a wrong
+  object correctly stayed unfrozen; a bare «Πάγω σε» (mangled «Πάγωσε»)
+  froze it again on the other rung. While frozen, an unrelated phrase and a
+  wrong shutdown verb form were both refused; the real shutdown trigger
+  («Κλήσε», which folds to the same normalized string as «κλείσε» through
+  the iotacism fold) still passed through and shut it down cleanly, and the
+  freeze — which survived that shutdown in the database, as documented —
+  was cleared afterward with `python -m jarvis.policy unlock` from a fresh
+  terminal.
 
 Phase 1 closed on 2026-09-23 (`docs/PHASE1_STATUS.md`): the beep-reset bug and
 the too-high silence floor are fixed and confirmed live, and the remaining
