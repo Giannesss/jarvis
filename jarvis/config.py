@@ -9,19 +9,67 @@ OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3:8b")
 PIPER_MODEL_PATH = os.environ.get("PIPER_MODEL_PATH", "models/el_GR-joy-medium.onnx")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
 
-# "ollama" (local, default) or "claude" (Anthropic API, needs
-# ANTHROPIC_API_KEY below). See CLAUDE.md "Providers".
+# "ollama" (local, the default) or "claude" (Anthropic's Messages API, which
+# is online and needs a key). See CLAUDE.md "Providers". An unrecognized value
+# raises at import time, i.e. at startup.
 BRAIN_PROVIDER = os.environ.get("BRAIN_PROVIDER", "ollama")
 
-# Only read when BRAIN_PROVIDER=claude. Empty by default so importing this
-# module never requires a key; jarvis/brain.py raises at import time if
-# BRAIN_PROVIDER=claude and this is empty, rather than failing mid-turn.
+# --- The Claude brain (BRAIN_PROVIDER=claude, see jarvis/brain.py).
+#
+# Everything in this block is inert while BRAIN_PROVIDER is "ollama": no key is
+# needed, no SDK is imported, and nothing said to Jarvis leaves the machine.
+#
+# The key is read from the environment (.env, loaded above) and nowhere else.
+# It is never printed, never logged, and never written to data/jarvis.log. A
+# missing key while BRAIN_PROVIDER=claude is a *startup* failure rather than a
+# per-question one -- see brain._check_key().
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
-# Haiku 4.5 by default, per the roadmap's budget plan: cheap enough for
-# everyday short voice replies, with Sonnet 5 as the documented upgrade for
-# harder requests (not yet wired -- there is no complexity routing here).
-CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
+# Haiku 4.5 is the roadmap's own pick for everyday use -- cheap and fast, which
+# is what a one-or-two-sentence spoken reply wants. It is also the model with
+# the fewest surprises for this shape of request: omitting the `thinking`
+# parameter means no thinking at all, whereas the 5-series models think
+# adaptively unless explicitly told not to, and a 120-token spoken answer has
+# no latency budget for it. Change this and re-read brain._ask_claude()'s note
+# on what is deliberately *not* sent.
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5")
+
+# Whether a *transient* Claude failure -- no internet, a rate limit, a 5xx --
+# is answered from the local Ollama model for that one turn, the same way Edge
+# TTS falls back to Piper. This is the roadmap's Phase 2 step 5, "keep qwen3:8b
+# as an offline fallback".
+#
+# Transient only. A bad key or a malformed request raises instead: falling back
+# there would mean every reply quietly comes from qwen3 while you believe you
+# are talking to Claude. See brain._is_transient().
+CLAUDE_FALLBACK_OLLAMA = (
+    os.environ.get("CLAUDE_FALLBACK_OLLAMA", "true").lower() == "true"
+)
+
+# --- The research skill (Phase 5 step 1, jarvis/brain.py research()).
+#
+# Always the Claude API, whatever BRAIN_PROVIDER is set to -- Ollama has no
+# way to reach the internet at all, so there is no local fallback to offer
+# here the way _ask_claude/_stream_claude do. A missing ANTHROPIC_API_KEY is
+# therefore a per-call refusal (brain.ResearchUnavailable), not the
+# import-time failure BRAIN_PROVIDER=claude gets: research is opt-in on its
+# own, independently of which brain answers ordinary questions.
+#
+# Defaults to CLAUDE_MODEL rather than a separate model of its own -- research
+# is a new knob, not a reason to introduce a second one before there is a
+# reason to tell them apart.
+CLAUDE_RESEARCH_MODEL = os.environ.get("CLAUDE_RESEARCH_MODEL", CLAUDE_MODEL)
+
+# How many searches the web_search tool may run for one research request.
+# Each one is billed ($10/1000, plus tokens) whether or not it finds anything,
+# so this is a cost cap as much as a quality one.
+RESEARCH_MAX_SEARCHES = int(os.environ.get("RESEARCH_MAX_SEARCHES", "5"))
+
+# Generous compared to MAX_REPLY_TOKENS: this has to cover the search-tool
+# preambles and citations along the way, not just the final summary, and
+# unlike a spoken conversational reply there is no streaming latency budget
+# to protect.
+RESEARCH_MAX_TOKENS = int(os.environ.get("RESEARCH_MAX_TOKENS", "1024"))
 
 # "edge" (online, Microsoft Edge TTS, male voice by default) or "piper"
 # (offline, falls back to this automatically if edge synthesis fails).

@@ -12,7 +12,7 @@ import time
 import webbrowser
 from datetime import datetime, timedelta
 
-from jarvis import db, memory, policy, scheduler, text
+from jarvis import brain, db, memory, policy, scheduler, text
 from jarvis import diag
 from jarvis.config import SKILL_APPS, SKILL_SITES
 
@@ -299,7 +299,10 @@ def _handle_agenda(raw_text: str) -> str | None:
         return f"Δεν έχεις τίποτα {day_word.lower()}."
 
     spoken = [
-        f"εξέταση {value}" if kind == "exam" else value for kind, value in items
+        f"εξέταση {value}" if kind == "exam"
+        else f"μάθημα {value}" if kind == "class"
+        else value
+        for kind, value in items
     ]
     return f"{day_word} έχεις: {', '.join(spoken)}."
 
@@ -331,14 +334,63 @@ def _handle_memory_recall(raw_text: str) -> str | None:
     return " ".join(hits[:MEMORY_RECALL_LIMIT])
 
 
+def _research_matches(raw_text: str) -> bool:
+    """Recognises a research trigger without acting -- what CONFIRM requires
+    (see policy.Skill's docstring): the actual network call happens only in
+    _handle_research(), and only once the user has said yes out loud."""
+    return memory.parse_research(raw_text) is not None
+
+
+RESEARCH_CONFIRM_PROMPT = "Αυτό θα ψάξει στο διαδίκτυο και έχει κόστος. Να προχωρήσω;"
+
+
+def _handle_research(raw_text: str) -> str | None:
+    """«Κάνε έρευνα για ...» / «Ερεύνησε ...» / «Ξανακάνε έρευνα για ...».
+
+    The first live skill to actually use Permission.CONFIRM (see CLAUDE.md
+    "Policy") -- everything else registered here is SAFE, but this is real
+    network traffic with a real bill attached, unlike anything else in
+    SKILLS, so policy.dispatch() only reaches this handler after
+    RESEARCH_CONFIRM_PROMPT has been answered yes.
+    """
+    parsed = memory.parse_research(raw_text)
+    if parsed is None:
+        return None  # _research_matches() already checked this
+    topic, is_refresh = parsed
+
+    try:
+        summary = brain.research(topic)
+    except brain.ResearchUnavailable as e:
+        return str(e)
+    except Exception as e:
+        print(f"Σφάλμα έρευνας: {e}")
+        return "Δεν μπόρεσα να κάνω την έρευνα τώρα."
+
+    try:
+        conn = db.connect()
+        try:
+            memory.save_expertise(topic, summary, conn)
+        finally:
+            conn.close()
+    except Exception as e:
+        # The research itself worked; saying nothing would hide a finding
+        # that was already paid for, so it is still spoken even if the row
+        # never made it to the database.
+        print(f"Σφάλμα μνήμης: {e}")
+
+    lead = "Ξανάκανα την έρευνα για" if is_refresh else "Έκανα έρευνα για"
+    return f"{lead} {topic}. {summary}"
+
+
 # Order matches the ladder `handle()` used before this registry existed, and
 # is load-bearing: shutdown first so "κλείσε" can never be intercepted,
 # memory_save before memory_recall since their trigger phrases overlap. See
 # CLAUDE.md "Skills".
 #
-# All seven are SAFE: none of them sends, deletes, spends or reaches outside
-# the machine. The CONFIRM and BLOCKED paths exist for what Phase 7 adds
-# (file move/rename/delete) -- see CLAUDE.md "Policy".
+# Seven of the eight are SAFE: none of them sends, deletes, spends or reaches
+# outside the machine. "research" is the first live CONFIRM skill -- the
+# BLOCKED path still carries nothing live, and is what Phase 7 adds (file
+# move/rename/delete) -- see CLAUDE.md "Policy".
 #
 # Written as keyword arguments because `permission` now has a default
 # (BLOCKED), so position no longer carries it. That is the deny-by-default
@@ -379,6 +431,21 @@ SKILLS: list[Skill] = [
         handler=_handle_memory_recall,
         permission=Permission.SAFE,
         input="raw",
+    ),
+    Skill(
+        name="research",
+        phrases=(),
+        description=(
+            "Runs several web searches on a topic through the Claude API and "
+            "stores a structured summary as a dated \"expertise\" row. Real "
+            "triggers live in memory.parse_research(), not here. «κάνε "
+            "έρευνα για ...», «ερεύνησε ...», «ξανακάνε έρευνα για ...»."
+        ),
+        handler=_handle_research,
+        permission=Permission.CONFIRM,
+        input="raw",
+        matches=_research_matches,
+        confirm_prompt=RESEARCH_CONFIRM_PROMPT,
     ),
     Skill(
         name="timer",

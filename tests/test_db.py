@@ -40,7 +40,8 @@ class SchemaTests(DbTestCase):
         self.assertEqual(
             names,
             {"schema_version", "profile", "notes", "semesters", "courses",
-             "exams", "businesses", "reminders", "audit", "policy_state"},
+             "exams", "businesses", "reminders", "audit", "policy_state",
+             "expertise", "class_schedule"},
         )
 
     def test_connect_creates_parent_directory(self) -> None:

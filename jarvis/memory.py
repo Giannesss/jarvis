@@ -503,6 +503,67 @@ RE_BIZ_NEED = _re(
 )
 RE_BIZ_PLAIN = _re(_BIZ_HEAD + r"\s*(?P<note>.+)$")
 
+
+# --- The research skill (Phase 5 step 1) ------------------------------------
+#
+# Not a rung in parse()'s ladder below: this triggers an action -- jarvis/
+# skills.py's research skill calls brain.research() -- rather than filing a
+# fact, so it stays a separate, pure function returning (topic, is_refresh)
+# instead of a Parsed for save(). Written here anyway, alongside the other
+# trigger patterns, because it is the same job: turning a spoken trigger into
+# a payload, with Norm keeping the topic verbatim (accents, capitals) for the
+# search query brain.research() sends.
+#
+# The refresh form is checked first, and has two spellings of "again":
+# "ξανακάνε έρευνα" (ξανα glued to κανε, one word to the recognizer) and the
+# more natural "κάνε ξανά έρευνα" (κανε, then ξανα, then ερευνα) -- a live
+# hand test asked it exactly that way and it fell through to the brain
+# because only the first spelling was recognized.
+#
+# Neither can be shadowed by RE_RESEARCH by accident. "ξανακάνε..." never
+# starts with "κανε" the way RE_RESEARCH's anchor requires, so that
+# alternative simply never reaches it. "κάνε ξανά ερευνα" does start with
+# "κανε", but RE_RESEARCH's own alternative demands "ερευνα" immediately
+# after it (_GAP only spans whitespace/punctuation, never another word), and
+# "ξανα" sits in between -- so RE_RESEARCH would refuse this string even if
+# it were tried first. Checking refresh first is still what makes that
+# argument unnecessary to rely on.
+RE_RESEARCH_REFRESH = _re(
+    rf"^(?:τζαρβισ{_GAP})?"
+    rf"(?:ξανα{_JOIN}κανε{_GAP}ερευνα|κανε{_GAP}ξανα{_GAP}ερευνα)"
+    rf"{_GAP}(?:για{_GAP})?(?P<topic>.+)$"
+)
+RE_RESEARCH = _re(
+    rf"^(?:τζαρβισ{_GAP})?"
+    rf"(?:κανε{_GAP}ερευνα|ερευνησε|ψαξε{_GAP}στο{_GAP}ιντερνετ)"
+    rf"{_GAP}(?:για{_GAP})?(?P<topic>.+)$"
+)
+
+
+def parse_research(text: str) -> tuple[str, bool] | None:
+    """(topic, is_refresh) for a research trigger, or None.
+
+    Pure and offline, like parse(): recognizes the trigger and pulls out the
+    topic verbatim, never touches the network or the database. jarvis/
+    skills.py's research skill calls brain.research(topic) with what this
+    returns, once the CONFIRM prompt is answered yes (see CLAUDE.md
+    "Research").
+    """
+    view = Norm.of(text)
+
+    match = RE_RESEARCH_REFRESH.match(view.norm)
+    if match:
+        topic = view.group(match, "topic")
+        return (topic, True) if topic else None
+
+    match = RE_RESEARCH.match(view.norm)
+    if match:
+        topic = view.group(match, "topic")
+        return (topic, False) if topic else None
+
+    return None
+
+
 # Appended to a row's `norm` so the row stays findable by the generic word
 # that classified it, even when the pattern consumed that word. Without this,
 # "η επιχείρησή μου χρειάζεται λογιστή" is filed under businesses but cannot
@@ -510,7 +571,17 @@ RE_BIZ_PLAIN = _re(_BIZ_HEAD + r"\s*(?P<note>.+)$")
 _TABLE_KEYWORDS = {
     "businesses": "επιχειρηση μαγαζι εταιρεια καταστημα",
     "courses": "μαθημα εξαμηνο",
+    "class_schedule": "μαθημα ωρολογιο προγραμμα",
 }
+
+# Greek weekday names, indexed by Python's date.weekday() (Δευτέρα=0 ..
+# Κυριακή=6) -- the same convention class_schedule.weekday is stored in and
+# WEEKDAYS above already maps spoken names to. Used to render a schedule row
+# back into speech (agenda(), _SEARCHABLE) and shared with mem.py so the CLI
+# renders the same way.
+WEEKDAY_NAMES = (
+    "Δευτέρα", "Τρίτη", "Τετάρτη", "Πέμπτη", "Παρασκευή", "Σάββατο", "Κυριακή",
+)
 
 
 # --- Tags ------------------------------------------------------------------
@@ -541,6 +612,7 @@ _TABLE_TAGS = {
     "courses": "university",
     "exams": "university",
     "businesses": "business",
+    "class_schedule": "university",
 }
 
 # Stored comma-delimited *and* comma-terminated: ",cafe,university,". The
@@ -914,6 +986,54 @@ def save(parsed: Parsed, conn: sqlite3.Connection) -> int:
     return cursor.lastrowid
 
 
+def save_expertise(topic: str, summary: str, conn: sqlite3.Connection) -> int:
+    """Upsert a dated "expertise" row. Returns the new (or updated) row id.
+
+    Keyed by the topic's normalized form, the same shape save()'s profile
+    branch uses: researching a topic again updates this row in place rather
+    than piling up duplicate summaries, which is what makes the refresh
+    trigger ("ξανακάνε έρευνα για...") mean something. `norm` covers topic
+    *and* summary, unlike `topic_key`, which is exact and only for the
+    upsert -- so a keyword search over unrelated wording can still find it.
+    """
+    ts = db.now_iso()
+    topic_key = normalize(topic)
+    norm = normalize(f"{topic} {summary}")
+
+    conn.execute(
+        "INSERT INTO expertise"
+        " (topic, topic_key, summary, norm, tags, created_at, updated_at)"
+        " VALUES (:topic, :topic_key, :summary, :norm, :tags, :ts, :ts)"
+        " ON CONFLICT(topic_key) DO UPDATE SET"
+        " topic=excluded.topic, summary=excluded.summary, norm=excluded.norm,"
+        " tags=excluded.tags, updated_at=excluded.updated_at",
+        {
+            "topic": topic,
+            "topic_key": topic_key,
+            "summary": summary,
+            "norm": norm,
+            "tags": tags_for("expertise", norm),
+            "ts": ts,
+        },
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT id FROM expertise WHERE topic_key = ?", (topic_key,)
+    ).fetchone()
+    return row["id"]
+
+
+def get_expertise(topic: str, conn: sqlite3.Connection) -> sqlite3.Row | None:
+    """The existing row for this topic, if any.
+
+    Lets the research skill tell a first save from a refresh in what it says
+    back, without needing save_expertise() to report which one happened.
+    """
+    return conn.execute(
+        "SELECT * FROM expertise WHERE topic_key = ?", (normalize(topic),)
+    ).fetchone()
+
+
 # --- Stemming and recall ---------------------------------------------------
 
 # Longest first, so "ματα" is tried before "ατα" before "α". Normalized and
@@ -1100,6 +1220,12 @@ def spoken_profile(conn: sqlite3.Connection) -> str:
 _STATUS_SUFFIX = {"fired": " (έγινε)", "missed": " (χάθηκε)"}
 
 
+def render_class(row: sqlite3.Row) -> str:
+    when = row["start_time"] + (f"-{row['end_time']}" if row["end_time"] else "")
+    extra = ", ".join(part for part in (row["room"], row["professor"]) if part)
+    return f"{row['course']} {when}" + (f" ({extra})" if extra else "")
+
+
 def agenda(
     conn: sqlite3.Connection, day: date, tag: str | None = None
 ) -> list[tuple[str, str]]:
@@ -1113,10 +1239,19 @@ def agenda(
     marked. The question is what the day holds, not what is still queued --
     and since the scheduler began claiming rows, filtering on `pending` would
     make a 9am reminder invisible by 10am.
+
+    class_schedule is different from the other tables here: it has no date at
+    all, only a weekday that recurs every week, so it is matched on
+    `day.weekday()` rather than on `day` itself -- the same convention
+    WEEKDAYS/date.weekday() already share (see CLAUDE.md "Roadmap").
+    Ordered by start_time and listed first, since a class day's classes are
+    what the rest of the day is arranged around.
     """
     stamp = day.isoformat()
     items: list[tuple[str, str]] = []
 
+    class_sql = "SELECT course, start_time, end_time, room, professor FROM class_schedule WHERE weekday = ?"
+    class_params: list = [day.weekday()]
     exam_sql = "SELECT course, topic FROM exams WHERE due_date = ?"
     exam_params: list = [stamp]
     reminder_sql = "SELECT text, status FROM reminders WHERE due_at LIKE ?"
@@ -1125,10 +1260,17 @@ def agenda(
     if tag:
         # The sentinels in tag_like() are what keep this from matching a tag
         # that merely contains the one asked for.
+        class_sql += " AND tags LIKE ?"
+        class_params.append(tag_like(tag))
         exam_sql += " AND tags LIKE ?"
         exam_params.append(tag_like(tag))
         reminder_sql += " AND tags LIKE ?"
         reminder_params.append(tag_like(tag))
+
+    class_sql += " ORDER BY start_time"
+
+    for row in conn.execute(class_sql, class_params):
+        items.append(("class", render_class(row)))
 
     for row in conn.execute(exam_sql, exam_params):
         topic = f" ({row['topic']})" if row["topic"] else ""
@@ -1142,10 +1284,13 @@ def agenda(
     return items
 
 
+_AGENDA_LABELS = {"exam": "Σήμερα εξέταση", "class": "Σήμερα μάθημα"}
+
+
 def _due_today(conn: sqlite3.Connection, now: datetime) -> list[str]:
     """Today's agenda, rendered for the brain's memory block."""
     return [
-        f"Σήμερα εξέταση: {text}" if kind == "exam" else f"Σήμερα: {text}"
+        f"{_AGENDA_LABELS.get(kind, 'Σήμερα')}: {text}"
         for kind, text in agenda(conn, now.date())
     ]
 
@@ -1162,6 +1307,12 @@ _SEARCHABLE = (
      lambda r: f"Επιχείρηση{' ' + r['name'] if r['name'] else ''}: {r['note']}"),
     ("reminders", "SELECT id, text, due_at, created_at FROM reminders WHERE norm LIKE ?",
      lambda r: f"Υπενθύμιση {r['due_at'][:10]}: {r['text']}"),
+    ("expertise", "SELECT id, topic, summary, created_at FROM expertise WHERE norm LIKE ?",
+     lambda r: f"Έρευνα για {r['topic']}: {r['summary']}"),
+    ("class_schedule",
+     "SELECT id, course, weekday, start_time, end_time, room, professor,"
+     " created_at FROM class_schedule WHERE norm LIKE ?",
+     lambda r: f"Μάθημα: {WEEKDAY_NAMES[r['weekday']]} {render_class(r)}"),
 )
 
 

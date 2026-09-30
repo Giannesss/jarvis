@@ -1,3 +1,4 @@
+anthropic
 ollama
 anthropic
 speechrecognition

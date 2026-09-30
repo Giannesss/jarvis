@@ -228,6 +228,20 @@ class AgendaTests(MemoryDbTestCase):
         )
         self.conn.commit()
 
+    def _class(
+        self, course, weekday, start, end=None, room=None, professor=None,
+        tags=",university,",
+    ) -> None:
+        self.conn.execute(
+            "INSERT INTO class_schedule"
+            " (course, weekday, start_time, end_time, room, professor, norm,"
+            "  tags, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, '2026-09-01', '2026-09-01')",
+            (course, weekday, start, end, room, professor,
+             memory.normalize(course), tags),
+        )
+        self.conn.commit()
+
     def test_it_pulls_from_every_dated_table_at_once(self) -> None:
         self._exam("Στατιστική", self.today)
         self._reminder("να πάρω ψωμί", self.today)
@@ -236,6 +250,57 @@ class AgendaTests(MemoryDbTestCase):
 
         self.assertEqual(
             items, [("exam", "Στατιστική"), ("reminder", "να πάρω ψωμί")]
+        )
+
+    def test_a_class_appears_on_its_weekday(self) -> None:
+        # self.today (2026-09-24) is a Thursday -- weekday() == 3.
+        self._class("Υδατική Χημεία", 3, "15:15", "17:00", "Β1", "Παπαδόπουλος")
+        self.assertEqual(
+            memory.agenda(self.conn, self.today),
+            [("class", "Υδατική Χημεία 15:15-17:00 (Β1, Παπαδόπουλος)")],
+        )
+
+    def test_a_class_is_absent_on_a_different_weekday(self) -> None:
+        # Wednesday (2) instead of Thursday (3): a weekly schedule has no
+        # `due_date` to fall on a specific calendar day, only a weekday that
+        # recurs -- so it must be matched on day.weekday(), not on `day`.
+        self._class("Μαθηματικά Ι", 2, "08:15")
+        self.assertEqual(memory.agenda(self.conn, self.today), [])
+
+    def test_classes_are_listed_first_and_time_ordered(self) -> None:
+        self._exam("Στατιστική", self.today)
+        self._class("Φυσική Ατμόσφαιρας", 3, "17:15", "20:00")
+        self._class("Μαθηματικά Ι", 3, "08:15", "09:00")
+
+        self.assertEqual(
+            memory.agenda(self.conn, self.today),
+            [
+                ("class", "Μαθηματικά Ι 08:15-09:00"),
+                ("class", "Φυσική Ατμόσφαιρας 17:15-20:00"),
+                ("exam", "Στατιστική"),
+            ],
+        )
+
+    def test_a_class_with_no_room_or_professor_omits_the_parenthesis(self) -> None:
+        self._class("Προγραμματισμός Η/Υ", 3, "10:00", "12:00")
+        self.assertEqual(
+            memory.agenda(self.conn, self.today),
+            [("class", "Προγραμματισμός Η/Υ 10:00-12:00")],
+        )
+
+    def test_a_class_tag_narrows_like_any_other_table(self) -> None:
+        self._class("Μαθηματικά Ι", 3, "08:15")
+        self.assertEqual(
+            memory.agenda(self.conn, self.today, "university"),
+            [("class", "Μαθηματικά Ι 08:15")],
+        )
+        self.assertEqual(memory.agenda(self.conn, self.today, "cafe"), [])
+
+    def test_the_brains_memory_block_labels_a_class(self) -> None:
+        self._class("Μαθηματικά Ι", 3, "08:15", "09:00")
+        self.assertEqual(
+            memory._due_today(self.conn, self.now),
+            ["Σήμερα μάθημα: Μαθηματικά Ι 08:15-09:00"],
         )
 
     def test_another_day_is_not_todays_agenda(self) -> None:
@@ -313,6 +378,21 @@ class AgendaSkillTests(MemoryDbTestCase):
 
         self.assertEqual(skills.handle("Τι έχω σήμερα;"), "Δεν έχεις τίποτα σήμερα.")
         self.assertEqual(skills.handle("Τι έχω αύριο;"), "Αύριο έχεις: αυριανό.")
+
+    def test_a_class_is_spoken_with_a_class_prefix(self) -> None:
+        today_weekday = datetime.now().weekday()
+        self.conn.execute(
+            "INSERT INTO class_schedule"
+            " (course, weekday, start_time, norm, tags, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ',university,', '2026-09-01', '2026-09-01')",
+            ("Μαθηματικά Ι", today_weekday, "08:15", memory.normalize("Μαθηματικά Ι")),
+        )
+        self.conn.commit()
+
+        self.assertEqual(
+            skills.handle("Τι έχω σήμερα;"),
+            "Σήμερα έχεις: μάθημα Μαθηματικά Ι 08:15.",
+        )
 
     def test_an_area_narrows_it(self) -> None:
         self._reminder("παραγγελία", 0, tags=",cafe,")

@@ -1,11 +1,29 @@
 # Jarvis
 
-Local, offline Greek-speaking voice assistant, by default. Voice output can
-optionally use Microsoft's online Edge TTS (falls back to offline Piper if
-it's unavailable). The brain can optionally use the real Anthropic API
-instead of the local Ollama model (`BRAIN_PROVIDER=claude`) — opt-in, off by
-default, and the one deliberate exception to "no cloud APIs, no API keys":
-see "Providers".
+Greek-speaking voice assistant, local by default. Speech recognition, memory,
+skills, the policy layer and the audit log never leave the machine.
+
+Two parts can optionally use an online service, each behind its own switch and
+each with a local fallback:
+
+- **the brain** — `BRAIN_PROVIDER=claude` sends the conversation to Anthropic's
+  Messages API and needs `ANTHROPIC_API_KEY`; the default `ollama` runs a local
+  model and needs neither a key nor a network. See "Providers".
+- **the voice** — `TTS_ENGINE=edge` (the default) sends the reply *text* to
+  Microsoft to be spoken, falling back to offline Piper when that fails.
+
+So "no cloud APIs, no API keys", which this line used to say, is now a
+configuration rather than a property: true of the brain at its default setting,
+and never quite true of the voice. With `BRAIN_PROVIDER=ollama`, nothing you
+*say* reaches Anthropic.
+
+**What the Claude brain sends, when it is selected:** the system prompt, the
+few-shot examples, up to `MAX_HISTORY_MESSAGES` of the conversation, and the
+recalled memory block — which is to say saved facts about you. Nothing else;
+there are no tools and no file access. `memory.is_sensitive()` already refuses
+to *store* passwords, PINs, cards and IBANs, so they cannot be recalled into a
+prompt either — that guard was written for the database and turns out to be the
+one that matters here too.
 
 ## Roadmap
 
@@ -24,17 +42,81 @@ notes; a refresh trigger («ξανακάνε έρευνα για…») so a stal
 redone on request; and populating real data early — this semester's courses,
 syllabus topics and exam dates, and a description of each business.
 
-**The Phase 2 dependency it needed is now met.** The roadmap lists Phase 5 as
-requiring the Claude brain from Phase 2, and `BRAIN_PROVIDER="claude"` is now
-a real provider in `_PROVIDERS`/`_STREAM_PROVIDERS` (`jarvis/brain.py`), with
-the `anthropic` dependency in `requirements.txt` and an import-time key check
-(see "Providers"). It is opt-in — `BRAIN_PROVIDER` still defaults to
-`"ollama"` in `.env.example` — but switching it on is the first thing in this
-project that reaches the network for *thinking* rather than for a voice, and
-that was taken as a deliberate decision rather than a side effect, after
-walking through the cost (Anthropic API billing, a spend limit set on the
-key) and the trade-off it makes to "no cloud APIs, no API keys". None of the
-five `research`-skill steps themselves are built yet.
+**Its prerequisite is built, and steps 1-3 of Phase 5 are now code — not yet
+hand-tested on live audio.** The roadmap lists Phase 5 as requiring the Claude
+brain from Phase 2, so that half of Phase 2 was built first — see below. Step 1
+is where «δεν έχεις πρόσβαση στο ίντερνετ» in `SYSTEM_PROMPT` stops being true
+for one specific action: a brain reached *over* the network still cannot look
+anything up on its own (that sentence still governs ordinary replies), but
+`brain.research()` holding the web-search tool can. See "Research" for what is
+built: the `research` skill (step 1), the structured summary stored as a dated
+`expertise` row (step 2), and `memory.recall()`/`memory.search()` surfacing
+those rows the way they already surface profile facts and notes (step 3). Step
+4, the refresh trigger, is also built — «ξανακάνε έρευνα για…» upserts the same
+row rather than piling up duplicates. Step 5, populating real data (this
+semester's courses, syllabus topics and exam dates, each business's
+description), is content, not code, and is the last thing left in this
+phase — now started: the 1st-semester course list (7 courses, from the
+user's own program-of-studies schedule) is in the real `courses` table via
+`tools/seed_courses_2026_2027_sem1.py`. Syllabus topics, exam dates and
+business descriptions are still to come, as the user sends them.
+
+That schedule also carries day/time/room/professor detail the `courses`
+table has no columns for — a weekly recurring timetable is a different
+shape of data from the single-dated `exams`/`reminders` the agenda already
+handles. Flagged to the user rather than dropped or silently bolted on when
+the course list was first seeded; the decision came back yes, and the
+feature — a new `class_schedule` table, agenda wiring, and now
+`tools/seed_class_schedule_2026_2027_sem1.py` carrying the real 13-row
+weekly timetable off the user's own schedule image — is built and closed,
+seed script and live hand-test both done. See "The weekly class schedule"
+under "Memory". «Τι έχω σήμερα» (a Wednesday) and «Τι έχω αύριο» each spoke
+back the right classes, in the right time order, room and professor
+included, against the real database — matching Thursday's Μαθηματικά
+Ι/Υδατική Χημεία/Φυσική Ατμόσφαιρας the user had described live before this
+table existed.
+
+Untested by design, not by oversight: this is real network traffic with a real
+bill attached (`$10`/1000 searches plus tokens), so it is the first live
+`Permission.CONFIRM` skill rather than `SAFE` — see "Policy" — and the roadmap's
+own hand-test rule applies before it counts as closed, the same as Phase 3 and
+Phase 4 before it.
+
+**The first two of the three live tests have now run; the third (recall)
+has not.** «Κάνε έρευνα για γυμναστήρια στην Ξάνθη», confirmed with a bare
+«Ναι», came back through `brain.research()` with a real, well-formed Greek
+summary (five short sentences, no list formatting) about actual gyms in
+Ξάνθη — the CONFIRM gate, the server-side `web_search` tool and
+`_final_text()`'s preamble-stripping are all confirmed live. The refresh
+trigger also fired, but exposed the "same words, not same subject" upsert
+boundary written up under "Research" — a genuine limit, not a bug. The
+hand test also found one real gap, now fixed: «Κάνε ξανά έρευνα για …» (verb,
+"again", "research", in that order) didn't match either pattern and fell
+through to the brain, because only «ξανακάνε έρευνα» (the two glued into one
+recognized word) was recognized; `RE_RESEARCH_REFRESH` now accepts both.
+Still outstanding: asking a later, unrelated-sounding question to see
+whether `memory.recall()` actually surfaces the researched topic.
+
+**Phase 2's brain half — the Claude API as a real `BRAIN_PROVIDER` — is built,
+out of order, because Phase 5 needs it.** Three of the roadmap's five steps for
+it are not code (create a key with a monthly spend cap, put it in `.env`, keep
+qwen3:8b as an offline fallback), and the shape of the change follows from the
+third: the local model does not go away, it becomes the fallback, exactly the
+way Piper sits behind Edge TTS. `claude-haiku-4-5` is the default, the roadmap's
+own pick, and the model with the fewest surprises for a ≤120-token spoken reply.
+See "Providers" for the rules; `tests/test_brain_claude.py` pins them against a
+fake client.
+
+**Partly hand-tested on live audio; not yet closed.** A plain general-knowledge
+question («Πες μου μερικά πράγματα για την Αθήνα») and a follow-up both came
+back through `[timing] Claude stream: ...` (not Ollama), streamed normally,
+with a correct answer and a sensible first-token time (0.6–2.7s) — so the
+wiring itself, end to end, is confirmed live. Still outstanding, per the same
+rule as Phase 3 and Phase 4: a recall (do the remembered facts actually reach
+the reply), one of the five grounding questions that used to draw invented
+answers, and a barge-in mid-reply, since the streamed path is wired too.
+Phase 2's *voice* half (ElevenLabs) is untouched, and `TTS_ENGINE`'s
+`"elevenlabs"` is still a placeholder.
 
 **Phase 3 — a reply you can interrupt — closed on 2026-09-27**, built out of
 order on `feature/streaming-interrupt` and merged to `master` when it closed.
@@ -111,8 +193,9 @@ voice model downloaded into `models/`. Enter at the prompt to record, `exit`/`qu
 2. **Speech-to-text** — same file, transcribes with `faster_whisper`
    (`WHISPER_MODEL` from `.env`, default `"small"`; CPU, int8,
    `language="el"`).
-3. **LLM reply** — `jarvis/brain.py` sends the running chat history to a
-   local Ollama model with a system prompt asking for short,
+3. **LLM reply** — `jarvis/brain.py` sends the running chat history to
+   whichever brain `BRAIN_PROVIDER` names — a local Ollama model by default,
+   or the Claude API — with a system prompt asking for short,
    natural-sounding replies (no markdown, no calling itself an AI unless
    asked) and refusing to invent the user's own facts (see "Grounding").
    The prompt doesn't say anything about which language to reply
@@ -138,9 +221,9 @@ only falling back to the brain when a skill doesn't match (see "Skills").
 - `jarvis/policy.py` — the `Skill`/`Permission` types, the permission gate,
   the kill switch, the audit log, and `python -m jarvis.policy` (also backing
   `:policy` at the prompt). See "Policy".
-- `jarvis/brain.py` — Ollama chat call + conversation history + system prompt.
-  `ask()` for a finished reply, `start_turn()` → `Turn` for a streamed one
-  (see "Streaming replies").
+- `jarvis/brain.py` — the brain call (Ollama or the Claude API, see
+  "Providers") + conversation history + system prompt. `ask()` for a finished
+  reply, `start_turn()` → `Turn` for a streamed one (see "Streaming replies").
 - `jarvis/chunker.py` — pure: cuts a token stream into pieces worth speaking.
 - `jarvis/speaker.py` — Edge/Piper synthesis, the speech lock, the
   audible-interval bookkeeping the capture gate reads, and `speak_stream()`,
@@ -203,9 +286,14 @@ only falling back to the brain when a skill doesn't match (see "Skills").
 
 ## Config
 
-All settings live in `.env` (copy from `.env.example`): `OLLAMA_MODEL`, `PIPER_MODEL_PATH`.
-The mic device name, record duration, and FFmpeg path are hardcoded constants at the
-top of `jarvis/listener.py`.
+All settings live in `.env` (copy from `.env.example`) and are read in one
+place, `jarvis/config.py`, each with a comment saying why its value is what it
+is. `ANTHROPIC_API_KEY` is the only secret among them: read from the
+environment, never printed, never written to `data/jarvis.log`, and only read at
+all when `BRAIN_PROVIDER=claude`.
+
+The mic device name and the FFmpeg path are hardcoded constants at the top of
+`jarvis/listener.py`.
 
 ## Providers
 
@@ -213,34 +301,77 @@ top of `jarvis/listener.py`.
 `BRAIN_PROVIDER` and `TTS_ENGINE` (both in `.env`, see `.env.example`).
 
 - Brain: `BRAIN_PROVIDER` selects from `_PROVIDERS` in `jarvis/brain.py`.
-  `"ollama"` (the default) and `"claude"` are both implemented; `"openai"` is
-  still a placeholder — adding it means a new function plus a new dict entry,
-  no other changes. An unknown value raises `ValueError` at import time
-  (startup), before the app's request-level error handling can swallow it.
-  `"claude"` sends the conversation to the real Anthropic API
-  (`ANTHROPIC_API_KEY`, `CLAUDE_MODEL`, default `claude-haiku-4-5-20251001`)
-  instead of the local model — real network, real cost per reply (see the
-  roadmap's budget plan), the one deliberate exception to "no cloud APIs, no
-  API keys". `BRAIN_PROVIDER=claude` with `ANTHROPIC_API_KEY` empty raises
-  `ValueError` at import time too, same reasoning as the unknown-provider
-  check it sits beside — a startup that will fail on the first turn should
-  fail before that. `_get_claude_client()` is a lazy singleton, same idiom as
-  `speaker._get_voice()`: the `anthropic` import is deferred so importing
-  `brain.py` stays cheap when `BRAIN_PROVIDER=ollama`. `_split_system()`
-  turns the flat Ollama-style message list (including the frozen-prefix
-  system messages and the transient memory-block one, see "Memory") into
-  Anthropic's separate `system` string plus a system-free `messages` list,
-  since Anthropic's API takes system as a top-level argument, not a
-  `"system"`-role message. Both `_ask_claude()` (non-streaming) and
-  `_stream_claude()` (streaming, registered in `_STREAM_PROVIDERS`) go
-  through it. `_stream_claude()` translates Anthropic's `stop_reason` vocabulary
-  (`end_turn`, `max_tokens`) to Ollama's (`stop`, `length`) before setting
-  `state["done_reason"]`, so `Turn.truncated` — which only ever checks for
-  `"length"` — stays provider-agnostic. `tests/test_brain_claude.py` pins
-  `_split_system`, both provider functions (including the max-tokens trim
-  behavior and the stop-reason translation) and the import-time guard, via
-  `importlib.reload()` the same way `tests/test_speaker_lazy.py` pins the
-  Piper lazy-load.
+  `"ollama"` (local) and `"claude"` (Anthropic's Messages API) are both
+  implemented; `"openai"` is a placeholder for later — adding it means a new
+  function plus a new dict entry, no other changes. An unknown value raises
+  `ValueError` at import time (startup), before the app's request-level error
+  handling can swallow it. **So does `BRAIN_PROVIDER=claude` with no
+  `ANTHROPIC_API_KEY`** (`_check_key()`), and for the same reason: a missing key
+  is one clear message at startup, where the alternative is a spoken «δεν μπορώ
+  να απαντήσω» once per question for the rest of the run.
+  The `anthropic` SDK is imported *lazily*, inside `_get_client()` — with
+  `BRAIN_PROVIDER=ollama` it is never needed, importing `brain` must stay cheap
+  (`skills.py` pulls it in transitively), and the test suite therefore runs on a
+  machine that has never installed it. Same lazy-singleton idiom as
+  `speaker._get_voice()`.
+
+### The Claude brain
+
+Four things about it are deliberate, and three of them are about *not* sending
+something.
+
+- **The message format is one pure function** (`_to_messages_api`). Ollama takes
+  a flat list with `system` messages anywhere in it; the Messages API takes a
+  top-level `system` and a `messages` list that may not carry the role at all —
+  a mid-conversation system message is an Opus 5 / 4.8 feature and a 400 on
+  Haiku 4.5. That is not an edge case here: it is exactly where
+  `_build_messages()` splices the recalled memory, on every turn that recalls
+  anything. So every system message is joined into `system` in order, the frozen
+  prompt first and the memory block after it — which is also where it belongs,
+  since `MEMORY_PREAMBLE` exists precisely to make recalled facts read as
+  background rather than as something the user just said. `_history` is never
+  touched, so `ask()` and `Turn`'s contract is unchanged and its tests pass
+  untouched.
+- **No `temperature`, no `thinking`, no `output_config`.** `CLAUDE_MODEL` is a
+  knob, and a request only valid for today's value of it is a trap:
+  `temperature` is rejected outright on Sonnet 5 and Opus 5, `effort` on Haiku
+  4.5, and an *absent* `thinking` means "none" on Haiku 4.5 but "adaptive" on
+  the 5-series — which a 120-token spoken reply has no latency budget for. The
+  prompt already asks for one or two short sentences, so the Ollama path's
+  `TEMPERATURE` has no twin here.
+- **The stop-reason vocabulary stays Ollama's, translated at this provider's
+  edge.** `Turn.truncated` reads `"length"`; the Messages API says
+  `"max_tokens"`. `_normalize_stop()` is the one line that keeps everything
+  downstream from knowing which brain answered, and `MAX_REPLY_TOKENS` (120)
+  carries over unchanged — same cap, same `_trim_to_last_sentence()` when it
+  bites.
+- **A transient failure falls back to Ollama; anything else raises.** This is
+  the roadmap's "keep qwen3:8b as an offline fallback"
+  (`CLAUDE_FALLBACK_OLLAMA`), and it is the same shape as Edge → Piper: the
+  fallback is literally the other provider function, called with the same
+  message list, and it is **announced on the terminal** the way «Edge TTS
+  απέτυχε …, χρήση Piper.» is. A fallback nobody is told about is a different
+  assistant answering under Claude's name.
+
+  Which failures, and why the line is drawn there (`_is_transient`): 408/409/429
+  and 5xx fall back, as do the SDK's connection and timeout errors. A 401, 403
+  or 400 **raises** — it will never fix itself, and answering from qwen3 anyway
+  would mean every reply quietly comes from the local model while you believe
+  you are talking to Claude. That is a wrong answer with nothing on the terminal
+  to show for it; a spoken error is the cheap direction. **Anything
+  unclassifiable raises too**, a bug of our own included. Classification is by
+  HTTP status plus the exception's module and class *name*, never by catching
+  `anthropic`'s classes — that is what lets this module classify an error
+  without importing the SDK, and the suite run without it installed.
+
+  **Streaming falls back only before the first delta.** Once a word has reached
+  the speakers there is no way to start over on the local model without saying
+  it twice, so a failure mid-reply stays a failure: `Turn` drops the turn and
+  `main._stream_reply()` speaks its error line, exactly as it already does when
+  Ollama dies mid-stream.
+
+`tests/test_brain_claude.py` pins all of it against a fake client. Nothing in
+the suite reaches the API, needs a key, or needs the SDK installed.
 - Voice: `TTS_ENGINE` selects from `_VOICE_PROVIDERS` in `jarvis/speaker.py`.
   Only `"edge"` is implemented there; `"piper"` (or any unrecognized value)
   isn't in the dict and is used directly as the always-available fallback.
@@ -854,7 +985,10 @@ carries an empty tuple for that reason: its real triggers are
 `memory.parse()`'s ladder, and listing a few here would be a fiction.
 
 Implemented, in the order `handle()` tries them: shutting Jarvis down; saving
-to memory and reading it back (both in "Memory" below); a spoken timer that
+to memory and reading it back (both in "Memory" below); running a web
+research and storing a structured summary (see "Research" — `research`
+carries an empty tuple too, for the same reason `memory_save` does:
+`memory.parse_research()` owns the real triggers); a spoken timer that
 announces itself when it fires (a `reminders` row now, see "Scheduler");
 current time / date;
 and opening a website (`SKILL_SITES` in `config.py`) or a local app
@@ -888,10 +1022,13 @@ the whole layer is testable without a microphone.
 
 **Deny by default.** `Skill.permission` defaults to `Permission.BLOCKED`, so
 a skill added later without naming a permission cannot run. An unrecognised
-permission value is blocked too. All seven registered skills are `SAFE` —
-none sends, deletes, spends or reaches outside the machine. The `CONFIRM`
-and `BLOCKED` paths are built and tested but carry no live skill yet; they
-are what Phase 7's file move/rename/delete plugs into.
+permission value is blocked too. Seven of the eight registered skills are
+`SAFE` — none of them sends, deletes, spends or reaches outside the machine.
+`research` (see "Research") is the first live `CONFIRM` skill: real network
+traffic with a real bill attached, so it is recognised and asked about before
+it runs rather than run on match the way a `SAFE` skill is. `BLOCKED` still
+carries no live skill; it is what Phase 7's file move/rename/delete plugs
+into.
 
 **A `CONFIRM` skill needs a `matches()` and a `confirm_prompt`.** The
 existing handlers answer "did you match?" by *doing the thing*, which is fine
@@ -1380,6 +1517,87 @@ Known boundary: the agenda is *dated* items only. A café note with no date
 is tagged `cafe` and found by keyword search, but «τι έχω σήμερα για τον
 καφέ» will not list it, because it is not on for today.
 
+### The weekly class schedule
+
+`class_schedule` is a different shape of table from every other one here:
+every other table's agenda entry is tied to a `due_date` (an exam) or a
+`due_at` (a reminder) — one specific calendar day. A class recurs every
+week on the same weekday, so the row has no date at all, only a `weekday`
+column (0-6, Python's `date.weekday()` convention — Δευτέρα=0 .. Κυριακή=6,
+the same convention `memory.WEEKDAYS`/`RE_DATE_WDAY` already use for spoken
+weekday names). `agenda()` matches it on `day.weekday()` instead of `day`
+itself, which is the whole reason this needed its own table rather than a
+column on `courses`: `courses` already exists and is dateless by design
+(a semester-long enrolment fact), and bolting a single weekday/time onto it
+would still only describe one weekly slot per course, when the real
+schedule needs day *and* time *and* room *and* professor together, and (a
+smaller point, but real) a course meeting three times a week needs three
+rows, not one.
+
+Columns: `course`, `weekday`, `start_time`, `end_time`, `room`,
+`professor`, `semester` — the last four nullable, since not every source
+lists all of them. `end_time`/`room`/`professor` are folded into one
+rendering, `memory.render_class()`, shared by `agenda()`, the
+`class_schedule` entry in `_SEARCHABLE`, and `mem._summarize()` (via
+`memory.WEEKDAY_NAMES`), so the three don't drift into three different
+phrasings of the same row.
+
+Wired into `agenda()` like any other table: tagged `university` by
+`_TABLE_TAGS` (the same implicit tag `courses`/`exams` get, whatever the
+row's own text says), searchable through the generic keyword path via
+`_TABLE_KEYWORDS["class_schedule"]` (`"μάθημα ωρολόγιο πρόγραμμα"`, the
+same idea as `courses`' own keyword entry — findable by the generic word
+even though the row's own text may never say it), and listed/shown/edited/
+deleted through `:mem ... class_schedule` like any other content table —
+`db.CONTENT_TABLES["class_schedule"] = "course"` is what makes that work.
+
+**Classes are listed first in an agenda, and time-ordered.** They anchor
+the shape of the day the way exams and reminders don't, so `agenda()`
+returns them before exams and reminders, each in `start_time` order —
+sorted in SQL (`ORDER BY start_time`), a plain string sort that works
+because every stored time is `HH:MM`, 24-hour, zero-padded. The spoken form
+(`skills._handle_agenda`) prefixes each with «μάθημα», the same way an exam
+is prefixed with «εξέταση»; the brain's memory block
+(`memory._due_today()`) does the same with «Σήμερα μάθημα: …».
+
+**No voice save trigger yet.** Unlike every other table here, there is no
+spoken «θυμήσου ότι έχω μάθημα Τρίτη στις 5» pattern that writes into
+`class_schedule` — the source of truth is the user's actual
+program-of-studies document, not something worth parsing out of speech with
+all the ambiguity `RE_COURSE_OF` already has to fight for `courses`. Rows
+are seeded, the way `tools/seed_courses_2026_2027_sem1.py` seeded `courses`:
+`tools/seed_class_schedule_2026_2027_sem1.py` builds a `Parsed` per row
+(`table="class_schedule"`) and calls `memory.save()`, so a seeded row gets
+the same tags/timestamps a real save would. `ROWS` there is 13 entries, from
+the user's real χειμερινό 2026-2027 (1ο εξάμηνο) schedule image — every one
+of the 7 seeded courses, but 13 rows because several meet more than once a
+week: Προγραμματισμός Η/Υ has one lecture plus three separate lab groups
+(Ομάδα Α/Α2/Α3, each its own time and mostly its own professor pairing),
+Υδατική Χημεία has a separate lecture and lab session, and Μαθηματικά
+Ι/Βιολογία - Οικολογία each meet twice a week as the same plain lecture.
+Keyed to idempotency on `(course, weekday, start_time)` rather than `id`,
+same idea as `seed_courses`' `(name, semester)`, so running the script twice
+adds nothing the second time.
+
+Two courses' schedule cells name no professor at all — Εισαγωγή στην
+Επιστήμη/Εισαγωγή στις Εργαστηριακές Πρακτικές, both nullable `professor`
+by design, not a transcription gap. Where a course's multiple weekly
+sessions would otherwise be indistinguishable in `class_schedule` (no
+column for lecture-vs-lab or lab group), that distinction is folded into
+`course` itself as a parenthetical (`"Προγραμματισμός Η/Υ (Ε, Ομάδα Α)"`)
+rather than left implicit in the room/time alone — the seed script's own
+docstring has the full reasoning and the room-code legend (Β1-Β7 = ΠΡΟΚΑΤ,
+ΥΚ = the department's Υπολογιστικό Κέντρο in Κιμμέρια).
+
+Run once, locally, to populate the real database:
+```
+.\.venv\Scripts\python.exe tools\seed_class_schedule_2026_2027_sem1.py
+```
+Run and hand-tested live on 2026-09-30: 13 rows seeded, then «Τι έχω
+σήμερα» (a Wednesday) and «Τι έχω αύριο» each answered correctly from the
+real database — right classes, right time order within the day, room and
+professor spoken along with each.
+
 ### Known gaps
 
 1. **Words under 5 characters don't stem.** `πόλη` → `πολι` is 4 characters;
@@ -1449,6 +1667,106 @@ concurrent writer) into `BACKUP_DIR` (`data/backups/`), keeping the newest
 Jarvis from starting, and on `:mem backup`. Filenames are microsecond-stamped
 so they are unique and sort chronologically — pruning deletes the oldest by
 name, and a coarser stamp let a pruned name be reused and overwritten.
+
+## Research
+
+Phase 5 steps 1-4 (see "Roadmap"): «κάνε έρευνα για …» runs several web
+searches on a topic through the Claude API and speaks back a structured
+summary, which is also kept as a dated `expertise` row so later questions can
+draw on it. Not yet hand-tested on live audio — built and unit-tested only.
+
+**Always the Claude API, whatever `BRAIN_PROVIDER` is set to.** Ollama has no
+way to reach the internet at all, so there is no local fallback the way
+`_ask_claude`/`_stream_claude` have one — `brain.research()` either reaches
+Anthropic or raises `ResearchUnavailable`, which the skill speaks verbatim. A
+missing `ANTHROPIC_API_KEY` is therefore a per-*call* refusal here, not the
+import-time failure `BRAIN_PROVIDER=claude` gets from `brain._check_key()`:
+research is opt-in on its own, independently of which brain answers ordinary
+questions, and `CLAUDE_RESEARCH_MODEL`/`RESEARCH_MAX_SEARCHES`/
+`RESEARCH_MAX_TOKENS` (`jarvis/config.py`) are its own knobs, defaulting to
+`CLAUDE_MODEL` rather than inventing a second model setting before there is a
+reason to tell them apart.
+
+**web_search is a server tool.** Anthropic runs the searches itself and feeds
+the results back inside the one `messages.create()` call
+(`tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses":
+RESEARCH_MAX_SEARCHES}]`) — there is no client-side tool-use loop for this
+process to drive, unlike a tool it would have to execute itself. `RESEARCH_
+SYSTEM_PROMPT` asks for the reply to be *only* the structured summary, but the
+model still writes "I'll search for..." text between search rounds, so
+`brain._final_text()` keeps only the text blocks *after* the last
+`web_search_tool_result` block — everything before that is thinking out loud
+about what to search next, not the finding. Falls back to every text block
+when there was no search at all, so a reply that never searched is still
+returned rather than silently dropped.
+
+**The trigger is parsed, not matched by substring**, the same shape as
+`memory.parse()`'s ladder but deliberately not part of it: research triggers
+an action (a real API call, a real charge) rather than filing a fact, so
+`memory.parse_research()` is its own pure function returning `(topic,
+is_refresh)` — `RE_RESEARCH` for «κάνε έρευνα για …» / «ερεύνησε …» / «ψάξε
+στο ίντερνετ για …», `RE_RESEARCH_REFRESH` for «ξανακάνε έρευνα για …» *and*
+«κάνε ξανά έρευνα για …», tried first. A live hand test asked for the second
+spelling and it fell through to the brain, because only the glued-word form
+was recognized; `RE_RESEARCH_REFRESH` now carries both as alternatives.
+Neither can be shadowed by `RE_RESEARCH` by accident, and not for the same
+reason: "ξανακάνε" is one word to the recognizer, so it never starts with
+"κανε" the way `RE_RESEARCH`'s anchor requires — the same non-overlap
+`RE_TRIGGER`'s rungs rely on — while "κάνε ξανά έρευνα" *does* start with
+"κανε", but `RE_RESEARCH`'s own alternative demands "ερευνα" immediately
+after it and "ξανά" sits in between, so it would refuse the string even if
+tried first. Checking refresh first is still what makes relying on that
+second argument unnecessary. The topic is read back through `Norm.group()`,
+verbatim (accents, capitals), for the same reason every other capture in
+`memory.py` is: `"το ΕΚΠΑ"` searches better than `"το εκπα"`.
+
+**The `expertise` table is keyed by topic, upserted, not appended.**
+`memory.save_expertise()` is the same shape as `save()`'s `profile` branch:
+`topic_key` (the topic alone, normalized) is `UNIQUE`, so researching a topic
+again — the refresh trigger — updates the row in place rather than piling up
+duplicate summaries, which is what "a stale topic can be redone on request"
+(the roadmap's wording for step 4) actually means. `norm` is built from
+*topic and summary together*, unlike `topic_key`, so a keyword search over a
+word that only appears inside the summary can still surface the row — wired
+into `memory._SEARCHABLE` (step 3), the same list `recall()`'s keyword hits
+and the spoken `memory_recall` skill already read. `db.CONTENT_TABLES` and
+`mem.py`'s `_summarize()`/`_refresh_norm()` all know about it too, so
+`:mem list/show/edit/del expertise` work like any other table — except
+`topic_key` is protected from direct edits (`mem._PROTECTED_COLUMNS`), since
+editing it by hand would desync it from `topic` and silently break the next
+upsert.
+
+**The upsert is keyed on the spoken topic, not on "the same subject" —
+known boundary, found live.** A refresh whose topic Whisper transcribes
+differently from the original request (different words, not just a
+different fold) gets a different `topic_key` and lands as a *second* row
+rather than updating the first, even though a person would call it the same
+topic. Measured live: «Ξανακάνε έρευνα για γυμναστήρια στην Ξάνθη» came back
+mangled as «...για γη μου να στείρει, ας την ξάνθει» — the refresh verb
+still matched (the comma survived via `_JOIN`), but the captured topic no
+longer normalizes to the same key as the original research, so it upserts
+into a row of its own instead of refreshing the gyms-in-Xanthi row. Nothing
+here can fix that from the trigger side — the topic *is* whatever was
+said — so it stays a known limit rather than a bug to close: re-asking in
+the same words is what makes a refresh land on the right row.
+
+**`research` is the first live `Permission.CONFIRM` skill** (see "Policy" —
+every other registered skill is `SAFE`). This is real network traffic with a
+real bill attached, unlike anything else in `SKILLS`, so `policy.dispatch()`
+only reaches `_handle_research()` once `RESEARCH_CONFIRM_PROMPT` ("Αυτό θα
+ψάξει στο διαδίκτυο και έχει κόστος. Να προχωρήσω;") has been answered yes —
+`_research_matches()` recognizes the trigger without acting, exactly what
+`Skill.matches` exists for. If the research itself succeeds but the database
+write fails, the finding is still spoken: losing the row is worse hidden than
+said out loud, since it was already paid for either way.
+
+`tests/test_research.py` pins all of it: the parser (including the refresh/
+plain non-overlap and the verbatim topic), the `expertise` upsert against a
+real temp database, `brain._final_text()`/`brain.research()` against a fake
+client (same idiom as `tests/test_brain_claude.py` — no key, no SDK, no
+network needed to run it), and the skill wired through `policy.dispatch()`'s
+CONFIRM gate end to end (confirmed, declined, no asker installed, the
+`ResearchUnavailable` and generic-error paths, and the audit row).
 
 ## Normalization
 
