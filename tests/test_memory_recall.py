@@ -133,6 +133,21 @@ class RecallContentTests(RecallTestCase):
     def test_empty_memory_yields_an_empty_block(self) -> None:
         self.assertEqual(memory.recall("οτιδήποτε", self.conn, NOW), "")
 
+    def test_a_class_schedule_row_is_found_by_keyword_search(self) -> None:
+        self.conn.execute(
+            "INSERT INTO class_schedule"
+            " (course, weekday, start_time, end_time, room, professor, norm,"
+            "  created_at, updated_at)"
+            " VALUES ('Υδατική Χημεία', 3, '15:15', '17:00', 'Β1', 'Παπαδόπουλος',"
+            "         ?, ?, ?)",
+            (memory.normalize("Υδατική Χημεία"), NOW.isoformat(), NOW.isoformat()),
+        )
+        self.conn.commit()
+
+        block = memory.recall("τι ώρα έχω χημεία", self.conn, NOW)
+        self.assertIn("Πέμπτη", block)
+        self.assertIn("15:15", block)
+
     def test_unrelated_query_returns_no_keyword_hits(self) -> None:
         self._save("Θυμήσου ότι το συνέδριο ήταν βαρετό")
         block = memory.recall("τι θυμάσαι για τη Νορβηγία", self.conn, NOW)

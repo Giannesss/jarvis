@@ -219,6 +219,8 @@ def _summarize(table: str, row: sqlite3.Row) -> str:
         return f"{row['name']}" + (f" ({row['semester']})" if row["semester"] else "")
     if table == "expertise":
         return f"{row['topic']}: {row['summary']}"
+    if table == "class_schedule":
+        return f"{memory.WEEKDAY_NAMES[row['weekday']]} {memory.render_class(row)}"
     return str(row[db.CONTENT_TABLES.get(table, "id")])
 
 

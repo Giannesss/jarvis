@@ -571,7 +571,17 @@ def parse_research(text: str) -> tuple[str, bool] | None:
 _TABLE_KEYWORDS = {
     "businesses": "επιχειρηση μαγαζι εταιρεια καταστημα",
     "courses": "μαθημα εξαμηνο",
+    "class_schedule": "μαθημα ωρολογιο προγραμμα",
 }
+
+# Greek weekday names, indexed by Python's date.weekday() (Δευτέρα=0 ..
+# Κυριακή=6) -- the same convention class_schedule.weekday is stored in and
+# WEEKDAYS above already maps spoken names to. Used to render a schedule row
+# back into speech (agenda(), _SEARCHABLE) and shared with mem.py so the CLI
+# renders the same way.
+WEEKDAY_NAMES = (
+    "Δευτέρα", "Τρίτη", "Τετάρτη", "Πέμπτη", "Παρασκευή", "Σάββατο", "Κυριακή",
+)
 
 
 # --- Tags ------------------------------------------------------------------
@@ -602,6 +612,7 @@ _TABLE_TAGS = {
     "courses": "university",
     "exams": "university",
     "businesses": "business",
+    "class_schedule": "university",
 }
 
 # Stored comma-delimited *and* comma-terminated: ",cafe,university,". The
@@ -1209,6 +1220,12 @@ def spoken_profile(conn: sqlite3.Connection) -> str:
 _STATUS_SUFFIX = {"fired": " (έγινε)", "missed": " (χάθηκε)"}
 
 
+def render_class(row: sqlite3.Row) -> str:
+    when = row["start_time"] + (f"-{row['end_time']}" if row["end_time"] else "")
+    extra = ", ".join(part for part in (row["room"], row["professor"]) if part)
+    return f"{row['course']} {when}" + (f" ({extra})" if extra else "")
+
+
 def agenda(
     conn: sqlite3.Connection, day: date, tag: str | None = None
 ) -> list[tuple[str, str]]:
@@ -1222,10 +1239,19 @@ def agenda(
     marked. The question is what the day holds, not what is still queued --
     and since the scheduler began claiming rows, filtering on `pending` would
     make a 9am reminder invisible by 10am.
+
+    class_schedule is different from the other tables here: it has no date at
+    all, only a weekday that recurs every week, so it is matched on
+    `day.weekday()` rather than on `day` itself -- the same convention
+    WEEKDAYS/date.weekday() already share (see CLAUDE.md "Roadmap").
+    Ordered by start_time and listed first, since a class day's classes are
+    what the rest of the day is arranged around.
     """
     stamp = day.isoformat()
     items: list[tuple[str, str]] = []
 
+    class_sql = "SELECT course, start_time, end_time, room, professor FROM class_schedule WHERE weekday = ?"
+    class_params: list = [day.weekday()]
     exam_sql = "SELECT course, topic FROM exams WHERE due_date = ?"
     exam_params: list = [stamp]
     reminder_sql = "SELECT text, status FROM reminders WHERE due_at LIKE ?"
@@ -1234,10 +1260,17 @@ def agenda(
     if tag:
         # The sentinels in tag_like() are what keep this from matching a tag
         # that merely contains the one asked for.
+        class_sql += " AND tags LIKE ?"
+        class_params.append(tag_like(tag))
         exam_sql += " AND tags LIKE ?"
         exam_params.append(tag_like(tag))
         reminder_sql += " AND tags LIKE ?"
         reminder_params.append(tag_like(tag))
+
+    class_sql += " ORDER BY start_time"
+
+    for row in conn.execute(class_sql, class_params):
+        items.append(("class", render_class(row)))
 
     for row in conn.execute(exam_sql, exam_params):
         topic = f" ({row['topic']})" if row["topic"] else ""
@@ -1251,10 +1284,13 @@ def agenda(
     return items
 
 
+_AGENDA_LABELS = {"exam": "Σήμερα εξέταση", "class": "Σήμερα μάθημα"}
+
+
 def _due_today(conn: sqlite3.Connection, now: datetime) -> list[str]:
     """Today's agenda, rendered for the brain's memory block."""
     return [
-        f"Σήμερα εξέταση: {text}" if kind == "exam" else f"Σήμερα: {text}"
+        f"{_AGENDA_LABELS.get(kind, 'Σήμερα')}: {text}"
         for kind, text in agenda(conn, now.date())
     ]
 
@@ -1273,6 +1309,10 @@ _SEARCHABLE = (
      lambda r: f"Υπενθύμιση {r['due_at'][:10]}: {r['text']}"),
     ("expertise", "SELECT id, topic, summary, created_at FROM expertise WHERE norm LIKE ?",
      lambda r: f"Έρευνα για {r['topic']}: {r['summary']}"),
+    ("class_schedule",
+     "SELECT id, course, weekday, start_time, end_time, room, professor,"
+     " created_at FROM class_schedule WHERE norm LIKE ?",
+     lambda r: f"Μάθημα: {WEEKDAY_NAMES[r['weekday']]} {render_class(r)}"),
 )
 
 

@@ -151,9 +151,35 @@ CREATE TABLE IF NOT EXISTS expertise (
     tags       TEXT
 );
 
+-- The weekly recurring class timetable the roadmap flagged as a separate
+-- feature (see CLAUDE.md "Roadmap"): a course meeting that recurs every week
+-- on the same weekday is a different shape of data from `exams`/`reminders`,
+-- which are single dated events -- so it gets its own table rather than a
+-- column bolted onto `courses`. weekday follows Python's date.weekday()
+-- convention (Δευτέρα=0 .. Κυριακή=6), the same convention
+-- memory.WEEKDAYS/RE_DATE_WDAY already use for spoken weekday names, so a
+-- row's weekday compares directly against date.weekday() with no translation
+-- at the query site. end_time/room/professor/semester are nullable -- not
+-- every source lists all of them.
+CREATE TABLE IF NOT EXISTS class_schedule (
+    id         INTEGER PRIMARY KEY,
+    course     TEXT NOT NULL,
+    weekday    INTEGER NOT NULL,
+    start_time TEXT NOT NULL,
+    end_time   TEXT,
+    room       TEXT,
+    professor  TEXT,
+    semester   TEXT,
+    norm       TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    tags       TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders (status, due_at);
 CREATE INDEX IF NOT EXISTS idx_exams_due ON exams (due_date);
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit (ts);
+CREATE INDEX IF NOT EXISTS idx_class_schedule_weekday ON class_schedule (weekday);
 """
 
 # Tables the CLI and recall are allowed to touch, and the column holding each
@@ -168,6 +194,7 @@ CONTENT_TABLES = {
     "businesses": "note",
     "reminders": "text",
     "expertise": "summary",
+    "class_schedule": "course",
 }
 
 

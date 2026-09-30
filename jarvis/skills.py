@@ -299,7 +299,10 @@ def _handle_agenda(raw_text: str) -> str | None:
         return f"Δεν έχεις τίποτα {day_word.lower()}."
 
     spoken = [
-        f"εξέταση {value}" if kind == "exam" else value for kind, value in items
+        f"εξέταση {value}" if kind == "exam"
+        else f"μάθημα {value}" if kind == "class"
+        else value
+        for kind, value in items
     ]
     return f"{day_word} έχεις: {', '.join(spoken)}."
 

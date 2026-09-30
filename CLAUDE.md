@@ -64,9 +64,12 @@ business descriptions are still to come, as the user sends them.
 That schedule also carries day/time/room/professor detail the `courses`
 table has no columns for — a weekly recurring timetable is a different
 shape of data from the single-dated `exams`/`reminders` the agenda already
-handles, and isn't captured yet. Flagged to the user rather than dropped or
-silently bolted on; picking it up is a real feature (a new table plus
-agenda wiring), not a data-entry task, so it waits for a decision to do it.
+handles. Flagged to the user rather than dropped or silently bolted on when
+the course list was first seeded; the decision came back yes, and the
+feature itself — a new `class_schedule` table plus agenda wiring — is now
+built (code, not yet real data). See "The weekly class schedule" under
+"Memory". Still to come: the actual day/time/room/professor rows from the
+user's program-of-studies schedule.
 
 Untested by design, not by oversight: this is real network traffic with a real
 bill attached (`$10`/1000 searches plus tokens), so it is the first live
@@ -1508,6 +1511,62 @@ That is the loose end the scheduler left, closed here.
 Known boundary: the agenda is *dated* items only. A café note with no date
 is tagged `cafe` and found by keyword search, but «τι έχω σήμερα για τον
 καφέ» will not list it, because it is not on for today.
+
+### The weekly class schedule
+
+`class_schedule` is a different shape of table from every other one here:
+every other table's agenda entry is tied to a `due_date` (an exam) or a
+`due_at` (a reminder) — one specific calendar day. A class recurs every
+week on the same weekday, so the row has no date at all, only a `weekday`
+column (0-6, Python's `date.weekday()` convention — Δευτέρα=0 .. Κυριακή=6,
+the same convention `memory.WEEKDAYS`/`RE_DATE_WDAY` already use for spoken
+weekday names). `agenda()` matches it on `day.weekday()` instead of `day`
+itself, which is the whole reason this needed its own table rather than a
+column on `courses`: `courses` already exists and is dateless by design
+(a semester-long enrolment fact), and bolting a single weekday/time onto it
+would still only describe one weekly slot per course, when the real
+schedule needs day *and* time *and* room *and* professor together, and (a
+smaller point, but real) a course meeting three times a week needs three
+rows, not one.
+
+Columns: `course`, `weekday`, `start_time`, `end_time`, `room`,
+`professor`, `semester` — the last four nullable, since not every source
+lists all of them. `end_time`/`room`/`professor` are folded into one
+rendering, `memory.render_class()`, shared by `agenda()`, the
+`class_schedule` entry in `_SEARCHABLE`, and `mem._summarize()` (via
+`memory.WEEKDAY_NAMES`), so the three don't drift into three different
+phrasings of the same row.
+
+Wired into `agenda()` like any other table: tagged `university` by
+`_TABLE_TAGS` (the same implicit tag `courses`/`exams` get, whatever the
+row's own text says), searchable through the generic keyword path via
+`_TABLE_KEYWORDS["class_schedule"]` (`"μάθημα ωρολόγιο πρόγραμμα"`, the
+same idea as `courses`' own keyword entry — findable by the generic word
+even though the row's own text may never say it), and listed/shown/edited/
+deleted through `:mem ... class_schedule` like any other content table —
+`db.CONTENT_TABLES["class_schedule"] = "course"` is what makes that work.
+
+**Classes are listed first in an agenda, and time-ordered.** They anchor
+the shape of the day the way exams and reminders don't, so `agenda()`
+returns them before exams and reminders, each in `start_time` order —
+sorted in SQL (`ORDER BY start_time`), a plain string sort that works
+because every stored time is `HH:MM`, 24-hour, zero-padded. The spoken form
+(`skills._handle_agenda`) prefixes each with «μάθημα», the same way an exam
+is prefixed with «εξέταση»; the brain's memory block
+(`memory._due_today()`) does the same with «Σήμερα μάθημα: …».
+
+**No voice save trigger yet.** Unlike every other table here, there is no
+spoken «θυμήσου ότι έχω μάθημα Τρίτη στις 5» pattern that writes into
+`class_schedule` — the source of truth is the user's actual
+program-of-studies document, not something worth parsing out of speech with
+all the ambiguity `RE_COURSE_OF` already has to fight for `courses`. Rows
+are meant to be seeded once, the way
+`tools/seed_courses_2026_2027_sem1.py` seeded `courses`: build a `Parsed`
+per row (`table="class_schedule"`, `fields` matching the columns above plus
+`norm`) and call `memory.save()`, so a seeded row gets the same
+tags/timestamps a real save would. No such seed tool exists yet, because
+the actual day/time/room/professor data hasn't been provided — this is the
+code half of the feature the roadmap flagged; the data is still to come.
 
 ### Known gaps
 

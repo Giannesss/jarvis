@@ -46,6 +46,18 @@ class MemCliTestCase(unittest.TestCase):
         parsed = memory.Parsed("notes", {"text": text, "norm": memory.normalize(text)})
         return memory.save(parsed, self.conn)
 
+    def seed_class(
+        self, course: str = "Μαθηματικά Ι", weekday: int = 3, start: str = "08:15",
+    ) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO class_schedule"
+            " (course, weekday, start_time, norm, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, '2026-09-01', '2026-09-01')",
+            (course, weekday, start, memory.normalize(course)),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
 
 class ListShowTests(MemCliTestCase):
     def test_list_one_table(self) -> None:
@@ -70,6 +82,13 @@ class ListShowTests(MemCliTestCase):
     def test_unknown_table_is_rejected(self) -> None:
         # argparse choices keep `:mem del schema_version 1` from being a thing.
         self.assertNotEqual(self.run_cmd("list", "schema_version"), 0)
+
+    def test_a_class_row_lists_with_its_weekday_and_time(self) -> None:
+        self.seed_class("Μαθηματικά Ι", 3, "08:15")
+        self.assertEqual(self.run_cmd("list", "class_schedule"), 0)
+        self.assertIn("Πέμπτη", self.output)
+        self.assertIn("Μαθηματικά Ι", self.output)
+        self.assertIn("08:15", self.output)
 
 
 class EditTests(MemCliTestCase):
