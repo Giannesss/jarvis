@@ -66,10 +66,13 @@ table has no columns for — a weekly recurring timetable is a different
 shape of data from the single-dated `exams`/`reminders` the agenda already
 handles. Flagged to the user rather than dropped or silently bolted on when
 the course list was first seeded; the decision came back yes, and the
-feature itself — a new `class_schedule` table plus agenda wiring — is now
-built (code, not yet real data). See "The weekly class schedule" under
-"Memory". Still to come: the actual day/time/room/professor rows from the
-user's program-of-studies schedule.
+feature — a new `class_schedule` table, agenda wiring, and now
+`tools/seed_class_schedule_2026_2027_sem1.py` carrying the real 13-row
+weekly timetable off the user's own schedule image — is built end to end.
+See "The weekly class schedule" under
+"Memory". Still to come, per the roadmap's own hand-test rule: running the
+seed script against the real database and confirming «τι έχω σήμερα»/
+«αύριο» actually speaks a class back on live audio, not just in tests.
 
 Untested by design, not by oversight: this is real network traffic with a real
 bill attached (`$10`/1000 searches plus tokens), so it is the first live
@@ -1560,13 +1563,34 @@ spoken «θυμήσου ότι έχω μάθημα Τρίτη στις 5» patte
 `class_schedule` — the source of truth is the user's actual
 program-of-studies document, not something worth parsing out of speech with
 all the ambiguity `RE_COURSE_OF` already has to fight for `courses`. Rows
-are meant to be seeded once, the way
-`tools/seed_courses_2026_2027_sem1.py` seeded `courses`: build a `Parsed`
-per row (`table="class_schedule"`, `fields` matching the columns above plus
-`norm`) and call `memory.save()`, so a seeded row gets the same
-tags/timestamps a real save would. No such seed tool exists yet, because
-the actual day/time/room/professor data hasn't been provided — this is the
-code half of the feature the roadmap flagged; the data is still to come.
+are seeded, the way `tools/seed_courses_2026_2027_sem1.py` seeded `courses`:
+`tools/seed_class_schedule_2026_2027_sem1.py` builds a `Parsed` per row
+(`table="class_schedule"`) and calls `memory.save()`, so a seeded row gets
+the same tags/timestamps a real save would. `ROWS` there is 13 entries, from
+the user's real χειμερινό 2026-2027 (1ο εξάμηνο) schedule image — every one
+of the 7 seeded courses, but 13 rows because several meet more than once a
+week: Προγραμματισμός Η/Υ has one lecture plus three separate lab groups
+(Ομάδα Α/Α2/Α3, each its own time and mostly its own professor pairing),
+Υδατική Χημεία has a separate lecture and lab session, and Μαθηματικά
+Ι/Βιολογία - Οικολογία each meet twice a week as the same plain lecture.
+Keyed to idempotency on `(course, weekday, start_time)` rather than `id`,
+same idea as `seed_courses`' `(name, semester)`, so running the script twice
+adds nothing the second time.
+
+Two courses' schedule cells name no professor at all — Εισαγωγή στην
+Επιστήμη/Εισαγωγή στις Εργαστηριακές Πρακτικές, both nullable `professor`
+by design, not a transcription gap. Where a course's multiple weekly
+sessions would otherwise be indistinguishable in `class_schedule` (no
+column for lecture-vs-lab or lab group), that distinction is folded into
+`course` itself as a parenthetical (`"Προγραμματισμός Η/Υ (Ε, Ομάδα Α)"`)
+rather than left implicit in the room/time alone — the seed script's own
+docstring has the full reasoning and the room-code legend (Β1-Β7 = ΠΡΟΚΑΤ,
+ΥΚ = the department's Υπολογιστικό Κέντρο in Κιμμέρια).
+
+Run once, locally, to populate the real database:
+```
+.\.venv\Scripts\python.exe tools\seed_class_schedule_2026_2027_sem1.py
+```
 
 ### Known gaps
 
