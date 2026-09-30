@@ -82,20 +82,24 @@ bill attached (`$10`/1000 searches plus tokens), so it is the first live
 own hand-test rule applies before it counts as closed, the same as Phase 3 and
 Phase 4 before it.
 
-**The first two of the three live tests have now run; the third (recall)
-has not.** «Κάνε έρευνα για γυμναστήρια στην Ξάνθη», confirmed with a bare
-«Ναι», came back through `brain.research()` with a real, well-formed Greek
-summary (five short sentences, no list formatting) about actual gyms in
-Ξάνθη — the CONFIRM gate, the server-side `web_search` tool and
-`_final_text()`'s preamble-stripping are all confirmed live. The refresh
-trigger also fired, but exposed the "same words, not same subject" upsert
-boundary written up under "Research" — a genuine limit, not a bug. The
-hand test also found one real gap, now fixed: «Κάνε ξανά έρευνα για …» (verb,
-"again", "research", in that order) didn't match either pattern and fell
-through to the brain, because only «ξανακάνε έρευνα» (the two glued into one
-recognized word) was recognized; `RE_RESEARCH_REFRESH` now accepts both.
-Still outstanding: asking a later, unrelated-sounding question to see
-whether `memory.recall()` actually surfaces the researched topic.
+**All three live tests have now run.** «Κάνε έρευνα για γυμναστήρια στην
+Ξάνθη», confirmed with a bare «Ναι», came back through `brain.research()`
+with a real, well-formed Greek summary (five short sentences, no list
+formatting) about actual gyms in Ξάνθη — the CONFIRM gate, the server-side
+`web_search` tool and `_final_text()`'s preamble-stripping are all confirmed
+live. The refresh trigger also fired, but exposed the "same words, not same
+subject" upsert boundary written up under "Research" — a genuine limit, not
+a bug. The hand test also found one real gap, now fixed: «Κάνε ξανά έρευνα
+για …» (verb, "again", "research", in that order) didn't match either
+pattern and fell through to the brain, because only «ξανακάνε έρευνα» (the
+two glued into one recognized word) was recognized; `RE_RESEARCH_REFRESH`
+now accepts both. The third test — asking a later, unrelated-sounding
+question to see whether `memory.recall()` actually surfaces the researched
+topic — has now run too: «Τι θυμάσαι για γυμναστήρια;», with no mention of
+Ξάνθη, matched the local `memory_recall` skill (not even the brain) and
+spoke the full stored `expertise` summary back verbatim. Confirms the row
+written by step 2 and the keyword search wired in step 3 both work end to
+end on a real question, not just against a temp database in the test suite.
 
 **Phase 2's brain half — the Claude API as a real `BRAIN_PROVIDER` — is built,
 out of order, because Phase 5 needs it.** Three of the roadmap's five steps for
@@ -107,16 +111,21 @@ own pick, and the model with the fewest surprises for a ≤120-token spoken repl
 See "Providers" for the rules; `tests/test_brain_claude.py` pins them against a
 fake client.
 
-**Partly hand-tested on live audio; not yet closed.** A plain general-knowledge
-question («Πες μου μερικά πράγματα για την Αθήνα») and a follow-up both came
-back through `[timing] Claude stream: ...` (not Ollama), streamed normally,
-with a correct answer and a sensible first-token time (0.6–2.7s) — so the
-wiring itself, end to end, is confirmed live. Still outstanding, per the same
-rule as Phase 3 and Phase 4: a recall (do the remembered facts actually reach
-the reply), one of the five grounding questions that used to draw invented
-answers, and a barge-in mid-reply, since the streamed path is wired too.
-Phase 2's *voice* half (ElevenLabs) is untouched, and `TTS_ENGINE`'s
-`"elevenlabs"` is still a placeholder.
+**Hand-tested on live audio; one debt left before it closes.** A plain
+general-knowledge question («Πες μου μερικά πράγματα για την Αθήνα») and a
+follow-up both came back through `[timing] Claude stream: ...` (not Ollama),
+streamed normally, with a correct answer and a sensible first-token time
+(0.6–2.7s) — so the wiring itself, end to end, is confirmed live. Two of the
+three remaining debts are now settled too: a recall («Πώς με λένε;» answered
+«Σε λένε Γιάννη.» from the recalled memory block, not invented) and one of
+the five grounding questions that used to draw invented answers («Πες μου
+για τη ζωή μου πριν τρία χρόνια» answered «Δεν ξέρω τι συνέβη στη ζωή σου
+πριν τρία χρόνια, δεν μου το έχεις πει.» — flat refusal, nothing made up).
+Still outstanding, per the same rule as Phase 3 and Phase 4: a barge-in
+mid-reply on the streamed Claude path specifically (barge-in itself is
+closed from Phase 3, but never against this provider). Phase 2's *voice*
+half (ElevenLabs) is untouched, and `TTS_ENGINE`'s `"elevenlabs"` is still a
+placeholder.
 
 **Phase 3 — a reply you can interrupt — closed on 2026-09-27**, built out of
 order on `feature/streaming-interrupt` and merged to `master` when it closed.
