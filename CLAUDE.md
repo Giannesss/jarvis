@@ -68,11 +68,13 @@ handles. Flagged to the user rather than dropped or silently bolted on when
 the course list was first seeded; the decision came back yes, and the
 feature — a new `class_schedule` table, agenda wiring, and now
 `tools/seed_class_schedule_2026_2027_sem1.py` carrying the real 13-row
-weekly timetable off the user's own schedule image — is built end to end.
-See "The weekly class schedule" under
-"Memory". Still to come, per the roadmap's own hand-test rule: running the
-seed script against the real database and confirming «τι έχω σήμερα»/
-«αύριο» actually speaks a class back on live audio, not just in tests.
+weekly timetable off the user's own schedule image — is built and closed,
+seed script and live hand-test both done. See "The weekly class schedule"
+under "Memory". «Τι έχω σήμερα» (a Wednesday) and «Τι έχω αύριο» each spoke
+back the right classes, in the right time order, room and professor
+included, against the real database — matching Thursday's Μαθηματικά
+Ι/Υδατική Χημεία/Φυσική Ατμόσφαιρας the user had described live before this
+table existed.
 
 Untested by design, not by oversight: this is real network traffic with a real
 bill attached (`$10`/1000 searches plus tokens), so it is the first live
@@ -1591,6 +1593,10 @@ Run once, locally, to populate the real database:
 ```
 .\.venv\Scripts\python.exe tools\seed_class_schedule_2026_2027_sem1.py
 ```
+Run and hand-tested live on 2026-09-30: 13 rows seeded, then «Τι έχω
+σήμερα» (a Wednesday) and «Τι έχω αύριο» each answered correctly from the
+real database — right classes, right time order within the day, room and
+professor spoken along with each.
 
 ### Known gaps
 
