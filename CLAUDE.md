@@ -111,21 +111,25 @@ own pick, and the model with the fewest surprises for a ≤120-token spoken repl
 See "Providers" for the rules; `tests/test_brain_claude.py` pins them against a
 fake client.
 
-**Hand-tested on live audio; one debt left before it closes.** A plain
-general-knowledge question («Πες μου μερικά πράγματα για την Αθήνα») and a
-follow-up both came back through `[timing] Claude stream: ...` (not Ollama),
-streamed normally, with a correct answer and a sensible first-token time
-(0.6–2.7s) — so the wiring itself, end to end, is confirmed live. Two of the
-three remaining debts are now settled too: a recall («Πώς με λένε;» answered
-«Σε λένε Γιάννη.» from the recalled memory block, not invented) and one of
-the five grounding questions that used to draw invented answers («Πες μου
-για τη ζωή μου πριν τρία χρόνια» answered «Δεν ξέρω τι συνέβη στη ζωή σου
-πριν τρία χρόνια, δεν μου το έχεις πει.» — flat refusal, nothing made up).
-Still outstanding, per the same rule as Phase 3 and Phase 4: a barge-in
-mid-reply on the streamed Claude path specifically (barge-in itself is
-closed from Phase 3, but never against this provider). Phase 2's *voice*
-half (ElevenLabs) is untouched, and `TTS_ENGINE`'s `"elevenlabs"` is still a
-placeholder.
+**Phase 2's brain half closed on 2026-09-30.** All four live-audio debts the
+roadmap's hand-test rule demanded are now settled. A plain general-knowledge
+question («Πες μου μερικά πράγματα για την Αθήνα») and a follow-up both came
+back through `[timing] Claude stream: ...` (not Ollama), streamed normally,
+with a correct answer and a sensible first-token time (0.6–2.7s) — the
+wiring itself, end to end. A recall («Πώς με λένε;» answered «Σε λένε
+Γιάννη.» from the recalled memory block, not invented). A grounding question
+of the five that used to draw invented answers («Πες μου για τη ζωή μου πριν
+τρία χρόνια» answered «Δεν ξέρω τι συνέβη στη ζωή σου πριν τρία χρόνια, δεν
+μου το έχεις πει.» — flat refusal, nothing made up). And a barge-in
+mid-reply on the streamed Claude path specifically (barge-in itself closed
+already from Phase 3, but never before tried against this provider): asked
+about the Β' Παγκόσμιος Πόλεμος, talked over Jarvis mid-sentence, and
+`[barge] fired at 38.72s: 22.7 dB over a -46.3 dB floor (margin 9.0 dB)` cut
+the reply off at 7.89s of the 9.60s it would have played, kept 23 pre-roll
+frames, and the next turn recorded normally — same behaviour as the Ollama
+path, now confirmed on this one too. Phase 2's *voice* half (ElevenLabs) is
+still untouched and out of scope for this closure; `TTS_ENGINE`'s
+`"elevenlabs"` is still a placeholder.
 
 **Phase 3 — a reply you can interrupt — closed on 2026-09-27**, built out of
 order on `feature/streaming-interrupt` and merged to `master` when it closed.
