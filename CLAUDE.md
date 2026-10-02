@@ -1749,19 +1749,31 @@ and the spoken `memory_recall` skill already read. `db.CONTENT_TABLES` and
 editing it by hand would desync it from `topic` and silently break the next
 upsert.
 
-**The upsert is keyed on the spoken topic, not on "the same subject" —
-known boundary, found live.** A refresh whose topic Whisper transcribes
-differently from the original request (different words, not just a
-different fold) gets a different `topic_key` and lands as a *second* row
-rather than updating the first, even though a person would call it the same
-topic. Measured live: «Ξανακάνε έρευνα για γυμναστήρια στην Ξάνθη» came back
-mangled as «...για γη μου να στείρει, ας την ξάνθει» — the refresh verb
-still matched (the comma survived via `_JOIN`), but the captured topic no
-longer normalizes to the same key as the original research, so it upserts
-into a row of its own instead of refreshing the gyms-in-Xanthi row. Nothing
-here can fix that from the trigger side — the topic *is* whatever was
-said — so it stays a known limit rather than a bug to close: re-asking in
-the same words is what makes a refresh land on the right row.
+**The upsert used to be keyed on the exact spoken topic, not "the same
+subject" — now softened for the refresh path only.** A refresh whose topic
+Whisper transcribes differently from the original request (different
+words, not just a different fold) gets a different `topic_key` under a
+plain upsert and lands as a *second* row rather than updating the first,
+even though a person would call it the same topic. Measured live:
+«Ξανακάνε έρευνα για γυμναστήρια στην Ξάνθη» came back mangled as «...για γη
+μου να στείρει, ας την ξάνθει» — the refresh verb still matched (the comma
+survived via `_JOIN`), but the captured topic no longer normalized to the
+same key as the original research. Nothing on the trigger side can fix
+this — the topic *is* whatever was said — so `memory.find_similar_expertise()`
+fixes it on the storage side instead, consulted only when `_handle_research()`
+already knows it's a refresh (never on a first-time «κάνε έρευνα», where a
+wrong merge would silently overwrite an unrelated topic's summary — worse
+than the duplicate row this was living with). Same two-part shape as the
+kill switch's fuzzy rungs: a generous half — `stems_of()`, the same stemmer
+`search()`'s keyword hits already use, so mangled words around the real
+content are tolerated — and a guard that must independently confirm it:
+the shared stems must cover at least half of the *existing* row's own
+stems, so one incidental shared word against a longer, unrelated topic
+can't pass, and two candidates tying for best score refuse rather than
+guess which one was meant. Re-run against the exact live transcription
+above (now `FindSimilarExpertiseTests.test_the_live_boundary_case_now_matches`):
+matches, on the strength of «ξάνθει» folding to the same stem as «Ξάνθη»
+surviving as half of the original row's two content stems.
 
 **`research` is the first live `Permission.CONFIRM` skill** (see "Policy" —
 every other registered skill is `SAFE`). This is real network traffic with a

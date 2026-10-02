@@ -366,6 +366,26 @@ def _handle_research(raw_text: str) -> str | None:
         print(f"Σφάλμα έρευνας: {e}")
         return "Δεν μπόρεσα να κάνω την έρευνα τώρα."
 
+    # On a refresh, the spoken topic may be a mangled transcription of the
+    # original request -- see CLAUDE.md "Research", "the upsert is keyed on
+    # the spoken topic, not on 'the same subject'". A fuzzy match against
+    # what is already stored finds the row the user actually meant to
+    # refresh, so the reply (and the upsert) uses its clean, original topic
+    # text rather than whatever Whisper just produced. Never attempted on a
+    # first-time request: a wrong merge there would silently overwrite an
+    # unrelated topic's summary.
+    if is_refresh:
+        try:
+            conn = db.connect()
+            try:
+                match = memory.find_similar_expertise(topic, conn)
+            finally:
+                conn.close()
+        except Exception:
+            match = None
+        if match is not None:
+            topic = match["topic"]
+
     try:
         conn = db.connect()
         try:

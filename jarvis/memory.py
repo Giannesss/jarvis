@@ -1034,6 +1034,58 @@ def get_expertise(topic: str, conn: sqlite3.Connection) -> sqlite3.Row | None:
     ).fetchone()
 
 
+def find_similar_expertise(topic: str, conn: sqlite3.Connection) -> sqlite3.Row | None:
+    """Best-effort reuse for the "same words, not same subject" upsert
+    boundary documented in CLAUDE.md "Research": a refresh whose topic
+    Whisper transcribes differently from the original request (not just a
+    different fold) gets a different topic_key under plain upsert and lands
+    as a duplicate row, even though a person would call it the same topic.
+    Only the research skill's refresh path calls this -- a first-time «κάνε
+    έρευνα για...» never merges into an existing row, since a wrong merge
+    here silently overwrites an unrelated topic's summary, which is worse
+    than the duplicate row this was already living with.
+
+    The match style is the same shape as the kill switch's fuzzy rungs (see
+    "Policy"): one generous half and one guard that must independently
+    confirm it, rather than a single tuned number. The generous half is
+    `stems_of()` -- the same stemmer `search()`'s keyword hits already use,
+    so punctuation, inflection and stray mangled words around the real
+    content are tolerated the same way a keyword search already tolerates
+    them. The guard is coverage, not overlap size: the shared stems must
+    account for at least half of the EXISTING row's own stems, so one
+    incidental shared word against a longer, unrelated topic can't pass --
+    a single place name surviving transcription is real evidence when the
+    existing topic is mostly that place name, and weak evidence when it is
+    one word out of many. Several rows tying for the best score is refused
+    outright: merging into the wrong one of several candidates is worse
+    than not merging, the same reasoning `tag_of_query()` already applies to
+    an ambiguous tag.
+    """
+    new_stems = set(stems_of(topic))
+    if not new_stems:
+        return None
+
+    best: sqlite3.Row | None = None
+    best_score = 0.0
+    tied = False
+    for row in conn.execute("SELECT id, topic, topic_key FROM expertise"):
+        existing_stems = set(stems_of(row["topic"]))
+        if not existing_stems:
+            continue
+        shared = new_stems & existing_stems
+        if not shared:
+            continue
+        score = len(shared) / len(existing_stems)
+        if score > best_score:
+            best, best_score, tied = row, score, False
+        elif score == best_score:
+            tied = True
+
+    if best is None or best_score < 0.5 or tied:
+        return None
+    return best
+
+
 # --- Stemming and recall ---------------------------------------------------
 
 # Longest first, so "ματα" is tried before "ατα" before "α". Normalized and

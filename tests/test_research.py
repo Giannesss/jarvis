@@ -169,6 +169,76 @@ class ExpertiseStorageTests(unittest.TestCase):
         self.assertTrue(any("μαγαζί" in hit for hit in hits))
 
 
+# --- find_similar_expertise() -------------------------------------------------
+#
+# The "same words, not same subject" upsert boundary (CLAUDE.md "Research"):
+# a refresh whose topic Whisper mangles differently from the original request
+# should still land on the existing row, not a second one.
+
+
+class FindSimilarExpertiseTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.conn = db.connect(Path(self._tmp.name) / "jarvis.db")
+        self.addCleanup(self.conn.close)
+
+    def test_the_live_boundary_case_now_matches(self) -> None:
+        # The exact transcription from CLAUDE.md's live hand test: the
+        # refresh verb matched, but the topic came back as a different
+        # string entirely, with only the place name surviving intact.
+        memory.save_expertise(
+            "γυμναστήρια στην Ξάνθη", "Πέντε γυμναστήρια λειτουργούν εκεί.",
+            self.conn,
+        )
+        match = memory.find_similar_expertise(
+            "γη μου να στείρει, ας την ξάνθει", self.conn
+        )
+        self.assertIsNotNone(match)
+        self.assertEqual(match["topic"], "γυμναστήρια στην Ξάνθη")
+
+    def test_the_same_topic_reworded_still_matches(self) -> None:
+        memory.save_expertise(
+            "τις τιμές διαμερισμάτων στη Θεσσαλονίκη", "Ανεβαίνουν.", self.conn
+        )
+        match = memory.find_similar_expertise(
+            "πόσο κοστίζουν τα διαμερίσματα στη Θεσσαλονίκη", self.conn
+        )
+        self.assertIsNotNone(match)
+        self.assertEqual(match["topic"], "τις τιμές διαμερισμάτων στη Θεσσαλονίκη")
+
+    def test_an_unrelated_topic_does_not_match(self) -> None:
+        memory.save_expertise(
+            "γυμναστήρια στην Ξάνθη", "Πέντε γυμναστήρια λειτουργούν εκεί.",
+            self.conn,
+        )
+        match = memory.find_similar_expertise(
+            "τιμές αυτοκινήτων στην Αθήνα", self.conn
+        )
+        self.assertIsNone(match)
+
+    def test_one_shared_word_against_a_longer_unrelated_topic_does_not_match(self) -> None:
+        # The guard is coverage of the EXISTING row's stems, not raw overlap
+        # count: sharing one word out of several keeps this from matching.
+        memory.save_expertise(
+            "εστιατόρια με θέα στην Αθήνα για γενέθλια", "Μερικά προτεινόμενα.",
+            self.conn,
+        )
+        match = memory.find_similar_expertise("καφετέριες στην Αθήνα", self.conn)
+        self.assertIsNone(match)
+
+    def test_no_existing_rows_is_no_match(self) -> None:
+        self.assertIsNone(memory.find_similar_expertise("οτιδήποτε", self.conn))
+
+    def test_a_tie_between_two_candidates_is_refused(self) -> None:
+        memory.save_expertise("γυμναστήρια στην Ξάνθη", "Α.", self.conn)
+        memory.save_expertise("γυμναστήρια στην Αθήνα", "Β.", self.conn)
+        # Shares "γυμναστήρια" equally with both, confirms neither -- merging
+        # into the wrong one is worse than not merging.
+        match = memory.find_similar_expertise("γυμναστήρια", self.conn)
+        self.assertIsNone(match)
+
+
 # --- brain.research() --------------------------------------------------------
 #
 # Same idiom as tests/test_brain_claude.py: _get_client() is replaced
@@ -350,6 +420,51 @@ class ResearchSkillDispatchTests(ResearchSkillTestCase):
         policy.set_confirm_asker(lambda question: True)
         reply = skills.handle("ξανακάνε έρευνα για τα μαθηματικά")
         self.assertIn("Ξανάκανα την έρευνα για τα μαθηματικά", reply)
+
+    def test_a_mangled_refresh_updates_the_original_row_not_a_duplicate(self) -> None:
+        # The live boundary case from CLAUDE.md "Research": a refresh whose
+        # topic transcribes very differently from the original request used
+        # to land as a second row. find_similar_expertise() is what skills
+        # now check for on the refresh path.
+        policy.set_confirm_asker(lambda question: True)
+        skills.handle("κάνε έρευνα για γυμναστήρια στην Ξάνθη")
+
+        self.fake_research.return_value = "Νέα, ενημερωμένη περίληψη."
+        reply = skills.handle("ξανακάνε έρευνα για γη μου να στείρει ας την ξάνθει")
+
+        # Still researched with the mangled spoken topic (there is no other
+        # text to search with) -- only the storage/reply side reuses the
+        # original.
+        self.fake_research.assert_called_with(
+            "γη μου να στείρει ας την ξάνθει"
+        )
+        self.assertIn("Ξανάκανα την έρευνα για γυμναστήρια στην Ξάνθη", reply)
+
+        conn = db.connect(db.DB_PATH)
+        try:
+            rows = conn.execute("SELECT * FROM expertise").fetchall()
+        finally:
+            conn.close()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["summary"], "Νέα, ενημερωμένη περίληψη.")
+
+    def test_a_first_time_request_never_merges_into_an_existing_row(self) -> None:
+        # find_similar_expertise() is only ever consulted on the refresh
+        # path -- a plain "κάνε έρευνα" for a genuinely new topic must not
+        # merge into an older, unrelated row just because the wording
+        # happens to overlap.
+        policy.set_confirm_asker(lambda question: True)
+        skills.handle("κάνε έρευνα για γυμναστήρια στην Ξάνθη")
+
+        self.fake_research.return_value = "Μια άλλη περίληψη."
+        skills.handle("κάνε έρευνα για γυμναστήρια στην Αθήνα")
+
+        conn = db.connect(db.DB_PATH)
+        try:
+            rows = conn.execute("SELECT * FROM expertise").fetchall()
+        finally:
+            conn.close()
+        self.assertEqual(len(rows), 2)
 
     def test_unavailable_reason_is_spoken_verbatim(self) -> None:
         self.fake_research.side_effect = brain.ResearchUnavailable("Δεν έχω κλειδί.")
