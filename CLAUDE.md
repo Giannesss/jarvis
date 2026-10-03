@@ -33,12 +33,13 @@ phases, with the model to use and the budget for each. It is the source of
 truth for what comes next; this file stays the source of truth for what is
 already built.
 
-**Current phase: Phase 6 — a visible Jarvis, started out of order.** Phase
-5's step 5 (populating real data — syllabus topics, exam dates, each
+**Phase 6 — a visible Jarvis, started out of order — closed on 2026-10-03.**
+Phase 5's step 5 (populating real data — syllabus topics, exam dates, each
 business's description) is still open, the same way Phase 2's brain half was
 built before Phase 1 closed: the pointer moved on because the user asked to,
 not because step 5 is done. It stays open, tracked below rather than quietly
-dropped, and nothing about Phase 6 depends on it.
+dropped, and nothing about Phase 6 depended on it. Phase 7 — file and
+computer organization — is next; see the roadmap doc for its steps.
 
 Phase 6's own five steps (the roadmap's "Steps (do in order)"): an audit of
 the current architecture before any UI code; the UI framework decided by an
@@ -47,7 +48,7 @@ logic; the microphone/brain/TTS wired in one at a time, testing after each;
 then the state machine, real system monitoring, tasks, quick actions and
 settings/debug mode, in that order, never all at once.
 
-**Steps 1-4 are done; step 5 is next.** The audit: everything under `jarvis/` outside
+**All five steps are done.** The audit: everything under `jarvis/` outside
 `main.py` itself — `listener.py`, `brain.py`, `speaker.py`/`player.py`,
 `skills.py`, `policy.py`, `memory.py`, `scheduler.py`, `db.py`, `diag.py` —
 is already decoupled from the CLI (no `print()`s baked into the logic, no
@@ -328,8 +329,10 @@ only falling back to the brain when a skill doesn't match (see "Skills").
   experiments trying different Windows mic-capture APIs; not part of the app.
 - `gui_main.py` — entry point for the Phase 6 GUI shell, parallel to
   `main.py`, not a replacement for it. See "The GUI shell".
-- `jarvis/gui/main_window.py` — `MainWindow`, the shell, plus (step 4, part
-  1) the microphone wired in on a background `QThread`. See "The GUI shell".
+- `jarvis/gui/main_window.py` — `MainWindow`: the shell, the microphone/
+  brain/voice wired in on background `QThread`s, the state machine, system
+  monitoring, the tasks list, quick actions and settings/debug mode — all
+  of Phase 6. See "The GUI shell".
 
 ## Config
 
@@ -2379,15 +2382,21 @@ are no object names to assert on inside a `QFormLayout` of plain labels,
 so the guarantee this class pins is "building it from the live config
 never crashes", not any one row's exact text.
 
-Not yet hand-tested live — open the real settings dialog and confirm the
-shown values actually match the real `.env` (flip `WAKE_WORD_ENABLED` or
-similar and restart to check it updates), then have one real conversation
-with the debug toggle checked and confirm a `"[debug] brain → allowed
-(no_skill_matched)"`-shaped line appears after each reply.
+**Hand-tested live on 2026-10-03.** The settings dialog showed the real
+values from the running `.env` (`BRAIN_PROVIDER=claude`,
+`CLAUDE_MODEL=claude-haiku-4-5`, `TTS_ENGINE=edge`,
+`TTS_VOICE=el-GR-NestorasNeural`, `WHISPER_MODEL=small`, wake word off,
+barge-in/conversation mode/scheduler/diagnostic log all on) — nothing
+guessed or hardcoded, confirming `_show_settings_dialog()` reads the same
+`config.py` values the rest of the app runs on. With debug mode checked, a
+real turn («Γεια σου Τζάρβις, τι γίνεται, όλα καλά;») answered normally
+and appended `"[debug] brain → allowed (no_skill_matched)"` to the
+transcript — confirming `_append_debug_line()` reads the real audit row
+`_get_reply()` just wrote, not a mocked one. Step 5 piece 5 is closed.
 
-With this piece confirmed, Phase 6 step 5 — state machine, system
-monitoring, tasks, quick actions, settings/debug mode — is done in full,
-and so is Phase 6 as originally scoped.
+**Phase 6 step 5 — state machine, system monitoring, tasks, quick
+actions, settings/debug mode — is done in full, and so is Phase 6 as
+originally scoped.**
 
 ## Normalization
 
