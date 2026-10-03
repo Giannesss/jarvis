@@ -1,25 +1,29 @@
-"""The Phase 6 shell -- step 3 of the roadmap's "Steps (do in order)":
-"Build a functional shell first (empty states, no logic)."
-
-Nothing in this file calls into listener.py, brain.py, speaker.py, or any
-other backend module. Every widget here shows a placeholder value rather
-than a live one. That is deliberate, not an oversight: the roadmap's next
-step wires the microphone/brain/TTS in one at a time, each tested before the
-next, and doing that against a screen that already renders correctly is a
-much smaller change than building the screen and the wiring at once. The
-step after that adds the state machine, real system monitoring, tasks, quick
-actions and settings/debug mode -- in that order, never all together.
+"""The Phase 6 shell. Step 3 of the roadmap's "Steps (do in order)" built the
+empty states ("Build a functional shell first"); step 4 -- "wire in mic/
+brain/TTS one at a time, testing after each" -- has now wired in the first
+of those three: the microphone. Nothing here calls into brain.py or
+speaker.py yet; that is the rest of step 4, not this one.
 
 Every widget that something will eventually read or write from outside this
 file has a stable `objectName()` set on it (see `_NAMED_WIDGETS` and the
 `widget()` helper below), so later steps -- and this file's own smoke test --
 can find it without reaching into private attributes or rebuilding the
 layout to get a handle on something.
+
+**The microphone listens on a `QThread`, never on the UI thread.**
+`listener.listen()` blocks -- it shells out to ffmpeg and then runs Whisper --
+for as long as the user is speaking plus however long transcription takes,
+and a blocked UI thread in Qt means a frozen, unresponsive window (no
+repaint, no click, the OS offers to kill it). `_ListenWorker` runs `listen()`
+on its own thread and reports back over a signal, which Qt marshals onto the
+UI thread automatically -- the one safe way to touch a widget from work that
+started on another thread. `MainWindow` never calls `listener.listen()`
+itself for that reason.
 """
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QThread, Qt, Signal
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QHBoxLayout,
@@ -34,6 +38,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from jarvis import listener
 from jarvis.config import SKILL_APPS, SKILL_SITES
 
 # Object names for every widget a later step, or a test, needs to find again.
@@ -47,20 +52,58 @@ TASKS_LIST = "tasks_list"
 CPU_LABEL = "cpu_label"
 RAM_LABEL = "ram_label"
 DEBUG_ACTION = "debug_mode_action"
+RECORD_BUTTON = "record_button"
+
+_STATUS_IDLE = "Κατάσταση: Αδρανές"
+_STATUS_LISTENING = "Κατάσταση: Ακούω..."
+
+
+class _ListenWorker(QThread):
+    """Runs `listener.listen()` off the UI thread and reports back over a
+    signal. `finished_with_text` carries `None` the same way `listen()`
+    itself does -- no speech, a device failure, anything that isn't a
+    transcript -- so the slot on the other end can treat "say nothing" as an
+    ordinary outcome rather than an error."""
+
+    finished_with_text = Signal(object)
+
+    def run(self) -> None:
+        text = listener.listen()
+        self.finished_with_text.emit(text)
 
 
 class MainWindow(QMainWindow):
-    """Jarvis's main window. Construction only -- no timers, no threads, no
-    backend calls. `gui_main.py` is the only thing that instantiates this."""
+    """Jarvis's main window. Construction starts no timers and no threads --
+    `_listen_thread` is only ever created in response to a click on the
+    record button, never at construction. `gui_main.py` is the only thing
+    that instantiates this."""
 
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Jarvis")
         self.resize(900, 600)
 
+        # Holds the in-flight _ListenWorker, if any -- None the rest of the
+        # time. Kept as an attribute rather than a local so the thread object
+        # isn't garbage-collected out from under itself while it's running,
+        # and so _start_listening can refuse a second click while one is
+        # already recording.
+        self._listen_thread: _ListenWorker | None = None
+
         self._build_menu_bar()
         self._build_central_widget()
         self._build_status_bar()
+
+    def closeEvent(self, event) -> None:  # noqa: N802 -- Qt's own name
+        # A QThread still running when its Python wrapper is destroyed
+        # prints a Qt warning and can crash on some platforms. Waiting here
+        # blocks the window on close for at most as long as listen() itself
+        # already bounds a turn to (MAX_RECORD_SECONDS) -- not ideal, but
+        # finite, and simpler than teaching listener.listen() to be
+        # cancellable before anything in the GUI actually needs that.
+        if self._listen_thread is not None:
+            self._listen_thread.wait()
+        super().closeEvent(event)
 
     # --- Menu bar -----------------------------------------------------------
 
@@ -131,12 +174,52 @@ class MainWindow(QMainWindow):
 
         transcript_list = QListWidget()
         transcript_list.setObjectName(TRANSCRIPT_LIST)
-        # Empty by design (see module docstring) -- step 4 is what appends a
-        # line here per turn, read back from listener.py/brain.py, not this
-        # file inventing placeholder conversation text.
+        # Starts empty; a real turn appends to it (see _on_listen_finished).
+        # Still nothing invented here -- every line it ever holds came back
+        # from listener.listen(), not a placeholder this file wrote.
         layout.addWidget(transcript_list)
 
+        record_button = QPushButton("Εγγραφή")
+        record_button.setObjectName(RECORD_BUTTON)
+        record_button.clicked.connect(self._start_listening)
+        layout.addWidget(record_button)
+
         return panel
+
+    # --- Microphone (Phase 6 step 4, part 1 of 3) ----------------------------
+
+    def _start_listening(self) -> None:
+        # Guards against a second click starting a second recording while
+        # one is already in flight -- listener.listen() isn't reentrant (one
+        # ffmpeg process, one temp wav path), and the button is disabled for
+        # the same reason, so this is a backstop for anything that can still
+        # reach here (e.g. a held Enter key) rather than the only guard.
+        if self._listen_thread is not None:
+            return
+
+        widget(self, STATUS_LABEL).setText(_STATUS_LISTENING)
+        widget(self, RECORD_BUTTON).setEnabled(False)
+
+        self._listen_thread = _ListenWorker(self)
+        self._listen_thread.finished_with_text.connect(self._on_listen_finished)
+        self._listen_thread.start()
+
+    def _on_listen_finished(self, text: object) -> None:
+        # listener.listen() returns str | None; Signal(object) is what
+        # carries that union across the thread boundary, since Qt's typed
+        # signals need one concrete type. text is re-narrowed here, not at
+        # the signal, for exactly that reason.
+        if isinstance(text, str) and text:
+            widget(self, TRANSCRIPT_LIST).addItem(f"Εσύ: {text}")
+        # No transcript, same as main.py's own "if not text: continue" --
+        # silence, a device failure, or nothing said is not an error here,
+        # just a turn with nothing to show. brain.ask()/speaker.speak() are
+        # not wired in yet (the rest of step 4), so there is no reply to add
+        # beside it.
+
+        widget(self, STATUS_LABEL).setText(_STATUS_IDLE)
+        widget(self, RECORD_BUTTON).setEnabled(True)
+        self._listen_thread = None
 
     def _build_side_panel(self) -> QWidget:
         panel = QWidget()
@@ -207,7 +290,7 @@ class MainWindow(QMainWindow):
 
     def _build_status_bar(self) -> None:
         bar = QStatusBar()
-        bar.showMessage("Jarvis — κέλυφος (Phase 6, βήμα 3: χωρίς λογική ακόμα)")
+        bar.showMessage("Jarvis — Phase 6, βήμα 4: μικρόφωνο συνδεδεμένο")
         self.setStatusBar(bar)
 
 

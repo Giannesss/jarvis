@@ -328,8 +328,8 @@ only falling back to the brain when a skill doesn't match (see "Skills").
   experiments trying different Windows mic-capture APIs; not part of the app.
 - `gui_main.py` — entry point for the Phase 6 GUI shell, parallel to
   `main.py`, not a replacement for it. See "The GUI shell".
-- `jarvis/gui/main_window.py` — `MainWindow`, the empty-state shell. See
-  "The GUI shell".
+- `jarvis/gui/main_window.py` — `MainWindow`, the shell, plus (step 4, part
+  1) the microphone wired in on a background `QThread`. See "The GUI shell".
 
 ## Config
 
@@ -1962,19 +1962,56 @@ speaking it), quick actions (wiring a click to `skills._open_site()`/
 `_open_app()`), and settings/debug mode (a real surface over what
 `jarvis/config.py` reads from `.env`) — in that order, never all at once.
 
-**Not yet hand-tested live, and not by oversight.** This sandbox cannot
-install PySide6 at all — `pypi.org`/`files.pythonhosted.org` sit in the
-proxy's `noProxy` list, so requests go direct and are refused — so nothing in
-`jarvis/gui/` has been run for real here, only syntax-checked with
-`python3 -m py_compile`. `tests/test_gui_shell.py` is written and will
-exercise real widget construction (`QT_QPA_PLATFORM=offscreen` lets it build
-widgets with no display attached) the moment it runs somewhere PySide6 is
-installed — skipped, not failed, in this sandbox, the same shape as the rest
-of the suite being skippable-by-environment rather than broken by it (see
-"Config"/"Providers" for the lazy-import idiom this mirrors). The roadmap's
-own hand-test rule applies before this step counts as closed: run
-`pip install -r requirements.txt` and `gui_main.py` on the real Windows
-machine to confirm the window actually renders before moving to step 4.
+**Step 4, part 1 of 3: the microphone.** A "Εγγραφή" button calls
+`listener.listen()` — the same Enter-press one-shot path `main.py` uses —
+and appends `"Εσύ: {text}"` to the transcript list exactly as the CLI prints
+it, once transcription comes back; `None`/empty is a silent no-op, the same
+as `main.py`'s own `if not text: continue`. `brain.ask()`/`speaker.speak()`
+are deliberately not wired in yet — that is the rest of step 4, each tested
+before the next, not this one — so the button records and transcribes but
+Jarvis doesn't yet answer.
+
+**`listener.listen()` runs on a `QThread`, never on the UI thread.** It
+blocks for as long as the user is speaking plus however long Whisper takes,
+and a blocked UI thread in Qt is a frozen, unresponsive window. `_ListenWorker`
+(`jarvis/gui/main_window.py`) runs `listen()` on its own thread and reports
+back over a `Signal(object)` — `object` rather than a typed signal because
+`listen()`'s own return type is `str | None`, and Qt's typed signals need one
+concrete type; the slot re-narrows it. Qt marshals a signal emitted on a
+worker thread onto the UI thread automatically, which is the one safe way to
+touch a widget from work that started elsewhere — `MainWindow` itself never
+calls `listener.listen()` directly, only through the worker. The button
+disables itself and the status label reads "Κατάσταση: Ακούω..." for the
+duration, both restored when the signal arrives; a second click while one
+recording is already in flight is a no-op (`_listen_thread is not None`),
+since `listener.listen()` isn't reentrant — one ffmpeg process, one temp wav
+path. `closeEvent()` waits for an in-flight thread before closing, so the
+window is never torn down out from under a running recording.
+
+`tests/test_gui_shell.py`'s `MicrophoneWiringTests` pins all of it with
+`listener.listen` mocked (never a real microphone in the suite): a spoken
+turn appends the right transcript line and restores the button/status; a
+`None` turn appends nothing; and a second click while listening is ignored.
+
+**Built in a sandbox that cannot run it, hand-tested on the real machine
+instead.** This sandbox cannot install PySide6 at all — `pypi.org`/
+`files.pythonhosted.org` sit in the proxy's `noProxy` list, so requests go
+direct and are refused — so nothing in `jarvis/gui/` was run here, only
+syntax-checked with `python3 -m py_compile`, before being handed to the user's
+Windows machine. `tests/test_gui_shell.py` exercises real widget construction
+(`QT_QPA_PLATFORM=offscreen` lets it build widgets with no display attached)
+wherever PySide6 is installed — skipped, not failed, in this sandbox, the
+same shape as the rest of the suite being skippable-by-environment rather
+than broken by it (see "Config"/"Providers" for the lazy-import idiom this
+mirrors).
+
+**Step 3 closed on 2026-10-03.** `pip install -r requirements.txt` then
+`gui_main.py` on the real machine opened a window matching the shell exactly:
+the menu bar, the "Κατάσταση: Αδρανές" status line, the empty transcript list
+on the left, and the side panel's disabled quick-action buttons, empty tasks
+list, and "—" CPU/RAM placeholders all rendered as built. The roadmap's own
+hand-test rule is satisfied; step 4 (wiring in the microphone/brain/TTS, one
+at a time) is next.
 
 ## Normalization
 
