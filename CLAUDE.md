@@ -329,10 +329,13 @@ only falling back to the brain when a skill doesn't match (see "Skills").
   experiments trying different Windows mic-capture APIs; not part of the app.
 - `gui_main.py` — entry point for the Phase 6 GUI shell, parallel to
   `main.py`, not a replacement for it. See "The GUI shell".
-- `jarvis/gui/main_window.py` — `MainWindow`: the shell, the microphone/
-  brain/voice wired in on background `QThread`s, the state machine, system
-  monitoring, the tasks list, quick actions and settings/debug mode — all
-  of Phase 6. See "The GUI shell".
+- `jarvis/gui/main_window.py` — `MainWindow`: the microphone/brain/voice
+  wired in on background `QThread`s, the state machine, system monitoring
+  (now including network throughput), the tasks list, quick actions and
+  settings/debug mode (all of Phase 6), presented since as a dark-themed
+  dashboard — a header with a live clock, a sidebar of five pages, and an
+  original glowing `_Orb` avatar in place of a plain status label. See "The
+  GUI shell" and "The dashboard redesign".
 
 ## Config
 
@@ -2397,6 +2400,141 @@ transcript — confirming `_append_debug_line()` reads the real audit row
 **Phase 6 step 5 — state machine, system monitoring, tasks, quick
 actions, settings/debug mode — is done in full, and so is Phase 6 as
 originally scoped.**
+
+### The dashboard redesign
+
+Done after Phase 6 closed, before Phase 7, at the user's request rather
+than anything on the roadmap: the shell above was functional but, in the
+user's own words, "πολύ γραφικό" — plain, not the "εντυπωσιακή... premium"
+multi-view platform look of a reference photo they sent. The scope they
+set, through two rounds of clarifying questions: whichever implementation
+gives the best premium result (left to judgment), and from the photo, only
+its *top* dashboard portion — header, sidebar, central avatar, system
+status/quick actions/current task panels. The photo's bottom section, eight
+small explainer cards (Ακούει/Σκέφτεται/Απαντάει/... each with its own mini
+illustration and caption) is marketing material about the assistant, not UI
+for it, and the user confirmed explicitly it is not wanted in the running
+app.
+
+**The reference photo's central avatar is Marvel's Iron Man helmet —
+instead `_Orb` draws an original design.** A glowing avatar built from
+concentric rings, a radial-gradient glow and a row of animated waveform
+bars, in the same blue sci-fi register as the photo but nobody's
+intellectual property. `_ORB_COLOR` keys its glow colour to `State` (dim
+blue idle, bright blue listening, amber thinking, teal speaking) so the
+avatar itself shows what Jarvis is doing, not just the status label next to
+it. A `QTimer` (`ORB_TICK_MS`, 60ms) drives `_Orb.tick()`, since a widget
+with no events of its own otherwise never repaints.
+
+**The waveform is explicitly decorative, not a real audio level.** Wiring
+it to the actual microphone/speaker signal would mean reaching into
+`listener.py`/`speaker.py`'s internals for a number this redesign doesn't
+otherwise need, so the bar heights are a deterministic `math.sin()` wobble
+off an internal phase counter instead — flagged in both `ORB_TICK_MS`'s own
+comment and `_Orb`'s docstring as a known simplification, in keeping with
+this project's own rule against presenting invented data as real (see
+"Grounding").
+
+**Layout: one header, one sidebar, five pages in a `QStackedWidget`.** The
+old single-screen shell (status label + transcript + a splitter's side
+panel) is now `Home`/`Chat`/`Tasks`/`Files`/`Settings`, switched by sidebar
+buttons (`NAV_HOME`/`NAV_CHAT`/`NAV_TASKS`/`NAV_FILES`/`NAV_SETTINGS`) via
+`_go_to_page()`, which also keeps exactly one of them `checked()` — Qt
+doesn't auto-exclude checkable buttons outside a `QButtonGroup`, so this is
+done by hand. Where everything moved:
+
+- **Home** — the orb, the record button, and (as a right-hand column) the
+  System Status panel (CPU/RAM/VRAM, same `_poll_system()` as before, now
+  joined by a **Network** reading — see below), the Quick Actions panel
+  (unchanged wiring, same `skills._open_site()`/`_open_app()` calls), and a
+  new **Current Task** panel showing the first item of today's agenda (or a
+  flat "waiting for a command" line) — the same `memory.agenda()` call
+  `_load_tasks()` already made for the Tasks page, read once and rendered
+  into both places.
+- **Chat** — the transcript list, unchanged in content and behaviour; it
+  just no longer shares a screen with the record button, which lives on
+  Home now.
+- **Tasks** — the full agenda list, unchanged from step 5 piece 3.
+- **Files** — a stub placeholder page naming Phase 7 as what will fill it;
+  nothing of Phase 7 was pulled forward.
+- **Settings** — replaces the old `QDialog`+`DEBUG_ACTION` menu `QAction`
+  with a page holding the same read-only `config.py` rows plus the
+  debug-mode toggle, now a `QCheckBox` (`findChild(QCheckBox, DEBUG_ACTION)`
+  in `_debug_mode_enabled()`, was `QAction`) — a page fits the sidebar's own
+  navigation model, where a modal dialog over a single-screen shell did not.
+  Still read-only, for the same reason as before: the project's own working
+  rule is "never edit `.env`", so a field here that wrote back to it would
+  be exactly that, by another name.
+
+**Network throughput is new, alongside CPU/RAM/VRAM.** `psutil` only gives
+a running total of bytes moved since boot, not a rate, so
+`_poll_system()` computes one as a delta between polls:
+`(total_bytes_now - total_bytes_last) / (time_now - time_last)`, using
+`time.monotonic()` so a system clock adjustment can't produce a negative or
+nonsensical elapsed time. The first poll in a process has no "last" reading
+to diff against and shows nothing yet — the same one-tick blind spot
+`psutil.cpu_percent()`'s own priming call already has, not a bug needing a
+separate fix. `_format_rate()` renders it as `"1.2 MB/s"`-style text, kept
+to two units (KB/s, MB/s) since this is a glance-at number.
+
+**The header carries a live clock and date**, via `_update_clock()` on its
+own one-second `QTimer` (`_clock_timer`) plus one immediate call at
+construction so the header isn't blank for the first second. `CLOCK_LABEL`/
+`DATE_LABEL` are named constants, consistent with every other widget this
+file can find again — they started as inline string literals in the first
+draft of this redesign and were promoted before committing, the same
+reason every other object name here is centralized rather than scattered.
+
+**The styling is a single dark QSS stylesheet** (`_STYLESHEET`, applied via
+`self.setStyleSheet(...)` in `__init__`) rather than per-widget styling
+calls scattered through the `_build_*()` methods — a deep navy palette, one
+blue accent, rounded panel/button/list styling matching the photo's
+register without any of its imagery. `QFrame#header`/`#sidebar`/`#panel`
+and `QPushButton[navButton="true"]:checked`/`:hover` are the selectors that
+carry most of the look; everything else (buttons, lists, the status bar)
+gets a general rule so new widgets added later pick up the theme without
+needing their own stylesheet entry.
+
+**Nothing about the actual behaviour changed.** The worker threads
+(`_ListenWorker`/`_BrainWorker`/`_SpeakWorker`), the `State` machine and
+`_set_state()`, `_get_reply()`, `_load_tasks()`'s agenda query, the quick
+actions' calls into `skills.py`, and the debug line's audit-row read are
+all exactly what step 4 and step 5 built — this redesign only changed where
+things are drawn and what they look like while drawing it. `_STATUS_TEXT`'s
+Greek strings, `_BRAIN_ERROR_REPLY`, and every status transition's timing
+are unchanged, which is why none of the existing worker/state/tasks tests
+needed anything beyond the object-lookup fixes below.
+
+**Tests.** `tests/test_gui_shell.py`'s `DebugModeWiringTests`/
+`ShellConstructionTests` were updated for `DEBUG_ACTION` now being a
+`QCheckBox` found via `widget()` rather than a `QAction` found via
+`findChild(QAction, ...)`. `SettingsDialogTests` (which mocked
+`QDialog.exec()`) is replaced by `SettingsPageTests`, pinning that
+`NAV_SETTINGS` is reachable from the sidebar and switches the stack to page
+4, and that the page's `QLabel`s show the real `config.BRAIN_PROVIDER`
+value rather than anything hardcoded. New coverage for what's actually new:
+`SidebarNavigationTests` (Home is shown at construction; each of the other
+four nav buttons switches to its own page and is the only one left
+checked), `OrbTests` (`_set_state()` updates the orb's own state; `tick()`
+advances its phase), `FormatRateTests` (`_format_rate()`'s KB/s and MB/s
+rendering), `NetworkMonitoringTests` (the first poll shows nothing, the
+second computes a real rate from a faked `psutil.net_io_counters()` and
+`time.monotonic()`), and `ClockTests` (`_update_clock()` against a patched
+`datetime.now()`, and that closing the window stops `_clock_timer`). All 53
+tests in `test_gui_shell.py` (42 before this redesign, 11 new) skip cleanly
+in this sandbox (no PySide6, the same constraint noted below); the full
+suite is 318 tests, 26 errors (the same pre-existing Windows-only-module
+baseline), 53 skipped.
+
+**Not yet hand-tested live.** This whole redesign was built and verified
+only against `py_compile` and the mocked suite in a sandbox that cannot
+install PySide6 (same constraint as "Built in a sandbox that cannot run
+it," above) — pending a `git pull` and a real run on the user's Windows
+machine: the dark theme, the orb's animation and colour changes across a
+real conversation turn, sidebar navigation across all five pages, the
+Network reading alongside CPU/RAM/VRAM, the Current Task panel, and the
+Settings page's checkbox and values all need a visual hand test before this
+is closed out the way every other piece in this file has been.
 
 ## Normalization
 

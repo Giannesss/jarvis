@@ -1,57 +1,54 @@
-"""The Phase 6 shell. Step 3 built the empty states ("Build a functional
-shell first"); step 4 wired in the microphone, the brain's reply and
-`speaker.speak()`/TTS, one at a time, each hand-tested before the next. Step
-5 -- "the state machine, real system monitoring, tasks, quick actions and
-settings/debug mode" -- is now underway: the state machine (`State`, below)
-is one explicit value for what Jarvis is doing right now, read by everything
-that used to ask three different thread attributes whether they were
-`None`; real system monitoring (`_poll_system()`, below) fills the CPU/RAM/
-VRAM labels from `psutil`/`pynvml` on a timer instead of leaving them at "—"
-forever; the tasks list (`_load_tasks()`, below) renders today's
-`memory.agenda()` -- the same data «τι έχω σήμερα» already speaks -- as a
-list instead; the quick-action buttons call `skills._open_site()`/
-`_open_app()`, the exact functions the matching voice command uses; and the
-settings dialog (`_show_settings_dialog()`) is a read-only view over what
-`jarvis/config.py` actually read from `.env` for this run, with the debug
-toggle (`DEBUG_ACTION`) wired to append one audit-log line per turn to the
-transcript.
+"""The Phase 6 shell, redesigned (2026-10-03) to match a reference mockup the
+user supplied: a dark, "premium" dashboard -- a sidebar of pages, a header
+with a live clock and a state pill, and a big glowing central avatar on the
+Home page instead of a plain status label. This redesign changes layout and
+styling only; every piece of actual behaviour built across step 4 and step 5
+(the worker threads, the state machine, system monitoring, the tasks list,
+quick actions, the settings values, the debug audit line) is unchanged --
+see "The GUI shell" in CLAUDE.md for what each of those does and why.
+
+**The central avatar is an original design, not Iron Man's helmet.** The
+reference image used Marvel's Iron Man face as its avatar; that's a
+recognizable, copyrighted character, so `_Orb` below draws its own thing
+instead -- concentric glowing rings and a row of waveform bars, in the same
+blue, sci-fi register, but nobody's intellectual property.
 
 Every widget that something will eventually read or write from outside this
-file has a stable `objectName()` set on it (see `_NAMED_WIDGETS` and the
-`widget()` helper below), so later steps -- and this file's own smoke test --
-can find it without reaching into private attributes or rebuilding the
-layout to get a handle on something.
+file has a stable `objectName()` (see the constants below and the `widget()`
+helper), so later steps -- and this file's own tests -- can find it without
+reaching into private attributes.
 
-**The microphone, the brain and the voice each run on their own `QThread`,
-never on the UI thread.** `listener.listen()` blocks on ffmpeg + Whisper,
-`brain.ask()` blocks on a local model or a network round trip, and
-`speaker.speak()` blocks for as long as the reply takes to play -- any one
-of them freezes the window (no repaint, no click, the OS offers to kill it)
-if run inline. `_ListenWorker`, `_BrainWorker` and `_SpeakWorker` each run
-one blocking call on its own thread and report back over a signal, which Qt
-marshals onto the UI thread automatically -- the one safe way to touch a
-widget from work that started elsewhere. `MainWindow` never calls
-`listener.listen()`, `_get_reply()` or `speaker.speak()` directly for that
-reason.
+**The microphone, the brain and the voice each still run on their own
+`QThread`, never on the UI thread.** `listener.listen()` blocks on ffmpeg +
+Whisper, `brain.ask()` blocks on a local model or a network round trip, and
+`speaker.speak()` blocks for as long as the reply takes to play -- any one of
+them freezes the window if run inline. `_ListenWorker`, `_BrainWorker` and
+`_SpeakWorker` each run one blocking call on its own thread and report back
+over a signal, which Qt marshals onto the UI thread automatically.
+`MainWindow` never calls `listener.listen()`, `_get_reply()` or
+`speaker.speak()` directly for that reason.
 """
 
 from __future__ import annotations
 
+import math
+import time
 from datetime import datetime
 from enum import Enum, auto
 
 import psutil
-from PySide6.QtCore import QThread, QTimer, Qt, Signal
-from PySide6.QtGui import QAction
+from PySide6.QtCore import QRectF, QThread, QTimer, Qt, Signal
+from PySide6.QtGui import QAction, QColor, QPainter, QRadialGradient
 from PySide6.QtWidgets import (
-    QDialog,
+    QCheckBox,
     QFormLayout,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QListWidget,
     QMainWindow,
     QPushButton,
-    QSplitter,
+    QStackedWidget,
     QStatusBar,
     QVBoxLayout,
     QWidget,
@@ -71,16 +68,36 @@ TASKS_LIST = "tasks_list"
 CPU_LABEL = "cpu_label"
 RAM_LABEL = "ram_label"
 VRAM_LABEL = "vram_label"
+NETWORK_LABEL = "network_label"
+CURRENT_TASK_LABEL = "current_task_label"
 DEBUG_ACTION = "debug_mode_action"
 RECORD_BUTTON = "record_button"
+ORB = "orb_widget"
+NAV_HOME = "nav_home"
+NAV_CHAT = "nav_chat"
+NAV_TASKS = "nav_tasks"
+NAV_FILES = "nav_files"
+NAV_SETTINGS = "nav_settings"
+CLOCK_LABEL = "clock_label"
+DATE_LABEL = "date_label"
 
-# How often _poll_system() refreshes the CPU/RAM/VRAM labels. 2s is frequent
-# enough to look live without polling psutil hard enough to show up in its
-# own reading -- cpu_percent(interval=None) is a near-free syscall-level
-# read, not a busy-wait, so this could be much shorter, but a system monitor
-# updating faster than a person reads it has nothing to show for the extra
-# polling.
+# How often _poll_system() refreshes the CPU/RAM/VRAM/network labels. 2s is
+# frequent enough to look live without polling psutil hard enough to show up
+# in its own reading -- cpu_percent(interval=None) is a near-free
+# syscall-level read, not a busy-wait, so this could be much shorter, but a
+# system monitor updating faster than a person reads it has nothing to show
+# for the extra polling.
 MONITOR_POLL_MS = 2000
+
+# The orb's own redraw tick -- separate from MONITOR_POLL_MS because a
+# visual pulse/waveform needs to look smooth (a handful of frames a second),
+# while a CPU percentage updating that often would just be noise nobody can
+# read. Purely decorative: the bars move whenever the state isn't IDLE, but
+# their heights are not derived from any real microphone or speaker level --
+# wiring that up would mean reaching into listener.py/speaker.py's internals
+# for a number this redesign doesn't otherwise need, so it's left as a known
+# simplification rather than invented data presented as real.
+ORB_TICK_MS = 60
 
 # Cached across calls to _read_vram_percent() -- nvmlInit() and the device
 # handle only need doing once per process, and a machine with no NVIDIA
@@ -122,6 +139,17 @@ def _read_vram_percent() -> float | None:
         return None
 
 
+def _format_rate(bytes_per_second: float) -> str:
+    """"1.2 MB/s"-style formatting for the network throughput reading --
+    kept to two units (KB/s, MB/s) since this is a glance-at number, not a
+    precise one, and anything under 1 KB/s is rendered as "0.0 KB/s" rather
+    than switching to bytes, which would be more digits for less meaning."""
+    kb = bytes_per_second / 1024
+    if kb < 1024:
+        return f"{kb:.1f} KB/s"
+    return f"{kb / 1024:.1f} MB/s"
+
+
 def _render_agenda_item(kind: str, text: str) -> str:
     """Same phrasing `skills._handle_agenda` already speaks for «τι έχω
     σήμερα» -- an exam prefixed "εξέταση", a class "μάθημα", a reminder
@@ -141,13 +169,10 @@ def _render_agenda_item(kind: str, text: str) -> str:
 
 class State(Enum):
     """What Jarvis is doing right now -- the one thing `_listen_thread`,
-    `_brain_thread` and `_speak_thread` were each separately standing in for
-    (every guard and every status-label update used to ask "is this
-    particular thread attribute `None`?", three times over, instead of
-    asking one question once). Exposed at module level, not nested in
-    `MainWindow`, because a later step (debug mode's own status surface,
-    most likely) and this file's own smoke test both need to name it
-    without an instance in hand.
+    `_brain_thread` and `_speak_thread` were each separately standing in for.
+    Exposed at module level, not nested in `MainWindow`, since the orb widget
+    and this file's own tests both need to name it without an instance in
+    hand.
 
     IDLE is the only state a second click is allowed to start a turn from;
     every other state means a worker is already running, and
@@ -160,14 +185,26 @@ class State(Enum):
     SPEAKING = auto()
 
 
-# One status line and one record-button-enabled bit per state -- the two
-# things every transition used to set by hand, in the same order, at every
-# call site. _set_state() below is the one place that reads this table now.
+# One status line, one orb colour and one record-button-enabled bit per
+# state -- the things every transition used to set by hand, in the same
+# order, at every call site. _set_state() below is the one place that reads
+# these tables now.
 _STATUS_TEXT = {
     State.IDLE: "Κατάσταση: Αδρανές",
     State.LISTENING: "Κατάσταση: Ακούω...",
     State.THINKING: "Κατάσταση: Σκέφτεται...",
     State.SPEAKING: "Κατάσταση: Μιλάει...",
+}
+
+# The orb's glow colour per state -- idle a dim blue, listening/speaking a
+# bright one (it's doing the thing a microphone/speaker icon would show),
+# thinking an amber (visually distinct from "I'm listening to you" without
+# needing a third colour family).
+_ORB_COLOR = {
+    State.IDLE: QColor(70, 110, 160),
+    State.LISTENING: QColor(70, 170, 255),
+    State.THINKING: QColor(230, 170, 60),
+    State.SPEAKING: QColor(70, 220, 190),
 }
 
 # Same text as main.py's own BRAIN_ERROR_REPLY. Duplicated rather than
@@ -183,8 +220,8 @@ def _get_reply(text: str) -> str:
     """The reply-generating half of main._answer(), re-derived rather than
     imported (same reason as _BRAIN_ERROR_REPLY above): a skill first, then
     the brain when none matched. Returns the reply text instead of speaking
-    it -- speaker.speak()/TTS is step 4 part 3, not this one, so the caller
-    decides what to do with the string.
+    it -- speaker.speak()/TTS is its own worker, not this function, so the
+    caller decides what to do with the string.
 
     The kill switch is already checked inside skills.handle() itself
     (policy.intercept(), before the registry loop) -- the is_frozen() check
@@ -249,9 +286,7 @@ class _SpeakWorker(QThread):
     Carries no payload back -- speak() returns nothing and raises nothing a
     caller here needs to react to (its own Edge/Piper fallback is handled
     inside speaker.py, same as the CLI). `finished_speaking` exists only to
-    tell the UI thread "the turn is over now", the same role Qt's own
-    QThread.finished could play, but a dedicated signal keeps this worker's
-    contract explicit and matches the other two workers' shape."""
+    tell the UI thread "the turn is over now"."""
 
     finished_speaking = Signal()
 
@@ -264,21 +299,107 @@ class _SpeakWorker(QThread):
         self.finished_speaking.emit()
 
 
+class _Orb(QWidget):
+    """The central glowing avatar -- an original design (concentric rings +
+    a row of waveform bars), deliberately not a recreation of the reference
+    mockup's Iron Man face, which is a copyrighted character. Colour and
+    "activity" (whether the waveform bars move) follow the state machine via
+    `set_state()`; a `QTimer` outside this class drives `tick()` to animate
+    it, since a widget with no events of its own otherwise never repaints."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setMinimumSize(220, 220)
+        self._state = State.IDLE
+        self._phase = 0.0
+
+    def set_state(self, state: State) -> None:
+        self._state = state
+
+    def tick(self) -> None:
+        self._phase += 1.0
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802 -- Qt's own name
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        side = min(self.width(), self.height())
+        cx, cy = self.width() / 2, self.height() / 2
+        color = _ORB_COLOR[self._state]
+
+        # A slow pulse on the outer glow radius -- idle breathes gently;
+        # listening/thinking/speaking pulse a bit faster and wider, so the
+        # orb visibly "comes alive" without needing real audio levels to do
+        # it (see ORB_TICK_MS's comment on why those aren't wired in).
+        speed = 0.03 if self._state is State.IDLE else 0.08
+        pulse = (math.sin(self._phase * speed) + 1) / 2  # 0..1
+
+        outer_radius = side * (0.42 + 0.04 * pulse)
+        gradient = QRadialGradient(cx, cy, outer_radius)
+        glow = QColor(color)
+        glow.setAlpha(90)
+        gradient.setColorAt(0.0, glow)
+        transparent = QColor(color)
+        transparent.setAlpha(0)
+        gradient.setColorAt(1.0, transparent)
+        painter.setBrush(gradient)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawEllipse(QRectF(cx - outer_radius, cy - outer_radius, outer_radius * 2, outer_radius * 2))
+
+        # Two solid rings, the inner one slightly brighter -- reads as a
+        # "core" the glow sits around, the same idea as an arc reactor
+        # without copying one.
+        for radius_frac, alpha in ((0.30, 160), (0.24, 220)):
+            radius = side * radius_frac
+            ring = QColor(color)
+            ring.setAlpha(alpha)
+            painter.setPen(ring)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawEllipse(QRectF(cx - radius, cy - radius, radius * 2, radius * 2))
+
+        # The waveform: a row of bars across the core, only animated
+        # (varying height) while something is actually happening -- idle
+        # shows them flat, a visual "nothing to hear right now".
+        bar_count = 9
+        bar_area_width = side * 0.5
+        bar_spacing = bar_area_width / bar_count
+        base_y = cy
+        for i in range(bar_count):
+            if self._state is State.IDLE:
+                height = side * 0.03
+            else:
+                # A deterministic pseudo-wave from the phase and the bar's
+                # own index -- decorative, not a real audio level (see
+                # ORB_TICK_MS above).
+                wobble = (math.sin(self._phase * 0.25 + i * 0.9) + 1) / 2
+                height = side * (0.04 + 0.12 * wobble)
+            x = cx - bar_area_width / 2 + i * bar_spacing
+            bar_color = QColor(color)
+            bar_color.setAlpha(230)
+            painter.setBrush(bar_color)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawRoundedRect(
+                QRectF(x, base_y - height / 2, bar_spacing * 0.5, height), 2, 2
+            )
+
+
 class MainWindow(QMainWindow):
     """Jarvis's main window. Construction starts no *worker* threads --
     `_listen_thread`/`_brain_thread`/`_speak_thread` are only ever created in
     response to a click on the record button and to a turn progressing,
-    never at construction. It does start one `QTimer` now (`_monitor_timer`,
-    for the CPU/RAM labels) -- a repeating UI-thread timer calling a
-    non-blocking `psutil` read is nothing like a worker thread blocking on
-    ffmpeg/Whisper/a model/TTS, so it doesn't need the same "not until
-    asked" discipline those three do. `gui_main.py` is the only thing that
-    instantiates this."""
+    never at construction. It does start two repeating `QTimer`s now
+    (`_monitor_timer` for CPU/RAM/VRAM/network, `_orb_timer` for the orb's
+    animation) -- both non-blocking UI-thread work, nothing like a worker
+    thread blocking on ffmpeg/Whisper/a model/TTS, so neither needs the
+    "not until asked" discipline those three do. `gui_main.py` is the only
+    thing that instantiates this."""
 
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Jarvis")
-        self.resize(900, 600)
+        self.resize(1200, 760)
+        self.setStyleSheet(_STYLESHEET)
 
         # Hold the in-flight worker, if any -- None the rest of the time.
         # Kept as an attribute rather than a local so the thread object isn't
@@ -291,6 +412,8 @@ class MainWindow(QMainWindow):
         self._brain_thread: _BrainWorker | None = None
         self._speak_thread: _SpeakWorker | None = None
         self._state = State.IDLE
+        self._last_net_bytes: int | None = None
+        self._last_net_time: float | None = None
 
         self._build_menu_bar()
         self._build_central_widget()
@@ -306,6 +429,15 @@ class MainWindow(QMainWindow):
         self._monitor_timer = QTimer(self)
         self._monitor_timer.timeout.connect(self._poll_system)
         self._monitor_timer.start(MONITOR_POLL_MS)
+
+        self._orb_timer = QTimer(self)
+        self._orb_timer.timeout.connect(self._orb.tick)
+        self._orb_timer.start(ORB_TICK_MS)
+
+        self._clock_timer = QTimer(self)
+        self._clock_timer.timeout.connect(self._update_clock)
+        self._clock_timer.start(1000)
+        self._update_clock()
 
         # Initial fill of the tasks list -- same data _poll_system() above
         # fills CPU/RAM/VRAM with: a read that happens once here so the
@@ -330,14 +462,21 @@ class MainWindow(QMainWindow):
         if self._speak_thread is not None:
             self._speak_thread.wait()
         self._monitor_timer.stop()
+        self._orb_timer.stop()
+        self._clock_timer.stop()
         super().closeEvent(event)
 
+    def _update_clock(self) -> None:
+        now = datetime.now()
+        widget(self, CLOCK_LABEL).setText(now.strftime("%H:%M"))
+        widget(self, DATE_LABEL).setText(now.strftime("%a %d %b %Y"))
+
     def _poll_system(self) -> None:
-        """Fills in the CPU/RAM/VRAM labels with a real reading. Called on
-        `_monitor_timer` (every `MONITOR_POLL_MS`) and directly by the test
-        suite -- both calls happen on the UI thread, since psutil's reads
-        here are a near-instant syscall-level read with no disk or network
-        I/O behind them, unlike `listener.listen()`/`brain.ask()`/
+        """Fills in the CPU/RAM/VRAM/network labels with a real reading.
+        Called on `_monitor_timer` (every `MONITOR_POLL_MS`) and directly by
+        the test suite -- both calls happen on the UI thread, since psutil's
+        reads here are near-instant syscall-level reads with no disk or
+        network I/O behind them, unlike `listener.listen()`/`brain.ask()`/
         `speaker.speak()` above, which is exactly why this doesn't need a
         worker thread the way those three do. The VRAM read
         (`_read_vram_percent()`) is the same kind of near-instant call when
@@ -354,18 +493,37 @@ class MainWindow(QMainWindow):
         else:
             widget(self, VRAM_LABEL).setText(f"VRAM: {vram:.0f}%")
 
+        # Network throughput isn't a single reading the way CPU/RAM/VRAM
+        # are -- psutil only gives a running total of bytes moved since boot,
+        # so the rate is a delta between this poll and the last one. The
+        # first poll in a process has no "last" to diff against, hence the
+        # None check: it primes the baseline and shows nothing yet, the same
+        # one-tick blind spot psutil.cpu_percent()'s own priming call has.
+        counters = psutil.net_io_counters()
+        total_bytes = counters.bytes_sent + counters.bytes_recv
+        now = time.monotonic()
+        if self._last_net_bytes is not None and self._last_net_time is not None:
+            elapsed = now - self._last_net_time
+            if elapsed > 0:
+                rate = (total_bytes - self._last_net_bytes) / elapsed
+                widget(self, NETWORK_LABEL).setText(
+                    f"Network: {_format_rate(max(rate, 0))}"
+                )
+        self._last_net_bytes = total_bytes
+        self._last_net_time = now
+
     def _load_tasks(self) -> None:
         """Fills TASKS_LIST with today's agenda -- `memory.agenda()`, the
         same call the `agenda` skill already makes for «τι έχω σήμερα», just
-        rendered as a list instead of spoken as a sentence. Narrowed to
-        today only (no tab or filter for αύριο/μεθαύριο yet -- that's
-        further than this step asks for: "render memory.agenda() ... as a
-        list instead of speaking it").
+        rendered as a list instead of spoken as a sentence. Also fills the
+        Home page's "Current Task" line with the first item, or a flat
+        "waiting for a command" line when there isn't one -- the same data,
+        just read twice for two different panels.
 
         Swallows every error, same discipline as `memory.recall_safe()` and
         `_handle_agenda`'s own try/except: a locked or broken database means
-        the tasks list doesn't refresh this time, never a crashed GUI or a
-        popup the user didn't ask for."""
+        neither panel refreshes this time, never a crashed GUI or a popup
+        the user didn't ask for."""
         tasks_list = widget(self, TASKS_LIST)
         tasks_list.clear()
         try:
@@ -379,16 +537,23 @@ class MainWindow(QMainWindow):
         for kind, text in items:
             tasks_list.addItem(_render_agenda_item(kind, text))
 
+        current_task = widget(self, CURRENT_TASK_LABEL)
+        if items:
+            current_task.setText(_render_agenda_item(*items[0]))
+        else:
+            current_task.setText("Έτοιμος — περιμένω εντολή.")
+
     def _set_state(self, state: State) -> None:
-        """The one place that updates the status label and the record
-        button together. Every transition below calls this instead of
-        touching either widget directly, so the two can never drift apart
-        (a status label reading "Σκέφτεται..." with the button somehow
-        still enabled, say) the way three separate call sites eventually
+        """The one place that updates the status label, the orb and the
+        record button together. Every transition below calls this instead
+        of touching any of the three directly, so they can never drift
+        apart (a status label reading "Σκέφτεται..." with the orb still
+        glowing idle-blue, say) the way separate call sites eventually
         would."""
         self._state = state
         widget(self, STATUS_LABEL).setText(_STATUS_TEXT[state])
         widget(self, RECORD_BUTTON).setEnabled(state is State.IDLE)
+        self._orb.set_state(state)
 
     # --- Menu bar -----------------------------------------------------------
 
@@ -400,43 +565,314 @@ class MainWindow(QMainWindow):
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
 
-        settings_menu = menu_bar.addMenu("&Ρυθμίσεις")
+        view_menu = menu_bar.addMenu("&Προβολή")
+        settings_action = QAction("Ρυθμίσεις", self)
+        settings_action.triggered.connect(lambda: self._go_to_page(NAV_SETTINGS))
+        view_menu.addAction(settings_action)
 
-        # The real settings surface, Phase 6 step 5's last piece: a read-only
-        # view over what jarvis/config.py actually read from .env for this
-        # run. Read-only is not a shortcut taken for lack of time -- it's the
-        # only shape consistent with the project's own working rule "never
-        # edit .env": a field here that wrote back to it would mean Claude
-        # code editing .env by another name. Seeing a wrong value here still
-        # tells you to go fix .env by hand and restart, which is the whole
-        # point of a settings surface over a config that's only ever read at
-        # startup.
-        settings_action = QAction("Ρυθμίσεις…", self)
-        settings_action.triggered.connect(self._show_settings_dialog)
-        settings_menu.addAction(settings_action)
+    # --- Central widget: header + sidebar + pages ----------------------------
 
-        # Checkable, and now wired to something real: when checked, every
-        # completed turn appends one extra transcript line showing the audit
-        # row policy.py already wrote for that turn (which skill matched, or
-        # that the brain answered, and why) -- see _append_debug_line(). That
-        # reuses the audit log Phase 4 already built rather than inventing a
-        # second logging path; nothing is computed here that wasn't already
-        # being recorded.
-        debug_action = QAction("Λειτουργία αποσφαλμάτωσης", self)
-        debug_action.setObjectName(DEBUG_ACTION)
-        debug_action.setCheckable(True)
-        settings_menu.addAction(debug_action)
+    def _build_central_widget(self) -> None:
+        central = QWidget(self)
+        self.setCentralWidget(central)
 
-    def _show_settings_dialog(self) -> None:
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Ρυθμίσεις")
-        form = QFormLayout(dialog)
+        outer = QVBoxLayout(central)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        outer.addWidget(self._build_header())
 
+        body = QHBoxLayout()
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(0)
+        outer.addLayout(body, stretch=1)
+
+        body.addWidget(self._build_sidebar())
+
+        self._stack = QStackedWidget()
+        self._stack.addWidget(self._build_home_page())
+        self._stack.addWidget(self._build_chat_page())
+        self._stack.addWidget(self._build_tasks_page())
+        self._stack.addWidget(self._build_files_page())
+        self._stack.addWidget(self._build_settings_page())
+        body.addWidget(self._stack, stretch=1)
+
+    def _build_header(self) -> QWidget:
+        header = QFrame()
+        header.setObjectName("header")
+        layout = QHBoxLayout(header)
+
+        brand = QVBoxLayout()
+        title = QLabel("JARVIS")
+        title.setObjectName("brandTitle")
+        tagline = QLabel("Always here. Ready.")
+        tagline.setObjectName("tagline")
+        brand.addWidget(title)
+        brand.addWidget(tagline)
+        layout.addLayout(brand)
+        layout.addStretch(1)
+
+        status_label = QLabel(_STATUS_TEXT[State.IDLE])
+        status_label.setObjectName(STATUS_LABEL)
+        layout.addWidget(status_label)
+        layout.addStretch(1)
+
+        clock_box = QVBoxLayout()
+        clock_label = QLabel("--:--")
+        clock_label.setObjectName(CLOCK_LABEL)
+        clock_label.setAlignment(Qt.AlignmentFlag.AlignRight)
+        date_label = QLabel("")
+        date_label.setObjectName(DATE_LABEL)
+        date_label.setAlignment(Qt.AlignmentFlag.AlignRight)
+        clock_box.addWidget(clock_label)
+        clock_box.addWidget(date_label)
+        layout.addLayout(clock_box)
+
+        return header
+
+    def _build_sidebar(self) -> QWidget:
+        sidebar = QFrame()
+        sidebar.setObjectName("sidebar")
+        layout = QVBoxLayout(sidebar)
+
+        nav_items = [
+            (NAV_HOME, "Home", 0),
+            (NAV_CHAT, "Chat", 1),
+            (NAV_TASKS, "Tasks", 2),
+            (NAV_FILES, "Files", 3),
+            (NAV_SETTINGS, "Settings", 4),
+        ]
+        self._nav_buttons: dict[str, QPushButton] = {}
+        for object_name, label, index in nav_items:
+            button = QPushButton(label)
+            button.setObjectName(object_name)
+            button.setCheckable(True)
+            button.setProperty("navButton", True)
+            button.clicked.connect(
+                lambda _checked=False, i=index, name=object_name: self._go_to_page(
+                    name, index=i
+                )
+            )
+            layout.addWidget(button)
+            self._nav_buttons[object_name] = button
+        self._nav_buttons[NAV_HOME].setChecked(True)
+
+        layout.addStretch(1)
+        return sidebar
+
+    def _go_to_page(self, object_name: str, index: int | None = None) -> None:
+        """Switches the stacked widget to the named page and keeps exactly
+        one sidebar button checked -- Qt doesn't auto-exclude checkable
+        buttons that aren't in a QButtonGroup, so this does it by hand."""
+        order = [NAV_HOME, NAV_CHAT, NAV_TASKS, NAV_FILES, NAV_SETTINGS]
+        if index is None:
+            index = order.index(object_name)
+        self._stack.setCurrentIndex(index)
+        for name, button in self._nav_buttons.items():
+            button.setChecked(name == object_name)
+
+    # --- Home page: the orb, quick actions, system status, current task -----
+
+    def _build_home_page(self) -> QWidget:
+        page = QWidget()
+        layout = QHBoxLayout(page)
+
+        center = QVBoxLayout()
+        center.addStretch(1)
+
+        self._orb = _Orb()
+        center.addWidget(self._orb, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        quote = QLabel(
+            '"Great things are not done by impulse, but by a series of\n'
+            'small things brought together." — Vincent van Gogh'
+        )
+        quote.setObjectName("quote")
+        quote.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        center.addWidget(quote)
+
+        record_button = QPushButton("Εγγραφή")
+        record_button.setObjectName(RECORD_BUTTON)
+        record_button.clicked.connect(self._start_listening)
+        center.addWidget(record_button, alignment=Qt.AlignmentFlag.AlignCenter)
+        center.addStretch(1)
+
+        layout.addLayout(center, stretch=3)
+        layout.addWidget(self._build_home_sidebar(), stretch=1)
+
+        return page
+
+    def _build_home_sidebar(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+
+        layout.addWidget(self._build_monitoring_box())
+        layout.addWidget(self._build_quick_actions_box())
+        layout.addWidget(self._build_current_task_box())
+        layout.addStretch(1)
+
+        return panel
+
+    def _build_monitoring_box(self) -> QWidget:
+        box = QFrame()
+        box.setObjectName("panel")
+        layout = QVBoxLayout(box)
+        layout.addWidget(QLabel("System Status"))
+
+        for object_name, placeholder in (
+            (CPU_LABEL, "CPU: —"),
+            (RAM_LABEL, "RAM: —"),
+            (VRAM_LABEL, "VRAM: —"),
+            (NETWORK_LABEL, "Network: —"),
+        ):
+            label = QLabel(placeholder)
+            label.setObjectName(object_name)
+            layout.addWidget(label)
+
+        # "—" is the construction-time placeholder only; _poll_system()
+        # overwrites all four labels with an actual reading on the first
+        # timer tick. VRAM can still land on "μη διαθέσιμο" afterwards
+        # rather than a percentage -- that is _read_vram_percent() reporting
+        # no NVIDIA GPU found, not a stuck placeholder.
+        return box
+
+    def _build_quick_actions_box(self) -> QWidget:
+        box = QFrame()
+        box.setObjectName("panel")
+        layout = QVBoxLayout(box)
+        layout.addWidget(QLabel("Quick Actions"))
+
+        # One button per site/app Jarvis can already open by voice
+        # (config.SKILL_SITES / SKILL_APPS) -- so the panel reflects what's
+        # really configured rather than a fixed, separately-maintained list
+        # that drifts from it. Each one calls exactly the function the
+        # voice skill itself calls (skills._open_site()/_open_app()), via
+        # _quick_action_site()/_quick_action_app() below.
+        for label, url in SKILL_SITES.items():
+            button = QPushButton(label)
+            button.clicked.connect(
+                lambda _checked=False, label=label, url=url: self._quick_action_site(
+                    label, url
+                )
+            )
+            layout.addWidget(button)
+
+        for label, argv in SKILL_APPS.items():
+            button = QPushButton(label)
+            button.clicked.connect(
+                lambda _checked=False, label=label, argv=argv: self._quick_action_app(
+                    label, argv
+                )
+            )
+            layout.addWidget(button)
+
+        return box
+
+    def _build_current_task_box(self) -> QWidget:
+        box = QFrame()
+        box.setObjectName("panel")
+        layout = QVBoxLayout(box)
+        layout.addWidget(QLabel("Current Task"))
+
+        label = QLabel("Έτοιμος — περιμένω εντολή.")
+        label.setObjectName(CURRENT_TASK_LABEL)
+        label.setWordWrap(True)
+        layout.addWidget(label)
+
+        return box
+
+    def _quick_action_site(self, label: str, url: str) -> None:
+        """A quick-action button's click, for a configured site. Calls the
+        exact function the voice skill calls (skills._open_site()) rather
+        than a second copy of "how to open a site" -- and reports the result
+        in the transcript the same way a spoken «άνοιξε ...» command would,
+        so the two feel like the same feature from two different inputs."""
+        try:
+            skills._open_site(url)
+        except Exception:
+            widget(self, TRANSCRIPT_LIST).addItem(
+                f"Jarvis: Δεν μπόρεσα να ανοίξω το {label}."
+            )
+            return
+        widget(self, TRANSCRIPT_LIST).addItem(f"Jarvis: Άνοιξα το {label}.")
+
+    def _quick_action_app(self, label: str, argv: list) -> None:
+        """Same as _quick_action_site(), for a configured local app."""
+        try:
+            skills._open_app(argv)
+        except Exception:
+            widget(self, TRANSCRIPT_LIST).addItem(
+                f"Jarvis: Δεν μπόρεσα να ανοίξω το {label}."
+            )
+            return
+        widget(self, TRANSCRIPT_LIST).addItem(f"Jarvis: Άνοιξα το {label}.")
+
+    # --- Chat page ------------------------------------------------------------
+
+    def _build_chat_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.addWidget(QLabel("Συνομιλία"))
+
+        transcript_list = QListWidget()
+        transcript_list.setObjectName(TRANSCRIPT_LIST)
+        # Starts empty; a real turn appends to it (see _on_listen_finished).
+        # Still nothing invented here -- every line it ever holds came back
+        # from listener.listen(), not a placeholder this file wrote.
+        layout.addWidget(transcript_list)
+
+        return page
+
+    # --- Tasks page -------------------------------------------------------------
+
+    def _build_tasks_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.addWidget(QLabel("Εργασίες"))
+
+        tasks_list = QListWidget()
+        tasks_list.setObjectName(TASKS_LIST)
+        # Empty here at construction only -- _load_tasks() (called at the
+        # end of __init__, and again after every completed turn) fills it
+        # from memory.agenda(), the same courses/exams/reminders data
+        # «τι έχω σήμερα» already speaks, rendered as a list instead.
+        layout.addWidget(tasks_list)
+
+        return page
+
+    # --- Files page (stub -- Phase 7 builds the real thing) --------------------
+
+    def _build_files_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.addWidget(QLabel("Αρχεία"))
+        placeholder = QLabel(
+            "Η διαχείριση αρχείων (αναζήτηση, άνοιγμα, οργάνωση) είναι το "
+            "Phase 7 του roadmap -- δεν έχει χτιστεί ακόμα."
+        )
+        placeholder.setWordWrap(True)
+        layout.addWidget(placeholder)
+        layout.addStretch(1)
+        return page
+
+    # --- Settings page ----------------------------------------------------------
+
+    def _build_settings_page(self) -> QWidget:
+        """A read-only view over what jarvis/config.py actually read from
+        .env for this run, plus the debug-mode toggle. Read-only is not a
+        shortcut taken for lack of time -- it's the only shape consistent
+        with the project's own working rule "never edit .env": a field here
+        that wrote back to it would mean Claude code editing .env by another
+        name. Seeing a wrong value here still tells you to go fix .env by
+        hand and restart, which is the whole point of a settings surface
+        over a config that's only ever read at startup."""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.addWidget(QLabel("Ρυθμίσεις"))
+
+        form = QFormLayout()
         # Grouped the same way CLAUDE.md's own "Config"/"Providers" sections
         # are: brain, voice, wake word/conversation, logging -- a developer
-        # reading this dialog and reading those docs sees the same shape.
-        # Values only, never a control to change them (see the comment on
-        # settings_action above for why).
+        # reading this page and reading those docs sees the same shape.
         rows: list[tuple[str, object]] = [
             ("Brain provider", config.BRAIN_PROVIDER),
             (
@@ -450,24 +886,35 @@ class MainWindow(QMainWindow):
             ("Whisper model", config.WHISPER_MODEL),
             ("Wake word", "on" if config.WAKE_WORD_ENABLED else "off"),
             ("Barge-in", "on" if config.BARGE_IN_ENABLED else "off"),
-            (
-                "Conversation mode",
-                "on" if config.CONVERSATION_MODE else "off",
-            ),
+            ("Conversation mode", "on" if config.CONVERSATION_MODE else "off"),
             ("Scheduler", "on" if config.SCHEDULER_ENABLED else "off"),
             ("Diagnostic log", "on" if config.LOG_ENABLED else "off"),
         ]
         for label, value in rows:
             form.addRow(f"{label}:", QLabel(str(value)))
+        layout.addLayout(form)
 
-        dialog.exec()
+        # Checkable, and wired to something real: when checked, every
+        # completed turn appends one extra transcript line showing the audit
+        # row policy.py already wrote for that turn (which skill matched, or
+        # that the brain answered, and why) -- see _append_debug_line(). That
+        # reuses the audit log Phase 4 already built rather than inventing a
+        # second logging path; nothing is computed here that wasn't already
+        # being recorded.
+        debug_checkbox = QCheckBox("Λειτουργία αποσφαλμάτωσης")
+        debug_checkbox.setObjectName(DEBUG_ACTION)
+        layout.addWidget(debug_checkbox)
+
+        layout.addStretch(1)
+        return page
 
     def _debug_mode_enabled(self) -> bool:
         """Reads DEBUG_ACTION's own checked state -- the single source of
         truth for whether debug lines are appended, rather than a second
-        flag that could drift from what the menu shows is checked."""
-        action = self.findChild(QAction, DEBUG_ACTION)
-        return action is not None and action.isChecked()
+        flag that could drift from what the settings page shows is
+        checked."""
+        checkbox = self.findChild(QCheckBox, DEBUG_ACTION)
+        return checkbox is not None and checkbox.isChecked()
 
     def _append_debug_line(self) -> None:
         """Appends one transcript line describing the audit row policy.py
@@ -496,51 +943,6 @@ class MainWindow(QMainWindow):
         widget(self, TRANSCRIPT_LIST).addItem(
             f"[debug] {action} → {decision} ({reason})"
         )
-
-    # --- Central widget: transcript + side panel -----------------------------
-
-    def _build_central_widget(self) -> None:
-        central = QWidget(self)
-        self.setCentralWidget(central)
-
-        outer = QVBoxLayout(central)
-
-        # The status strip. Its text and the record button's enabled state
-        # are both driven from one place now -- _set_state() -- so "Αδρανές"
-        # here is only the one-time construction value; every transition
-        # afterwards goes through _set_state(), never setText() directly.
-        status_label = QLabel("Κατάσταση: Αδρανές")
-        status_label.setObjectName(STATUS_LABEL)
-        status_label.setStyleSheet("font-weight: bold; padding: 4px;")
-        outer.addWidget(status_label)
-
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        outer.addWidget(splitter, stretch=1)
-
-        splitter.addWidget(self._build_transcript_panel())
-        splitter.addWidget(self._build_side_panel())
-        # The transcript gets most of the width; the side panel is fixed-ish.
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 1)
-
-    def _build_transcript_panel(self) -> QWidget:
-        panel = QWidget()
-        layout = QVBoxLayout(panel)
-        layout.addWidget(QLabel("Συνομιλία"))
-
-        transcript_list = QListWidget()
-        transcript_list.setObjectName(TRANSCRIPT_LIST)
-        # Starts empty; a real turn appends to it (see _on_listen_finished).
-        # Still nothing invented here -- every line it ever holds came back
-        # from listener.listen(), not a placeholder this file wrote.
-        layout.addWidget(transcript_list)
-
-        record_button = QPushButton("Εγγραφή")
-        record_button.setObjectName(RECORD_BUTTON)
-        record_button.clicked.connect(self._start_listening)
-        layout.addWidget(record_button)
-
-        return panel
 
     # --- Microphone + brain + voice (Phase 6 step 4, all three of 3) --------
 
@@ -619,127 +1021,11 @@ class MainWindow(QMainWindow):
         # when a turn changes it.
         self._load_tasks()
 
-    def _build_side_panel(self) -> QWidget:
-        panel = QWidget()
-        layout = QVBoxLayout(panel)
-
-        layout.addWidget(self._build_quick_actions_box())
-        layout.addWidget(self._build_tasks_box())
-        layout.addWidget(self._build_monitoring_box())
-        layout.addStretch(1)
-
-        return panel
-
-    def _build_quick_actions_box(self) -> QWidget:
-        box = QWidget()
-        layout = QVBoxLayout(box)
-        layout.addWidget(QLabel("Γρήγορες ενέργειες"))
-
-        # One button per site/app Jarvis can already open by voice
-        # (config.SKILL_SITES / SKILL_APPS) -- so the panel reflects what's
-        # really configured rather than a fixed, separately-maintained list
-        # that drifts from it. Each one is now wired to exactly the function
-        # the voice skill itself calls (skills._open_site()/_open_app()), via
-        # _quick_action_site()/_quick_action_app() below -- so a click and
-        # the matching spoken command do the same thing, not two
-        # independently-maintained ways to open the same site or app.
-        # Enabled now that there's something real behind the click; a button
-        # that looks clickable but does nothing would be worse than the
-        # disabled placeholder step 3 built.
-        for label, url in SKILL_SITES.items():
-            button = QPushButton(label)
-            button.clicked.connect(
-                lambda _checked=False, label=label, url=url: self._quick_action_site(
-                    label, url
-                )
-            )
-            layout.addWidget(button)
-
-        for label, argv in SKILL_APPS.items():
-            button = QPushButton(label)
-            button.clicked.connect(
-                lambda _checked=False, label=label, argv=argv: self._quick_action_app(
-                    label, argv
-                )
-            )
-            layout.addWidget(button)
-
-        return box
-
-    def _quick_action_site(self, label: str, url: str) -> None:
-        """A quick-action button's click, for a configured site. Calls the
-        exact function the voice skill calls (skills._open_site()) rather
-        than a second copy of "how to open a site" -- and reports the result
-        in the transcript the same way a spoken «άνοιξε ...» command would,
-        so the two feel like the same feature from two different inputs."""
-        try:
-            skills._open_site(url)
-        except Exception:
-            widget(self, TRANSCRIPT_LIST).addItem(
-                f"Jarvis: Δεν μπόρεσα να ανοίξω το {label}."
-            )
-            return
-        widget(self, TRANSCRIPT_LIST).addItem(f"Jarvis: Άνοιξα το {label}.")
-
-    def _quick_action_app(self, label: str, argv: list) -> None:
-        """Same as _quick_action_site(), for a configured local app."""
-        try:
-            skills._open_app(argv)
-        except Exception:
-            widget(self, TRANSCRIPT_LIST).addItem(
-                f"Jarvis: Δεν μπόρεσα να ανοίξω το {label}."
-            )
-            return
-        widget(self, TRANSCRIPT_LIST).addItem(f"Jarvis: Άνοιξα το {label}.")
-
-    def _build_tasks_box(self) -> QWidget:
-        box = QWidget()
-        layout = QVBoxLayout(box)
-        layout.addWidget(QLabel("Εργασίες"))
-
-        tasks_list = QListWidget()
-        tasks_list.setObjectName(TASKS_LIST)
-        # Empty here at construction only -- _load_tasks() (called at the
-        # end of __init__, and again after every completed turn) fills it
-        # from memory.agenda(), the same courses/exams/reminders data
-        # «τι έχω σήμερα» already speaks, rendered as a list instead.
-        layout.addWidget(tasks_list)
-
-        return box
-
-    def _build_monitoring_box(self) -> QWidget:
-        box = QWidget()
-        layout = QVBoxLayout(box)
-        layout.addWidget(QLabel("Σύστημα"))
-
-        row = QHBoxLayout()
-        cpu_label = QLabel("CPU: —")
-        cpu_label.setObjectName(CPU_LABEL)
-        ram_label = QLabel("RAM: —")
-        ram_label.setObjectName(RAM_LABEL)
-        vram_label = QLabel("VRAM: —")
-        vram_label.setObjectName(VRAM_LABEL)
-        row.addWidget(cpu_label)
-        row.addWidget(ram_label)
-        row.addWidget(vram_label)
-        layout.addLayout(row)
-
-        # "—" is the construction-time placeholder only; _poll_system()
-        # (the real-system-monitoring piece of step 5) overwrites all three
-        # labels with an actual reading on the first timer tick, so "—" is
-        # only ever seen for one MONITOR_POLL_MS at startup. VRAM's own
-        # reading can still land on "μη διαθέσιμο" afterwards rather than a
-        # percentage -- that is _read_vram_percent() reporting no NVIDIA GPU
-        # found, not a stuck placeholder.
-        return box
-
     # --- Status bar -----------------------------------------------------------
 
     def _build_status_bar(self) -> None:
         bar = QStatusBar()
-        bar.showMessage(
-            "Jarvis — Phase 6, βήμα 5: state machine + παρακολούθηση συστήματος"
-        )
+        bar.showMessage("Jarvis — Phase 6 complete")
         self.setStatusBar(bar)
 
 
@@ -750,3 +1036,92 @@ def widget(window: MainWindow, object_name: str) -> QWidget:
     if found is None:
         raise LookupError(f"no widget named {object_name!r}")
     return found
+
+
+# Dark, "premium" palette matching the reference mockup's register (deep
+# navy/black backgrounds, a single blue accent, soft rounded panels) without
+# any of its copyrighted imagery -- a stylesheet, not a design system, so
+# it's one block rather than split across every _build_*() method.
+_STYLESHEET = """
+QMainWindow, QWidget {
+    background-color: #0b0f1a;
+    color: #e6edf7;
+    font-family: "Segoe UI", sans-serif;
+}
+QFrame#header {
+    background-color: #0f1524;
+    border-bottom: 1px solid #1e2740;
+}
+QLabel#brandTitle {
+    font-size: 20px;
+    font-weight: bold;
+    letter-spacing: 2px;
+}
+QLabel#tagline {
+    color: #7a8aa8;
+    font-size: 11px;
+}
+QLabel#clock_label {
+    font-size: 16px;
+    font-weight: bold;
+}
+QLabel#date_label {
+    color: #7a8aa8;
+    font-size: 11px;
+}
+QFrame#sidebar {
+    background-color: #0f1524;
+    border-right: 1px solid #1e2740;
+    min-width: 160px;
+    max-width: 160px;
+}
+QPushButton[navButton="true"] {
+    text-align: left;
+    padding: 10px 14px;
+    border: none;
+    border-radius: 6px;
+    background-color: transparent;
+    color: #a9b6cc;
+}
+QPushButton[navButton="true"]:checked {
+    background-color: #1b2440;
+    color: #ffffff;
+}
+QPushButton[navButton="true"]:hover {
+    background-color: #161e34;
+}
+QFrame#panel {
+    background-color: #111828;
+    border: 1px solid #1e2740;
+    border-radius: 10px;
+    padding: 6px;
+    margin: 6px;
+}
+QLabel#quote {
+    color: #7a8aa8;
+    font-style: italic;
+    padding: 8px;
+}
+QListWidget {
+    background-color: #111828;
+    border: 1px solid #1e2740;
+    border-radius: 8px;
+}
+QPushButton {
+    background-color: #1b2440;
+    border: 1px solid #2a3658;
+    border-radius: 6px;
+    padding: 6px 10px;
+    color: #e6edf7;
+}
+QPushButton:hover {
+    background-color: #243058;
+}
+QPushButton:disabled {
+    color: #566180;
+}
+QStatusBar {
+    background-color: #0f1524;
+    color: #7a8aa8;
+}
+"""

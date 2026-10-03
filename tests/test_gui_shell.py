@@ -24,13 +24,21 @@ from unittest import mock
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 try:
-    from PySide6.QtWidgets import QApplication
+    from PySide6.QtWidgets import QApplication, QLabel, QPushButton
 
     from jarvis.gui import main_window as _main_window_module
     from jarvis.gui.main_window import (
+        CLOCK_LABEL,
         CPU_LABEL,
+        DATE_LABEL,
         DEBUG_ACTION,
         MONITOR_POLL_MS,
+        NAV_CHAT,
+        NAV_FILES,
+        NAV_HOME,
+        NAV_SETTINGS,
+        NAV_TASKS,
+        NETWORK_LABEL,
         RAM_LABEL,
         RECORD_BUTTON,
         STATUS_LABEL,
@@ -39,6 +47,7 @@ try:
         VRAM_LABEL,
         MainWindow,
         State,
+        _format_rate,
         widget,
     )
 
@@ -120,15 +129,11 @@ class ShellConstructionTests(unittest.TestCase):
 
     def test_debug_action_is_checkable_and_starts_unchecked(self) -> None:
         window = MainWindow()
-        # QAction isn't a QWidget, so widget()'s findChild(QWidget, ...)
-        # can't see it -- found directly here instead, by the same object
-        # name, via QAction's own findChild.
-        from PySide6.QtGui import QAction
-
-        debug_action = window.findChild(QAction, DEBUG_ACTION)
-        self.assertIsNotNone(debug_action)
-        self.assertTrue(debug_action.isCheckable())
-        self.assertFalse(debug_action.isChecked())
+        # DEBUG_ACTION is a QCheckBox on the Settings page now (it used to
+        # be a menu QAction before the redesign) -- an ordinary QWidget, so
+        # widget()'s findChild(QWidget, ...) sees it directly.
+        debug_checkbox = widget(window, DEBUG_ACTION)
+        self.assertFalse(debug_checkbox.isChecked())
 
     def test_unknown_widget_name_raises_rather_than_returning_none(self) -> None:
         window = MainWindow()
@@ -442,9 +447,7 @@ class DebugModeWiringTests(unittest.TestCase):
 
     @staticmethod
     def _enable_debug_mode(window: MainWindow) -> None:
-        from PySide6.QtGui import QAction
-
-        window.findChild(QAction, DEBUG_ACTION).setChecked(True)
+        widget(window, DEBUG_ACTION).setChecked(True)
 
     def test_debug_mode_is_off_by_default(self) -> None:
         window = MainWindow()
@@ -512,37 +515,40 @@ class DebugModeWiringTests(unittest.TestCase):
 
 
 @unittest.skipUnless(_PYSIDE6_AVAILABLE, "PySide6 is not installed here")
-class SettingsDialogTests(unittest.TestCase):
-    """The settings menu's real surface: a read-only QDialog over
-    jarvis/config.py's actual values. QDialog.exec() is mocked in every test
-    here -- it's modal and would otherwise block the test process waiting
-    for a user to close a window that will never appear."""
+class SettingsPageTests(unittest.TestCase):
+    """The settings surface's real home after the redesign: a page in the
+    sidebar's QStackedWidget (NAV_SETTINGS), not a modal QDialog -- it's
+    built once at construction like every other page, so there's no
+    exec()/blocking concern here the way the old dialog needed one mocked."""
 
     @classmethod
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
 
-    def test_opening_settings_shows_a_modal_dialog_without_crashing(self) -> None:
+    def test_the_settings_page_is_reachable_from_the_sidebar(self) -> None:
         window = MainWindow()
-        with mock.patch(
-            "jarvis.gui.main_window.QDialog.exec", return_value=0
-        ) as exec_:
-            window._show_settings_dialog()  # must not raise or block
-        exec_.assert_called_once()
+        nav_button = window.findChild(QPushButton, _main_window_module.NAV_SETTINGS)
+        self.assertIsNotNone(nav_button)
 
-    def test_the_dialog_shows_the_real_brain_provider(self) -> None:
-        window = MainWindow()
-        with mock.patch("jarvis.gui.main_window.QDialog.exec", return_value=0):
-            with mock.patch(
-                "jarvis.gui.main_window.config.BRAIN_PROVIDER", "ollama"
-            ):
-                # No assertion on the dialog's own widgets -- QFormLayout
-                # rows aren't addressed by objectName, and this piece is
-                # read-only informational text, not something later code
-                # depends on finding again. The real guarantee is the one
-                # above: building it from the live config values never
-                # raises, whatever BRAIN_PROVIDER happens to be.
-                window._show_settings_dialog()
+        nav_button.click()
+
+        self.assertEqual(window._stack.currentWidget(), window._stack.widget(4))
+        self.assertTrue(nav_button.isChecked())
+
+    def test_the_settings_page_shows_the_real_brain_provider(self) -> None:
+        with mock.patch("jarvis.gui.main_window.config.BRAIN_PROVIDER", "ollama"):
+            window = MainWindow()  # must not raise, whatever BRAIN_PROVIDER is
+
+        # QFormLayout rows aren't addressed by objectName, so this checks the
+        # page's visible text directly rather than a specific widget -- the
+        # real guarantee is that building the page from the live config
+        # values never raises and the value actually appears somewhere on it.
+        settings_page = window._stack.widget(4)
+        labels = [
+            child.text()
+            for child in settings_page.findChildren(QLabel)
+        ]
+        self.assertTrue(any("ollama" in text for text in labels))
 
 
 @unittest.skipUnless(_PYSIDE6_AVAILABLE, "PySide6 is not installed here")
@@ -899,6 +905,161 @@ class QuickActionWiringTests(unittest.TestCase):
             transcript.item(transcript.count() - 1).text(),
             "Jarvis: Δεν μπόρεσα να ανοίξω το Gmail.",
         )
+
+
+@unittest.skipUnless(_PYSIDE6_AVAILABLE, "PySide6 is not installed here")
+class SidebarNavigationTests(unittest.TestCase):
+    """The redesign's own new navigation structure: a QStackedWidget with
+    one page per sidebar button. Only NAV_SETTINGS is covered above
+    (SettingsPageTests); this pins the other three and that exactly one
+    sidebar button stays checked at a time, whichever one was clicked."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def _nav(self, window: MainWindow, object_name: str) -> QPushButton:
+        button = window.findChild(QPushButton, object_name)
+        self.assertIsNotNone(button, f"no nav button named {object_name!r}")
+        return button
+
+    def test_home_is_the_page_shown_at_construction(self) -> None:
+        window = MainWindow()
+        self.assertEqual(window._stack.currentWidget(), window._stack.widget(0))
+        self.assertTrue(self._nav(window, NAV_HOME).isChecked())
+
+    def test_each_nav_button_switches_to_its_own_page_and_checks_itself(
+        self,
+    ) -> None:
+        window = MainWindow()
+        for object_name, index in (
+            (NAV_CHAT, 1),
+            (NAV_TASKS, 2),
+            (NAV_FILES, 3),
+            (NAV_SETTINGS, 4),
+            (NAV_HOME, 0),
+        ):
+            self._nav(window, object_name).click()
+            self.assertEqual(window._stack.currentWidget(), window._stack.widget(index))
+            for other_name in (NAV_HOME, NAV_CHAT, NAV_TASKS, NAV_FILES, NAV_SETTINGS):
+                self.assertEqual(
+                    self._nav(window, other_name).isChecked(),
+                    other_name == object_name,
+                )
+
+
+@unittest.skipUnless(_PYSIDE6_AVAILABLE, "PySide6 is not installed here")
+class OrbTests(unittest.TestCase):
+    """_Orb is purely decorative (see its docstring and ORB_TICK_MS's own
+    comment on why the waveform isn't real audio), so there's nothing to pin
+    about what it draws -- only that it tracks the state machine the same
+    way the status label and record button do, via _set_state()."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_set_state_updates_the_orbs_own_state(self) -> None:
+        window = MainWindow()
+        for state in State:
+            window._set_state(state)
+            self.assertIs(window._orb._state, state)
+
+    def test_tick_advances_the_phase_without_raising(self) -> None:
+        window = MainWindow()
+        before = window._orb._phase
+        window._orb.tick()
+        self.assertGreater(window._orb._phase, before)
+
+
+@unittest.skipUnless(_PYSIDE6_AVAILABLE, "PySide6 is not installed here")
+class FormatRateTests(unittest.TestCase):
+    """_format_rate() is a pure function -- no QApplication needed to call
+    it, but it lives in main_window.py, so it's gated like every other test
+    here rather than actually running where PySide6 isn't installed."""
+
+    def test_under_one_kb_still_reads_in_kb(self) -> None:
+        self.assertEqual(_format_rate(500), "0.5 KB/s")
+
+    def test_kilobytes_per_second(self) -> None:
+        self.assertEqual(_format_rate(2048), "2.0 KB/s")
+
+    def test_rolls_over_to_megabytes_per_second(self) -> None:
+        self.assertEqual(_format_rate(1_258_291), "1.2 MB/s")
+
+
+@unittest.skipUnless(_PYSIDE6_AVAILABLE, "PySide6 is not installed here")
+class NetworkMonitoringTests(unittest.TestCase):
+    """_poll_system()'s network-rate half: psutil only gives a cumulative
+    byte count, so the first poll in a process has no "last" to diff
+    against and must show nothing yet, exactly like cpu_percent()'s own
+    priming call -- MonitoringTests above already pins the CPU/RAM/VRAM
+    side of the same method."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def _poll(self, window: MainWindow, total_bytes: int, now: float) -> None:
+        counters = mock.Mock(bytes_sent=total_bytes, bytes_recv=0)
+        with mock.patch(
+            "jarvis.gui.main_window.psutil.cpu_percent", return_value=0.0
+        ), mock.patch(
+            "jarvis.gui.main_window.psutil.virtual_memory",
+            return_value=mock.Mock(percent=0.0),
+        ), mock.patch(
+            "jarvis.gui.main_window._read_vram_percent", return_value=None
+        ), mock.patch(
+            "jarvis.gui.main_window.psutil.net_io_counters",
+            return_value=counters,
+        ), mock.patch(
+            "jarvis.gui.main_window.time.monotonic", return_value=now
+        ):
+            window._poll_system()
+
+    def test_the_first_poll_shows_no_rate_yet(self) -> None:
+        window = MainWindow()
+        placeholder = widget(window, NETWORK_LABEL).text()
+        self._poll(window, total_bytes=1_000_000, now=10.0)
+        # No "last" reading existed yet, so the label is left exactly as
+        # _poll_system() found it -- unchanged from construction.
+        self.assertEqual(widget(window, NETWORK_LABEL).text(), placeholder)
+
+    def test_the_second_poll_computes_a_real_rate(self) -> None:
+        window = MainWindow()
+        self._poll(window, total_bytes=1_000_000, now=10.0)
+        self._poll(window, total_bytes=1_000_000 + 2048, now=11.0)  # +2KB in 1s
+
+        self.assertEqual(widget(window, NETWORK_LABEL).text(), "Network: 2.0 KB/s")
+
+
+@unittest.skipUnless(_PYSIDE6_AVAILABLE, "PySide6 is not installed here")
+class ClockTests(unittest.TestCase):
+    """_update_clock() -- called once at construction and then every second
+    by _clock_timer. A fixed datetime is patched in rather than asserting
+    against whatever time the test happens to run at."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_the_clock_and_date_labels_reflect_the_current_time(self) -> None:
+        import datetime as _datetime_module
+
+        fixed = _datetime_module.datetime(2026, 9, 18, 18, 24)
+        with mock.patch(
+            "jarvis.gui.main_window.datetime"
+        ) as fake_datetime:
+            fake_datetime.now.return_value = fixed
+            window = MainWindow()
+
+        self.assertEqual(widget(window, CLOCK_LABEL).text(), "18:24")
+        self.assertEqual(widget(window, DATE_LABEL).text(), fixed.strftime("%a %d %b %Y"))
+
+    def test_closing_the_window_stops_the_clock_timer(self) -> None:
+        window = MainWindow()
+        window.close()
+        self.assertFalse(window._clock_timer.isActive())
 
 
 if __name__ == "__main__":
