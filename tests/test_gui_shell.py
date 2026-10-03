@@ -51,6 +51,32 @@ try:
 except ImportError:
     _PYSIDE6_AVAILABLE = False
 
+# Every completed turn now also calls _load_tasks() (see
+# _on_speak_finished()), which calls db.connect() -- patched globally for
+# this whole module, the same reason listener.listen()/brain.ask()/
+# speaker.speak() are mocked in every individual test, so that no test here
+# ever opens the real data/jarvis.db file. A bare MagicMock's default
+# __iter__ (an empty iterator) is what makes memory.agenda() come back []
+# against it without needing its own try/except -- construction-time
+# assertions elsewhere in this file that the tasks list starts empty rely
+# on exactly that. Tests that care what the tasks list actually shows
+# (TasksWiringTests, below) separately mock memory.agenda() itself to
+# supply real items.
+_db_connect_patcher: mock._patch | None = None
+
+
+def setUpModule() -> None:
+    global _db_connect_patcher
+    if not _PYSIDE6_AVAILABLE:
+        return
+    _db_connect_patcher = mock.patch("jarvis.gui.main_window.db.connect")
+    _db_connect_patcher.start()
+
+
+def tearDownModule() -> None:
+    if _db_connect_patcher is not None:
+        _db_connect_patcher.stop()
+
 
 @unittest.skipUnless(_PYSIDE6_AVAILABLE, "PySide6 is not installed here")
 class ShellConstructionTests(unittest.TestCase):
@@ -601,6 +627,98 @@ class GpuMonitoringTests(unittest.TestCase):
         fake_pynvml.nvmlInit.assert_called_once()
         fake_pynvml.nvmlDeviceGetHandleByIndex.assert_called_once()
         self.assertEqual(fake_pynvml.nvmlDeviceGetMemoryInfo.call_count, 2)
+
+
+@unittest.skipUnless(_PYSIDE6_AVAILABLE, "PySide6 is not installed here")
+class TasksWiringTests(unittest.TestCase):
+    """Phase 6 step 5's third piece: _load_tasks(), rendering
+    memory.agenda() -- the same data «τι έχω σήμερα» already speaks -- as a
+    list instead. memory.agenda() is mocked directly in every test here
+    (the module-level db.connect() patch above only keeps construction
+    itself from touching a real database; these tests go further and
+    control exactly what agenda() hands back)."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_construction_loads_todays_agenda(self) -> None:
+        items = [
+            ("class", "Φυσική 10:00"),
+            ("exam", "Μαθηματικά"),
+            ("reminder", "Πιες νερό"),
+        ]
+        with mock.patch(
+            "jarvis.gui.main_window.memory.agenda", return_value=items
+        ):
+            window = MainWindow()
+
+        tasks = widget(window, TASKS_LIST)
+        self.assertEqual(tasks.count(), 3)
+        self.assertEqual(tasks.item(0).text(), "μάθημα Φυσική 10:00")
+        self.assertEqual(tasks.item(1).text(), "εξέταση Μαθηματικά")
+        self.assertEqual(tasks.item(2).text(), "Πιες νερό")
+
+    def test_a_database_error_leaves_the_tasks_list_empty_without_crashing(
+        self,
+    ) -> None:
+        # Same discipline as memory.recall_safe(): a locked or broken
+        # database costs this one refresh, never a crashed GUI.
+        with mock.patch(
+            "jarvis.gui.main_window.memory.agenda",
+            side_effect=RuntimeError("database is locked"),
+        ):
+            window = MainWindow()
+
+        self.assertEqual(widget(window, TASKS_LIST).count(), 0)
+
+    def test_a_completed_turn_refreshes_the_tasks_list(self) -> None:
+        # _on_speak_finished() is exercised directly (as SpeechWiringTests
+        # does for the rest of its behaviour) rather than through a full
+        # recording -- the microphone/brain halves are already pinned
+        # elsewhere, and the tasks-list refresh is the one piece of
+        # _on_speak_finished() this class cares about.
+        with mock.patch(
+            "jarvis.gui.main_window.memory.agenda", return_value=[]
+        ):
+            window = MainWindow()
+        self.assertEqual(widget(window, TASKS_LIST).count(), 0)
+
+        with mock.patch(
+            "jarvis.gui.main_window.memory.agenda",
+            return_value=[("reminder", "Νέα υπενθύμιση")],
+        ):
+            window._on_speak_finished()
+
+        tasks = widget(window, TASKS_LIST)
+        self.assertEqual(tasks.count(), 1)
+        self.assertEqual(tasks.item(0).text(), "Νέα υπενθύμιση")
+
+
+@unittest.skipUnless(_PYSIDE6_AVAILABLE, "PySide6 is not installed here")
+class RenderAgendaItemTests(unittest.TestCase):
+    """_render_agenda_item() is a pure function and needs no QApplication --
+    but it still lives in main_window.py, which imports PySide6 at module
+    level, so it's gated the same as every other test here rather than
+    actually running in this sandbox."""
+
+    def test_an_exam_is_prefixed(self) -> None:
+        self.assertEqual(
+            _main_window_module._render_agenda_item("exam", "Φυσική"),
+            "εξέταση Φυσική",
+        )
+
+    def test_a_class_is_prefixed(self) -> None:
+        self.assertEqual(
+            _main_window_module._render_agenda_item("class", "Χημεία 09:00"),
+            "μάθημα Χημεία 09:00",
+        )
+
+    def test_a_reminder_is_shown_as_is(self) -> None:
+        self.assertEqual(
+            _main_window_module._render_agenda_item("reminder", "Πιες νερό"),
+            "Πιες νερό",
+        )
 
 
 if __name__ == "__main__":

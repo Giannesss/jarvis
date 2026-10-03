@@ -7,7 +7,9 @@ is one explicit value for what Jarvis is doing right now, read by everything
 that used to ask three different thread attributes whether they were
 `None`; real system monitoring (`_poll_system()`, below) fills the CPU/RAM/
 VRAM labels from `psutil`/`pynvml` on a timer instead of leaving them at "—"
-forever.
+forever; the tasks list (`_load_tasks()`, below) renders today's
+`memory.agenda()` -- the same data «τι έχω σήμερα» already speaks -- as a
+list instead.
 
 Every widget that something will eventually read or write from outside this
 file has a stable `objectName()` set on it (see `_NAMED_WIDGETS` and the
@@ -30,6 +32,7 @@ reason.
 
 from __future__ import annotations
 
+from datetime import datetime
 from enum import Enum, auto
 
 import psutil
@@ -48,7 +51,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from jarvis import brain, listener, memory, policy, skills, speaker
+from jarvis import brain, db, listener, memory, policy, skills, speaker
 from jarvis.config import SKILL_APPS, SKILL_SITES
 
 # Object names for every widget a later step, or a test, needs to find again.
@@ -111,6 +114,23 @@ def _read_vram_percent() -> float | None:
     except Exception:
         _nvml_unavailable = True
         return None
+
+
+def _render_agenda_item(kind: str, text: str) -> str:
+    """Same phrasing `skills._handle_agenda` already speaks for «τι έχω
+    σήμερα» -- an exam prefixed "εξέταση", a class "μάθημα", a reminder
+    shown as its own text (its fired/missed suffix, if any, is already
+    baked into `text` by `memory.agenda()` itself). Not imported from
+    skills.py: that rendering lives inline inside an f-string there, not a
+    function of its own, so this is a second copy kept in step by hand
+    rather than a shared one -- small enough that duplicating it costs far
+    less than coupling the GUI's tasks list to skills.py's private
+    internals would."""
+    if kind == "exam":
+        return f"εξέταση {text}"
+    if kind == "class":
+        return f"μάθημα {text}"
+    return text
 
 
 class State(Enum):
@@ -281,6 +301,14 @@ class MainWindow(QMainWindow):
         self._monitor_timer.timeout.connect(self._poll_system)
         self._monitor_timer.start(MONITOR_POLL_MS)
 
+        # Initial fill of the tasks list -- same data _poll_system() above
+        # fills CPU/RAM/VRAM with: a read that happens once here so the
+        # panel isn't empty for one more startup heartbeat than it needs to
+        # be, then refreshed again after every completed turn (see
+        # _on_speak_finished()), since a turn can itself have just saved
+        # the exam/reminder/class that would change what "today" holds.
+        self._load_tasks()
+
     def closeEvent(self, event) -> None:  # noqa: N802 -- Qt's own name
         # A QThread still running when its Python wrapper is destroyed
         # prints a Qt warning and can crash on some platforms. Waiting here
@@ -319,6 +347,31 @@ class MainWindow(QMainWindow):
             widget(self, VRAM_LABEL).setText("VRAM: μη διαθέσιμο")
         else:
             widget(self, VRAM_LABEL).setText(f"VRAM: {vram:.0f}%")
+
+    def _load_tasks(self) -> None:
+        """Fills TASKS_LIST with today's agenda -- `memory.agenda()`, the
+        same call the `agenda` skill already makes for «τι έχω σήμερα», just
+        rendered as a list instead of spoken as a sentence. Narrowed to
+        today only (no tab or filter for αύριο/μεθαύριο yet -- that's
+        further than this step asks for: "render memory.agenda() ... as a
+        list instead of speaking it").
+
+        Swallows every error, same discipline as `memory.recall_safe()` and
+        `_handle_agenda`'s own try/except: a locked or broken database means
+        the tasks list doesn't refresh this time, never a crashed GUI or a
+        popup the user didn't ask for."""
+        tasks_list = widget(self, TASKS_LIST)
+        tasks_list.clear()
+        try:
+            conn = db.connect()
+            try:
+                items = memory.agenda(conn, datetime.now().date())
+            finally:
+                conn.close()
+        except Exception:
+            return
+        for kind, text in items:
+            tasks_list.addItem(_render_agenda_item(kind, text))
 
     def _set_state(self, state: State) -> None:
         """The one place that updates the status label and the record
@@ -480,6 +533,13 @@ class MainWindow(QMainWindow):
     def _on_speak_finished(self) -> None:
         self._speak_thread = None
         self._set_state(State.IDLE)
+        # A turn that just finished could itself have saved the exam,
+        # reminder or class that changes what today's agenda holds (e.g.
+        # "θυμήσου ότι έχω εξέταση σήμερα..."), so the tasks list is
+        # refreshed at the one point a turn is fully over, not on its own
+        # timer -- there's no reason to poll a database that only changes
+        # when a turn changes it.
+        self._load_tasks()
 
     def _build_side_panel(self) -> QWidget:
         panel = QWidget()
@@ -518,10 +578,10 @@ class MainWindow(QMainWindow):
 
         tasks_list = QListWidget()
         tasks_list.setObjectName(TASKS_LIST)
-        # Empty by design -- this is the courses/exams/reminders agenda
-        # (memory.agenda(), already built and voice-driven) rendered as a
-        # list instead of spoken, which is a later step's wiring, not new
-        # data of its own.
+        # Empty here at construction only -- _load_tasks() (called at the
+        # end of __init__, and again after every completed turn) fills it
+        # from memory.agenda(), the same courses/exams/reminders data
+        # «τι έχω σήμερα» already speaks, rendered as a list instead.
         layout.addWidget(tasks_list)
 
         return box

@@ -2204,6 +2204,64 @@ does with a reading, as distinct from how that reading is produced.
 label read a real percentage, not "μη διαθέσιμο", against the user's NVIDIA
 GPU. Step 5 piece 2 (CPU, RAM and VRAM, all three live) is closed.
 
+**Step 5, piece 3: the tasks list.** The side panel's tasks list has been
+empty by design since step 3. `_load_tasks()` fills it with today's
+`memory.agenda()` — the same call the `agenda` skill already makes for
+«τι έχω σήμερα» (see "Memory" → "The agenda") — rendered as a list instead
+of spoken as a sentence. `_render_agenda_item()` mirrors that skill's own
+phrasing so an item reads the same whether it's heard or shown: an exam
+prefixed "εξέταση", a class "μάθημα", a reminder shown as its own text
+(its fired/missed suffix, if any, is already baked in by `memory.agenda()`
+itself). It's a second, hand-kept copy of that phrasing rather than an
+import from `skills.py` — small enough that duplicating it costs far less
+than coupling the GUI to a private module's inline rendering would.
+
+**Narrowed to today only**, not the αύριο/μεθαύριο a spoken «τι έχω αύριο»
+can ask for — the step only asks to render `memory.agenda()` as a list,
+not to rebuild the day-picking logic `_agenda_day()` already owns in
+`skills.py`. A tab or filter for other days is further than this piece
+goes.
+
+**Refreshed at two points, not on a timer.** Once at construction (so the
+panel isn't empty for longer than it has to be), and again at the end of
+every completed turn (`_on_speak_finished()`) — a turn can itself have just
+saved the exam/reminder/class that would change what today holds (e.g.
+«θυμήσου ότι έχω εξέταση σήμερα στα μαθηματικά», spoken through the GUI's
+own microphone). Polling a database that only changes when a turn changes
+it would be `_poll_system()`'s reasoning applied somewhere it doesn't fit —
+CPU/RAM/VRAM genuinely drift on their own between ticks; today's agenda
+does not.
+
+**Every error is swallowed, same discipline as `memory.recall_safe()`.**
+A locked or broken database means the tasks list doesn't refresh this
+time, never a crashed GUI or a popup nobody asked for — `_load_tasks()`
+clears the list first, then lets any exception from `db.connect()`/
+`memory.agenda()` simply end the refresh with nothing added.
+
+`TasksWiringTests` pins `_load_tasks()` with `memory.agenda()` mocked
+directly: construction loads a handful of mixed-kind items in the order
+given and renders each correctly; a database error leaves the list empty
+without raising; and a completed turn (`_on_speak_finished()`, called
+directly) picks up a changed agenda. `RenderAgendaItemTests` pins
+`_render_agenda_item()`'s three branches on their own, no window needed.
+Every other existing test in this file that completes a full turn now
+also exercises `_load_tasks()` incidentally (since `_on_speak_finished()`
+calls it) — `db.connect()` is patched once, for the whole test module
+(`setUpModule()`/`tearDownModule()`), the same reason
+`listener.listen()`/`brain.ask()`/`speaker.speak()` are mocked in every
+individual test: so that no test here ever opens the real
+`data/jarvis.db`. A bare `MagicMock`'s default `__iter__` (an empty
+iterator) is what lets `memory.agenda()` come back `[]` against it with no
+further mocking needed — which is exactly what the pre-existing
+"tasks list starts empty" assertion in `ShellConstructionTests` still
+relies on.
+
+Not yet hand-tested live — built and unit-tested only in this round.
+Worth a quick look once it's running: say something through the GUI that
+saves an exam, reminder or class for today (the same phrasing «τι έχω
+σήμερα» already answers out loud), and confirm the tasks list shows it
+after the reply finishes, without needing to close and reopen the window.
+
 **Built in a sandbox that cannot run it, hand-tested on the real machine
 instead.** This sandbox cannot install PySide6 at all — `pypi.org`/
 `files.pythonhosted.org` sit in the proxy's `noProxy` list, so requests go
