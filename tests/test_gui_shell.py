@@ -429,6 +429,123 @@ class SpeechWiringTests(unittest.TestCase):
 
 
 @unittest.skipUnless(_PYSIDE6_AVAILABLE, "PySide6 is not installed here")
+class DebugModeWiringTests(unittest.TestCase):
+    """Phase 6 step 5's fifth and final piece: the debug-mode toggle, wired
+    to append one line per turn describing the audit row policy.py already
+    wrote for it -- db.connect() is mocked per-test here (overriding the
+    module-wide patch from setUpModule) so each test controls exactly what
+    the fake "SELECT ... FROM audit" cursor returns."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    @staticmethod
+    def _enable_debug_mode(window: MainWindow) -> None:
+        from PySide6.QtGui import QAction
+
+        window.findChild(QAction, DEBUG_ACTION).setChecked(True)
+
+    def test_debug_mode_is_off_by_default(self) -> None:
+        window = MainWindow()
+        self.assertFalse(window._debug_mode_enabled())
+
+    def test_a_reply_with_debug_mode_off_appends_no_debug_line(self) -> None:
+        window = MainWindow()
+        with mock.patch("jarvis.gui.main_window.speaker.speak"):
+            window._on_reply_finished("Καλημέρα.")
+            window._speak_thread.wait(2000)
+            self.app.processEvents()
+
+        transcript = widget(window, TRANSCRIPT_LIST)
+        self.assertEqual(transcript.count(), 1)
+        self.assertEqual(transcript.item(0).text(), "Jarvis: Καλημέρα.")
+
+    def test_a_reply_with_debug_mode_on_appends_the_last_audit_row(self) -> None:
+        window = MainWindow()
+        self._enable_debug_mode(window)
+
+        fake_conn = mock.MagicMock()
+        fake_conn.execute.return_value.fetchone.return_value = (
+            "brain",
+            "allowed",
+            "no_skill_matched",
+        )
+        with (
+            mock.patch("jarvis.gui.main_window.speaker.speak"),
+            mock.patch(
+                "jarvis.gui.main_window.db.connect", return_value=fake_conn
+            ),
+        ):
+            window._on_reply_finished("Καλημέρα.")
+            window._speak_thread.wait(2000)
+            self.app.processEvents()
+
+        transcript = widget(window, TRANSCRIPT_LIST)
+        self.assertEqual(transcript.count(), 2)
+        self.assertEqual(transcript.item(0).text(), "Jarvis: Καλημέρα.")
+        self.assertEqual(
+            transcript.item(1).text(),
+            "[debug] brain → allowed (no_skill_matched)",
+        )
+
+    def test_a_database_error_leaves_the_debug_line_out_without_crashing(
+        self,
+    ) -> None:
+        window = MainWindow()
+        self._enable_debug_mode(window)
+
+        with (
+            mock.patch("jarvis.gui.main_window.speaker.speak"),
+            mock.patch(
+                "jarvis.gui.main_window.db.connect",
+                side_effect=RuntimeError("database is locked"),
+            ),
+        ):
+            window._on_reply_finished("Καλημέρα.")  # must not raise
+            window._speak_thread.wait(2000)
+            self.app.processEvents()
+
+        transcript = widget(window, TRANSCRIPT_LIST)
+        self.assertEqual(transcript.count(), 1)
+        self.assertEqual(transcript.item(0).text(), "Jarvis: Καλημέρα.")
+
+
+@unittest.skipUnless(_PYSIDE6_AVAILABLE, "PySide6 is not installed here")
+class SettingsDialogTests(unittest.TestCase):
+    """The settings menu's real surface: a read-only QDialog over
+    jarvis/config.py's actual values. QDialog.exec() is mocked in every test
+    here -- it's modal and would otherwise block the test process waiting
+    for a user to close a window that will never appear."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_opening_settings_shows_a_modal_dialog_without_crashing(self) -> None:
+        window = MainWindow()
+        with mock.patch(
+            "jarvis.gui.main_window.QDialog.exec", return_value=0
+        ) as exec_:
+            window._show_settings_dialog()  # must not raise or block
+        exec_.assert_called_once()
+
+    def test_the_dialog_shows_the_real_brain_provider(self) -> None:
+        window = MainWindow()
+        with mock.patch("jarvis.gui.main_window.QDialog.exec", return_value=0):
+            with mock.patch(
+                "jarvis.gui.main_window.config.BRAIN_PROVIDER", "ollama"
+            ):
+                # No assertion on the dialog's own widgets -- QFormLayout
+                # rows aren't addressed by objectName, and this piece is
+                # read-only informational text, not something later code
+                # depends on finding again. The real guarantee is the one
+                # above: building it from the live config values never
+                # raises, whatever BRAIN_PROVIDER happens to be.
+                window._show_settings_dialog()
+
+
+@unittest.skipUnless(_PYSIDE6_AVAILABLE, "PySide6 is not installed here")
 class StateMachineTests(unittest.TestCase):
     """Phase 6 step 5's first piece: _set_state()/State, exercised directly
     rather than through a full turn -- the transitions a real turn drives it

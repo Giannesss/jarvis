@@ -2323,8 +2323,71 @@ rather than propagating.
 quick-action button (YouTube, Gmail, Google, υπολογιστή, Notepad) opens the
 right site or launches the right app, with the matching "Jarvis: Άνοιξα
 το …" line appearing in the transcript. Step 5 piece 4 (quick actions) is
-closed. Only piece 5 — settings/debug mode — remains before Phase 6 step 5
-as a whole is done.
+closed.
+
+**Step 5, piece 5 (the last of step 5): settings/debug mode.** The menu's
+"Ρυθμίσεις…" item has opened a placeholder `QMessageBox` since step 3
+("the real settings surface ... is settings/debug mode, the last of Phase
+6's five steps. For now this just proves the menu structure is right.").
+`_show_settings_dialog()` is that real surface: a `QDialog` with one
+read-only row per setting (`QFormLayout`, label → `QLabel`), grouped the
+same way CLAUDE.md's own "Config"/"Providers" sections are — brain
+provider and model, TTS engine and voice, the Whisper model, then
+wake word/barge-in/conversation-mode/scheduler/log on/off — read straight
+from `jarvis/config.py`'s already-loaded values.
+
+**Read-only is not a shortcut, it's the only shape consistent with the
+project's own working rule "never edit `.env`".** A settings dialog that
+*wrote* a changed value back to `.env` would be exactly that, done through
+a dialog instead of a text editor. Seeing a wrong value here still tells
+you to go fix `.env` by hand and restart — which is also the only way any
+of these values ever take effect, since `config.py` reads `.env` once at
+import time, not on a timer or a signal. A future `settings/debug mode`
+that actually changes behaviour live (hot-swapping `BRAIN_PROVIDER`, say)
+would be a different, larger feature than what this piece asks for.
+
+**The debug toggle was checkable but inert since step 3; it now does
+something real.** `DEBUG_ACTION`'s checked state
+(`_debug_mode_enabled()`) gates one thing: after a turn's reply is shown
+in the transcript, `_append_debug_line()` queries the single most recent
+`audit` row (`SELECT action, decision, reason FROM audit ORDER BY id DESC
+LIMIT 1`) and appends it as `"[debug] {action} → {decision} ({reason})"`.
+This isn't a new logging path — `_get_reply()` already writes exactly one
+audit row per turn (either from a matched skill's `policy.dispatch()`, or
+the explicit `policy.record("brain", "allowed", "no_skill_matched")` line
+already in `_get_reply()` itself, see "Step 4, part 2") — so "debug mode"
+means surfacing the same audit log `:mem list audit` already exposes in a
+terminal, in the one place a GUI user actually is. Off by default, so an
+ordinary conversation's transcript is unchanged from before this piece.
+
+Swallows every error, same discipline as `_load_tasks()`: a locked or
+broken database costs this one debug line, never a crashed GUI — and a
+turn the frozen backstop silenced (`_get_reply()` returning `""`) already
+returns out of `_on_reply_finished()` before reaching this at all, so
+there's never a stray `"[debug] ..."` line with no reply above it.
+
+`DebugModeWiringTests` (`tests/test_gui_shell.py`) pins all of it: debug
+mode is off by default; a reply with it off appends only the one
+`"Jarvis: ..."` line; a reply with it on (and `db.connect()` mocked to
+return a fake audit row) appends a second `"[debug] ..."` line with the
+exact row's values; and a database error during that query leaves the
+debug line out without raising. `SettingsDialogTests` mocks
+`QDialog.exec()` (modal, and would otherwise block the test process
+waiting on a window that never appears) and pins that opening the dialog
+never raises, including against a patched `config.BRAIN_PROVIDER` — there
+are no object names to assert on inside a `QFormLayout` of plain labels,
+so the guarantee this class pins is "building it from the live config
+never crashes", not any one row's exact text.
+
+Not yet hand-tested live — open the real settings dialog and confirm the
+shown values actually match the real `.env` (flip `WAKE_WORD_ENABLED` or
+similar and restart to check it updates), then have one real conversation
+with the debug toggle checked and confirm a `"[debug] brain → allowed
+(no_skill_matched)"`-shaped line appears after each reply.
+
+With this piece confirmed, Phase 6 step 5 — state machine, system
+monitoring, tasks, quick actions, settings/debug mode — is done in full,
+and so is Phase 6 as originally scoped.
 
 ## Normalization
 

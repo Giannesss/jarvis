@@ -9,7 +9,12 @@ that used to ask three different thread attributes whether they were
 VRAM labels from `psutil`/`pynvml` on a timer instead of leaving them at "—"
 forever; the tasks list (`_load_tasks()`, below) renders today's
 `memory.agenda()` -- the same data «τι έχω σήμερα» already speaks -- as a
-list instead.
+list instead; the quick-action buttons call `skills._open_site()`/
+`_open_app()`, the exact functions the matching voice command uses; and the
+settings dialog (`_show_settings_dialog()`) is a read-only view over what
+`jarvis/config.py` actually read from `.env` for this run, with the debug
+toggle (`DEBUG_ACTION`) wired to append one audit-log line per turn to the
+transcript.
 
 Every widget that something will eventually read or write from outside this
 file has a stable `objectName()` set on it (see `_NAMED_WIDGETS` and the
@@ -39,11 +44,12 @@ import psutil
 from PySide6.QtCore import QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
+    QDialog,
+    QFormLayout,
     QHBoxLayout,
     QLabel,
     QListWidget,
     QMainWindow,
-    QMessageBox,
     QPushButton,
     QSplitter,
     QStatusBar,
@@ -51,7 +57,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from jarvis import brain, db, listener, memory, policy, skills, speaker
+from jarvis import brain, config, db, listener, memory, policy, skills, speaker
 from jarvis.config import SKILL_APPS, SKILL_SITES
 
 # Object names for every widget a later step, or a test, needs to find again.
@@ -396,29 +402,99 @@ class MainWindow(QMainWindow):
 
         settings_menu = menu_bar.addMenu("&Ρυθμίσεις")
 
-        # Placeholder: the real settings surface (mic device, TTS engine,
-        # brain provider, etc. -- everything jarvis/config.py reads from
-        # .env today) is "settings/debug mode", the last of Phase 6's five
-        # steps. For now this just proves the menu structure is right.
+        # The real settings surface, Phase 6 step 5's last piece: a read-only
+        # view over what jarvis/config.py actually read from .env for this
+        # run. Read-only is not a shortcut taken for lack of time -- it's the
+        # only shape consistent with the project's own working rule "never
+        # edit .env": a field here that wrote back to it would mean Claude
+        # code editing .env by another name. Seeing a wrong value here still
+        # tells you to go fix .env by hand and restart, which is the whole
+        # point of a settings surface over a config that's only ever read at
+        # startup.
         settings_action = QAction("Ρυθμίσεις…", self)
-        settings_action.triggered.connect(self._show_settings_placeholder)
+        settings_action.triggered.connect(self._show_settings_dialog)
         settings_menu.addAction(settings_action)
 
-        # Checkable, but inert: toggling it only updates its own checked
-        # state right now. Wiring it to anything (e.g. diag.py's verbosity,
-        # or WAKE_DEBUG-style printouts surfaced in the UI instead of the
-        # terminal) is also part of that later step.
+        # Checkable, and now wired to something real: when checked, every
+        # completed turn appends one extra transcript line showing the audit
+        # row policy.py already wrote for that turn (which skill matched, or
+        # that the brain answered, and why) -- see _append_debug_line(). That
+        # reuses the audit log Phase 4 already built rather than inventing a
+        # second logging path; nothing is computed here that wasn't already
+        # being recorded.
         debug_action = QAction("Λειτουργία αποσφαλμάτωσης", self)
         debug_action.setObjectName(DEBUG_ACTION)
         debug_action.setCheckable(True)
         settings_menu.addAction(debug_action)
 
-    def _show_settings_placeholder(self) -> None:
-        QMessageBox.information(
-            self,
-            "Ρυθμίσεις",
-            "Οι ρυθμίσεις δεν έχουν συνδεθεί ακόμα -- αυτό είναι μόνο το "
-            "άδειο κέλυφος (Phase 6, βήμα 3).",
+    def _show_settings_dialog(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Ρυθμίσεις")
+        form = QFormLayout(dialog)
+
+        # Grouped the same way CLAUDE.md's own "Config"/"Providers" sections
+        # are: brain, voice, wake word/conversation, logging -- a developer
+        # reading this dialog and reading those docs sees the same shape.
+        # Values only, never a control to change them (see the comment on
+        # settings_action above for why).
+        rows: list[tuple[str, object]] = [
+            ("Brain provider", config.BRAIN_PROVIDER),
+            (
+                "Brain model",
+                config.CLAUDE_MODEL
+                if config.BRAIN_PROVIDER == "claude"
+                else config.OLLAMA_MODEL,
+            ),
+            ("TTS engine", config.TTS_ENGINE),
+            ("TTS voice", config.TTS_VOICE),
+            ("Whisper model", config.WHISPER_MODEL),
+            ("Wake word", "on" if config.WAKE_WORD_ENABLED else "off"),
+            ("Barge-in", "on" if config.BARGE_IN_ENABLED else "off"),
+            (
+                "Conversation mode",
+                "on" if config.CONVERSATION_MODE else "off",
+            ),
+            ("Scheduler", "on" if config.SCHEDULER_ENABLED else "off"),
+            ("Diagnostic log", "on" if config.LOG_ENABLED else "off"),
+        ]
+        for label, value in rows:
+            form.addRow(f"{label}:", QLabel(str(value)))
+
+        dialog.exec()
+
+    def _debug_mode_enabled(self) -> bool:
+        """Reads DEBUG_ACTION's own checked state -- the single source of
+        truth for whether debug lines are appended, rather than a second
+        flag that could drift from what the menu shows is checked."""
+        action = self.findChild(QAction, DEBUG_ACTION)
+        return action is not None and action.isChecked()
+
+    def _append_debug_line(self) -> None:
+        """Appends one transcript line describing the audit row policy.py
+        just wrote for this turn (_get_reply() always writes exactly one,
+        either from a matched skill's policy.dispatch() or the explicit
+        "brain" row in _get_reply() itself) -- the same information
+        `:mem list audit` already shows in the terminal, surfaced here
+        instead so the debug toggle means something real.
+
+        Swallows every error, same discipline as _load_tasks(): a locked or
+        broken database costs this one debug line, never a crashed GUI."""
+        try:
+            conn = db.connect()
+            try:
+                row = conn.execute(
+                    "SELECT action, decision, reason FROM audit "
+                    "ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+            finally:
+                conn.close()
+        except Exception:
+            return
+        if row is None:
+            return
+        action, decision, reason = row
+        widget(self, TRANSCRIPT_LIST).addItem(
+            f"[debug] {action} → {decision} ({reason})"
         )
 
     # --- Central widget: transcript + side panel -----------------------------
@@ -519,6 +595,8 @@ class MainWindow(QMainWindow):
             return
 
         widget(self, TRANSCRIPT_LIST).addItem(f"Jarvis: {reply}")
+        if self._debug_mode_enabled():
+            self._append_debug_line()
         # The transcript line appears now, before speech starts -- speak()
         # can take a second or more just to synthesize, and there is no
         # reason to make the user wait to see text that is already decided.
