@@ -10,3 +10,4 @@ openwakeword
 scipy
 scikit-learn
 PySide6
+psutil

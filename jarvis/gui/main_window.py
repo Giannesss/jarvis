@@ -2,10 +2,11 @@
 shell first"); step 4 wired in the microphone, the brain's reply and
 `speaker.speak()`/TTS, one at a time, each hand-tested before the next. Step
 5 -- "the state machine, real system monitoring, tasks, quick actions and
-settings/debug mode" -- is now underway, starting with the state machine
-(`State`, below): one explicit value for what Jarvis is doing right now,
-read by everything that used to ask three different thread attributes
-whether they were `None`.
+settings/debug mode" -- is now underway: the state machine (`State`, below)
+is one explicit value for what Jarvis is doing right now, read by everything
+that used to ask three different thread attributes whether they were
+`None`; real system monitoring (`_poll_system()`, below) fills the CPU/RAM
+labels from `psutil` on a timer instead of leaving them at "—" forever.
 
 Every widget that something will eventually read or write from outside this
 file has a stable `objectName()` set on it (see `_NAMED_WIDGETS` and the
@@ -30,7 +31,8 @@ from __future__ import annotations
 
 from enum import Enum, auto
 
-from PySide6.QtCore import QThread, Qt, Signal
+import psutil
+from PySide6.QtCore import QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QHBoxLayout,
@@ -60,6 +62,15 @@ CPU_LABEL = "cpu_label"
 RAM_LABEL = "ram_label"
 DEBUG_ACTION = "debug_mode_action"
 RECORD_BUTTON = "record_button"
+
+# How often _poll_system() refreshes the CPU/RAM labels. 2s is frequent
+# enough to look live without polling psutil hard enough to show up in its
+# own reading -- cpu_percent(interval=None) is a near-free syscall-level
+# read, not a busy-wait, so this could be much shorter, but a system monitor
+# updating faster than a person reads it has nothing to show for the extra
+# polling.
+MONITOR_POLL_MS = 2000
+
 
 class State(Enum):
     """What Jarvis is doing right now -- the one thing `_listen_thread`,
@@ -187,10 +198,15 @@ class _SpeakWorker(QThread):
 
 
 class MainWindow(QMainWindow):
-    """Jarvis's main window. Construction starts no timers and no threads --
-    `_listen_thread`/`_brain_thread` are only ever created in response to a
-    click on the record button and to a transcript coming back, never at
-    construction. `gui_main.py` is the only thing that instantiates this."""
+    """Jarvis's main window. Construction starts no *worker* threads --
+    `_listen_thread`/`_brain_thread`/`_speak_thread` are only ever created in
+    response to a click on the record button and to a turn progressing,
+    never at construction. It does start one `QTimer` now (`_monitor_timer`,
+    for the CPU/RAM labels) -- a repeating UI-thread timer calling a
+    non-blocking `psutil` read is nothing like a worker thread blocking on
+    ffmpeg/Whisper/a model/TTS, so it doesn't need the same "not until
+    asked" discipline those three do. `gui_main.py` is the only thing that
+    instantiates this."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -213,6 +229,17 @@ class MainWindow(QMainWindow):
         self._build_central_widget()
         self._build_status_bar()
 
+        # psutil.cpu_percent()'s first-ever call in a process measures usage
+        # since the process started, which is not a meaningful snapshot --
+        # the docs say to throw it away. Priming it here, once, at
+        # construction is what makes the first real _poll_system() tick
+        # (after one MONITOR_POLL_MS) measure since *this* moment instead.
+        psutil.cpu_percent(interval=None)
+
+        self._monitor_timer = QTimer(self)
+        self._monitor_timer.timeout.connect(self._poll_system)
+        self._monitor_timer.start(MONITOR_POLL_MS)
+
     def closeEvent(self, event) -> None:  # noqa: N802 -- Qt's own name
         # A QThread still running when its Python wrapper is destroyed
         # prints a Qt warning and can crash on some platforms. Waiting here
@@ -227,7 +254,21 @@ class MainWindow(QMainWindow):
             self._brain_thread.wait()
         if self._speak_thread is not None:
             self._speak_thread.wait()
+        self._monitor_timer.stop()
         super().closeEvent(event)
+
+    def _poll_system(self) -> None:
+        """Fills in the CPU/RAM labels with a real reading. Called on
+        `_monitor_timer` (every `MONITOR_POLL_MS`) and directly by the test
+        suite -- both calls happen on the UI thread, since psutil's reads
+        here are a near-instant syscall-level read with no disk or network
+        I/O behind them, unlike `listener.listen()`/`brain.ask()`/
+        `speaker.speak()` above, which is exactly why this doesn't need a
+        worker thread the way those three do."""
+        cpu = psutil.cpu_percent(interval=None)
+        ram = psutil.virtual_memory().percent
+        widget(self, CPU_LABEL).setText(f"CPU: {cpu:.0f}%")
+        widget(self, RAM_LABEL).setText(f"RAM: {ram:.0f}%")
 
     def _set_state(self, state: State) -> None:
         """The one place that updates the status label and the record
@@ -449,10 +490,10 @@ class MainWindow(QMainWindow):
         row.addWidget(ram_label)
         layout.addLayout(row)
 
-        # "—" rather than "0%": a real reading of zero and "nothing has
-        # measured this yet" must not look the same on screen. A poller
-        # (psutil, most likely) that fills these in on a timer is "real
-        # system monitoring", two steps after this one.
+        # "—" is the construction-time placeholder only; _poll_system()
+        # (the real-system-monitoring piece of step 5) overwrites both
+        # labels with an actual percentage on the first timer tick, so "—"
+        # is only ever seen for one MONITOR_POLL_MS at startup.
         return box
 
     # --- Status bar -----------------------------------------------------------
@@ -460,7 +501,7 @@ class MainWindow(QMainWindow):
     def _build_status_bar(self) -> None:
         bar = QStatusBar()
         bar.showMessage(
-            "Jarvis — Phase 6, βήμα 5: state machine"
+            "Jarvis — Phase 6, βήμα 5: state machine + παρακολούθηση συστήματος"
         )
         self.setStatusBar(bar)
 

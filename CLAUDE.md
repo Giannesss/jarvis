@@ -2128,6 +2128,41 @@ Not yet hand-tested live — this piece has no new observable behavior to
 hand-test (the status text and button timing are unchanged), so the mocked
 suite is the whole bar for it, unlike the three pieces of step 4 before it.
 
+**Step 5, piece 2: real system monitoring.** The side panel's CPU/RAM labels
+have read a fixed "—" since step 3, deliberately — a real reading of zero
+and "nothing has measured this yet" must not look the same on screen, and
+step 3's own brief was an empty shell, no logic. `_poll_system()` is the
+logic: it reads `psutil.cpu_percent(interval=None)` and
+`psutil.virtual_memory().percent` and writes both into `CPU_LABEL`/
+`RAM_LABEL` as `"CPU: 17%"`/`"RAM: 42%"`. It runs on a `QTimer`
+(`_monitor_timer`, `MONITOR_POLL_MS` = 2000ms), not a `QThread` — unlike
+`listener.listen()`/`brain.ask()`/`speaker.speak()`, a `psutil` read here is
+a near-instant syscall-level number with no disk or network I/O behind it,
+so it never blocks the UI thread and doesn't need the "not until asked"
+discipline the three worker threads do. The timer starts at construction
+(not on any user action) and is stopped in `closeEvent()` alongside the
+`.wait()` calls on the three worker threads.
+
+**`cpu_percent(interval=None)`'s first call in a process is a known trap,
+documented by `psutil` itself**: with no prior call to measure *from*, it
+reports usage since the process started rather than since "now" — a
+meaningless, usually-near-zero number on a GUI app that just launched.
+`MainWindow.__init__` makes one throwaway priming call before the timer
+ever starts, so the first real tick (one `MONITOR_POLL_MS` later) measures
+since construction instead of since process start. `MonitoringTests` pins
+this indirectly by mocking `psutil` outright rather than asserting on real
+numbers, which would make the suite flaky by definition — one test confirms
+the timer is active at the right interval, one confirms `_poll_system()`
+reads both `psutil` calls and writes both labels, one confirms closing the
+window stops the timer.
+
+This piece does introduce new, real, user-visible behavior — the "—"
+placeholders become actual moving percentages — unlike the state machine
+above, so it is not being called closed on the mocked suite alone the way
+that piece was. Flagged for a quick visual hand test: open the GUI, confirm
+the CPU/RAM labels show real numbers that change over a few seconds rather
+than sitting at "—" or a frozen value.
+
 **Built in a sandbox that cannot run it, hand-tested on the real machine
 instead.** This sandbox cannot install PySide6 at all — `pypi.org`/
 `files.pythonhosted.org` sit in the proxy's `noProxy` list, so requests go

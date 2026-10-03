@@ -28,6 +28,7 @@ try:
     from jarvis.gui.main_window import (
         CPU_LABEL,
         DEBUG_ACTION,
+        MONITOR_POLL_MS,
         RAM_LABEL,
         RECORD_BUTTON,
         STATUS_LABEL,
@@ -430,6 +431,48 @@ class StateMachineTests(unittest.TestCase):
             self.assertEqual(
                 widget(window, RECORD_BUTTON).isEnabled(), state is State.IDLE
             )
+
+
+@unittest.skipUnless(_PYSIDE6_AVAILABLE, "PySide6 is not installed here")
+class MonitoringTests(unittest.TestCase):
+    """Phase 6 step 5's second piece: _poll_system(), exercised directly
+    rather than by waiting on the real MONITOR_POLL_MS timer -- psutil is
+    mocked throughout, so nothing here reads this machine's actual CPU/RAM
+    (which would make the assertions below flaky by definition)."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_construction_starts_an_active_timer_at_the_right_interval(
+        self,
+    ) -> None:
+        # Construction itself isn't mocked here -- a real (short, cheap)
+        # psutil call during the priming step and during this timer's first
+        # tick (which never fires inside a test; only a real wait would
+        # trigger it) is harmless and exactly what the real app does too.
+        window = MainWindow()
+        self.assertTrue(window._monitor_timer.isActive())
+        self.assertEqual(window._monitor_timer.interval(), MONITOR_POLL_MS)
+
+    def test_poll_system_fills_in_both_labels_from_psutil(self) -> None:
+        window = MainWindow()
+        memory_reading = mock.Mock(percent=42.0)
+        with mock.patch(
+            "jarvis.gui.main_window.psutil.cpu_percent", return_value=17.0
+        ), mock.patch(
+            "jarvis.gui.main_window.psutil.virtual_memory",
+            return_value=memory_reading,
+        ):
+            window._poll_system()
+
+        self.assertEqual(widget(window, CPU_LABEL).text(), "CPU: 17%")
+        self.assertEqual(widget(window, RAM_LABEL).text(), "RAM: 42%")
+
+    def test_closing_the_window_stops_the_monitor_timer(self) -> None:
+        window = MainWindow()
+        window.close()
+        self.assertFalse(window._monitor_timer.isActive())
 
 
 if __name__ == "__main__":
