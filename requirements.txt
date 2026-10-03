@@ -1,7 +1,7 @@
 anthropic
 ollama
-anthropic
 speechrecognition
+faster-whisper
 piper-tts
 edge-tts
 pyaudio
