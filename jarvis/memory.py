@@ -202,6 +202,12 @@ _WEEKDAYS_RE = "|".join(WEEKDAYS)
 _RELDAY_RE = "|".join(RELDAY)
 _NUM_RE = r"\d+|" + "|".join(sorted(NUMBER_WORDS, key=len, reverse=True))
 _UNIT_RE = "|".join(stem + r"\w*" for stem, _ in UNITS)
+# Spoken hours ("στις οκτώ", "στις εννιά") never got here before -- only a
+# digit hour matched, so RE_CLOCK simply had nothing to say about the far
+# commoner way of saying a time out loud. Same word table as _NUM_RE, same
+# \d{1,2} cap as before for the digit form (never NUM_RE's unbounded \d+,
+# which would let a stray multi-digit number masquerade as an hour).
+_HOUR_RE = r"\d{1,2}|" + "|".join(sorted(NUMBER_WORDS, key=len, reverse=True))
 
 # --- Dates and clock times -------------------------------------------------
 
@@ -210,7 +216,7 @@ RE_DATE_WORD = _re(rf"\b(?P<d>\d{{1,2}})\s+(?P<month>{_MONTHS_RE})(?:\s+(?P<y>\d
 RE_DATE_REL = _re(rf"\b(?P<rel>{_RELDAY_RE})\b")
 RE_DATE_WDAY = _re(rf"\b(?:την\s+|το\s+)?(?P<wday>{_WEEKDAYS_RE})\b")
 RE_CLOCK = _re(
-    r"\bστισ\s+(?P<h>\d{1,2})(?:[:.](?P<min>\d{2}))?"
+    rf"\bστισ\s+(?P<h>{_HOUR_RE})(?:[:.](?P<min>\d{{2}}))?"
     r"(?:\s+(?P<part>το\s+πρωι|το\s+μεσημερι|το\s+απογευμα|το\s+βραδυ))?"
 )
 
@@ -262,20 +268,37 @@ def _roll_forward(
     return parsed
 
 
+# Captured straight off RE_CLOCK, whose source _re() already folds -- so
+# this set has to be written already folded too, or it silently never
+# matches. It wasn't: "το μεσημέρι" and "το βράδυ" each contain a vowel the
+# iotacism fold touches (η, υ) and were spelled here with the fold undone,
+# so a captured "το μεσιμερι"/"το βραδι" never equalled either literal and
+# hour += 12 never ran -- "στις 8 το βράδυ" and "στις 1 το μεσημέρι" both
+# silently resolved as the AM hour instead. Only "το απόγευμα" (no bare
+# η/ι/υ, just the preserved "ευ" digraph) happened to need no fold, which
+# is why the one existing test for this ("στις 5 το απόγευμα") never
+# caught it. Built with normalize(), as _FRAC_SECONDS already is, rather
+# than hand-folded a second time.
+_PM_PARTS = frozenset(
+    normalize(p) for p in ("το μεσημέρι", "το απόγευμα", "το βράδυ")
+)
+
+
 def _parse_clock(text: str, now: datetime) -> datetime | None:
     """A "στις 5 το απόγευμα"-shaped time, resolved against now. An hour that
-    has already passed today means tomorrow."""
+    has already passed today means tomorrow. The hour may be a digit or a
+    spelled-out word ("στις οκτώ"); _number() reads either."""
     m = RE_CLOCK.search(text)
     if m is None:
         return None
 
-    hour = int(m["h"])
+    hour = _number(m["h"])
     minute = int(m["min"]) if m["min"] else 0
-    if hour > 23 or minute > 59:
+    if hour is None or hour > 23 or minute > 59:
         return None
 
     part = (m["part"] or "").strip()
-    if part in ("το μεσημερι", "το απογευμα", "το βραδυ") and hour < 12:
+    if part in _PM_PARTS and hour < 12:
         hour += 12
 
     when = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
@@ -782,6 +805,26 @@ def _parse_reminder(view: Norm, now: datetime) -> Parsed | None:
                 if day
                 else None
             )
+        if when is None:
+            # "when" is non-greedy, so a live phrasing with the time AFTER
+            # "ότι"/"να" instead of before it ("Υπενθύμισέ μου ότι έχω
+            # ραντεβού στις 8 το βράδυ") leaves "when" matching empty --
+            # nothing sits between the verb and "ότι" -- and both parses
+            # above come back None. That used to fall straight through to
+            # the plain-note fallback: stored, never announced, and silent
+            # about it. The same clock/date phrase is tried again against
+            # the body instead, which is where it actually is. Nothing
+            # needs cutting out of the body for this, unlike RE_REMIND_REL
+            # or _parse_delay's stale countdowns: a clock time is still
+            # true when it's read back later, so the body is kept whole.
+            when = _parse_clock(m["body"], now)
+            if when is None:
+                day = _parse_date(m["body"], now.date())
+                when = (
+                    datetime.combine(day, datetime.min.time()).replace(hour=9)
+                    if day
+                    else None
+                )
         if when is not None:
             return _reminder(view.group(m, "body"), when)
 

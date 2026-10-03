@@ -459,6 +459,72 @@ class ReminderTests(unittest.TestCase):
         parsed = memory.parse("Υπενθύμισέ μου σε 1 ώρα ότι κάτι", NOW)
         self.assertEqual(parsed.table, "reminders")
 
+    def test_evening_hour_rolls_to_pm(self) -> None:
+        # "στις 8 το βράδυ" folds to "στισ 8 το βραδι" -- _PM_PARTS used to
+        # be spelled unfolded ("το βραδυ") and never matched it, so this
+        # silently resolved as 8am instead of 8pm. 14:30 hasn't reached
+        # 20:00 yet today, so it stays today rather than rolling over.
+        parsed = memory.parse("Υπενθύμισέ μου στις 8 το βράδυ να κλειδώσω", NOW)
+        self.assertEqual(parsed.fields["due_at"], "2026-09-22T20:00:00")
+
+    def test_noon_hour_rolls_to_pm(self) -> None:
+        # Same bug, the other literal: "μεσημέρι" folds its η to ι.
+        parsed = memory.parse("Υπενθύμισέ μου στις 1 το μεσημέρι να φάω", NOW)
+        self.assertEqual(parsed.fields["due_at"], "2026-09-23T13:00:00")
+
+    def test_spelled_out_hour(self) -> None:
+        # RE_CLOCK's hour used to be digits-only; "οκτώ" never matched at
+        # all, so a reminder phrased this way silently became a note.
+        parsed = memory.parse("Υπενθύμισέ μου στις οκτώ να κλείσω την πόρτα", NOW)
+        self.assertEqual(parsed.table, "reminders")
+        self.assertEqual(parsed.fields["due_at"], "2026-09-23T08:00:00")
+
+    def test_time_after_oti_instead_of_before_it(self) -> None:
+        # The live-audio miss: RE_REMIND_ABS's "when" is non-greedy, so
+        # phrasing the time AFTER "ότι" instead of before it left "when"
+        # matching empty and both parses failing -- the whole sentence
+        # fell through to a plain note, silently, with nothing to show it
+        # had ever been a reminder. The body is kept whole (not stripped
+        # of the time phrase): unlike a relative delay, a clock time is
+        # still true when read back later.
+        parsed = memory.parse(
+            "Υπενθύμισέ μου ότι έχω ραντεβού στις 8 το βράδυ", NOW
+        )
+        self.assertEqual(parsed.table, "reminders")
+        self.assertEqual(parsed.fields["text"], "έχω ραντεβού στις 8 το βράδυ")
+        self.assertEqual(parsed.fields["due_at"], "2026-09-22T20:00:00")
+
+    def test_time_after_na_instead_of_before_it(self) -> None:
+        # Same shape, the other marker ("να" instead of "ότι").
+        parsed = memory.parse(
+            "Υπενθύμισέ μου να με ρωτήσεις στις εννιά αν έφαγα", NOW
+        )
+        self.assertEqual(parsed.table, "reminders")
+        self.assertEqual(parsed.fields["due_at"], "2026-09-23T09:00:00")
+
+    def test_time_after_oti_with_a_date_instead_of_a_clock(self) -> None:
+        # The same fallback has to work for a date too, not only a clock.
+        # "12" reads as an hour here (noon, no am/pm part given) before
+        # _parse_clock's own trailing _parse_date() call rewrites the
+        # day/month/year onto it -- the same ambiguity the forward
+        # ("when" before "ότι") path already has for this exact phrasing,
+        # pinned unchanged rather than resolved, since resolving it is a
+        # separate question from the one this fix targets.
+        parsed = memory.parse(
+            "Υπενθύμισέ μου ότι έχω προθεσμία στις 12 Ιουνίου", NOW
+        )
+        self.assertEqual(parsed.table, "reminders")
+        self.assertEqual(parsed.fields["due_at"], "2027-06-12T12:00:00")
+
+    def test_genuinely_unparseable_reminder_is_dropped_not_guessed(self) -> None:
+        # Neither "when" nor the body has anything clock/date-shaped in it.
+        # This reminder verb ("υπενθύμισέ", not one of the θυμήσου-family
+        # RE_TRIGGER verbs) has no plain-note fallback to land in either --
+        # that gap predates this fix and is out of its scope; what matters
+        # here is that it stays None rather than inventing a time.
+        parsed = memory.parse("Υπενθύμισέ μου ότι αγαπάω τον σκύλο μου", NOW)
+        self.assertIsNone(parsed)
+
 
 class ExamTests(unittest.TestCase):
     def test_exam_with_month_name_and_course(self) -> None:

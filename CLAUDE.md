@@ -1456,6 +1456,63 @@ three original `RE_REMIND_*` patterns still separate their words with
 `\s+` rather than `_GAP`, predating that rule — so «Υπενθύμισέ μου σε 2,
 λεπτά…» misses where the new pattern would not.
 
+### A reminder's time after «ότι», and an unfolded PM check
+
+Two more live-audio-shaped bugs in the reminder parsers, found while fixing
+a reported failure and both now closed with regression tests.
+
+**The time after «ότι»/«να» instead of before it.** `RE_REMIND_ABS` reads
+`_REMIND_VERB + "(?P<when>.*?)\s*(?:οτι|να)\s+(?P<body>.+)"` — `when` is
+non-greedy, so it happily matches empty. The natural phrasing «Υπενθύμισέ
+μου ότι έχω ραντεβού στις 8 το βράδυ» puts the clock phrase *after* «ότι»,
+so nothing sits between the verb and the marker, `when` matches empty,
+both `_parse_clock`/`_parse_date` come back `None`, and the whole sentence
+fell straight through to the plain-note fallback — stored, never
+scheduled, with nothing on the terminal to say a reminder had been
+attempted. `_parse_reminder` now tries the same two parses a second time
+against `body` when `when` comes up empty. Nothing needs cutting out of
+the body for this, unlike `RE_REMIND_REL`'s unit or `_parse_delay`'s
+countdown: a clock time is still true when it's read back later, so the
+announcement keeps the full sentence, time phrase included. Same shape of
+fix for «να» as the other marker. A date works the same way, at the cost
+of inheriting the existing ambiguity between a bare number as an hour and
+as a day (see below) — a separate question from the one this fix targets,
+pinned rather than resolved.
+
+**`_PM_PARTS` was spelled unfolded.** `RE_CLOCK`'s own source goes through
+`_re()`, which folds it, so it correctly matches a captured «το βράδυ»/«το
+μεσημέρι» as the folded «το βραδι»/«το μεσιμερι» — but the Python list
+`_parse_clock` checked that capture against was written `("το μεσημερι",
+"το απογευμα", "το βραδυ")`, by hand, with the fold undone on two of the
+three (η and υ each fold to ι; «απόγευμα»'s «ευ» doesn't, which is exactly
+why the one existing test for this, the afternoon case, never caught it).
+The captured string never equalled either literal, so `hour += 12` never
+ran: «στις 8 το βράδυ» and «στις 1 το μεσημέρι» both silently resolved as
+the *am* hour. `_PM_PARTS` is now built with `normalize()`, the same
+`_FRAC_SECONDS` idiom, rather than hand-folded a second time — exactly the
+trap "Normalization" already warns about for phrase lists and patterns,
+just missed here because this one is neither.
+
+**Spelled-out hours.** `RE_CLOCK`'s hour was digits-only, so «στις οκτώ»
+never matched *at all* — a silent drop into the note fallback, same as the
+ordering bug above, just from a different cause. The hour group now reads
+`_HOUR_RE` (digit or `NUMBER_WORDS`, same table `_NUM_RE` already draws
+from), and `_parse_clock` reads it with `_number()` instead of a bare
+`int()`.
+
+**Known boundary, inherited rather than introduced:** a bare day-of-month
+number in a date phrase is read as an hour before the date overwrites the
+day/month/year onto it, so «στις 12 Ιουνίου» (with no am/pm part) resolves
+to noon rather than the 9am default a dateless reminder gets. This already
+happened for the forward (time-before-«ότι») phrasing; the fix here keeps
+it symmetric rather than fixing it, since that's a distinct ambiguity
+(hour-vs-day-of-month) from the one this fix was asked to close.
+
+Pinned in `tests/test_memory_parse.py`'s `ReminderTests`: evening and noon
+rolling to pm, a spelled-out hour, the time after both «ότι» and «να», the
+date variant and its inherited noon quirk, and a genuinely unparseable
+reminder still coming back `None` rather than a guessed time.
+
 ### Tags
 
 Every content table carries a `tags` column: the row's life area, so
