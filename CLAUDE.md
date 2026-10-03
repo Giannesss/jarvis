@@ -2738,6 +2738,90 @@ purposeful rather than washed-out now that it's used so much more
 sparingly, and does the orb's colour transition actually look smooth rather
 than too fast/too slow at 280ms.
 
+### A fourth pass: real depth instead of flat black everywhere
+
+Hand-tested live, the third pass's restraint read as intended but surfaced
+a new complaint: pure flat colour on every surface, with nothing behind it,
+looked lifeless rather than calm -- "add an aesthetic background" was the
+actual ask. The third pass's own token table only had three flat tones
+(background/surface/surface-raised); there was no depth *behind* those
+tones, just between them.
+
+**Two additions, both deliberately subtle rather than decorative, plus one
+real bug fixed along the way.**
+
+- **The window's own canvas is now a faint vertical gradient, not a flat
+  fill.** `_build_central_widget()`'s `central` widget gets
+  `setObjectName("appBackground")` and
+  `setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)` -- the
+  attribute matters: a plain `QWidget` subclass (unlike `QFrame`, `QLabel`,
+  `QPushButton`, which all paint stylesheet backgrounds on their own) simply
+  ignores a `background-color` rule unless told to opt in, so without this
+  line the gradient rule below would have been silently dead. `QWidget#
+  appBackground` is `qlineargradient(#0e0f13 top -> #09090b bottom)` --
+  barely perceptible, there to keep the room from reading as a single flat
+  plane behind every widget.
+- **A soft ambient glow sits behind the orb specifically**, not painted by
+  `_Orb` itself (which stays tight, just the ring/bars/their own small
+  glow) but by a new `QFrame#homeGlow` wrapping the whole center column of
+  the Home page. `_build_home_page()` used to build that column as a bare
+  `QVBoxLayout` added straight into the page; a layout has no rect of its
+  own to paint a background on, so it's now a `QFrame` the layout is built
+  *into* (`center = QVBoxLayout(center_frame)`), named `homeGlow`, holding a
+  low-alpha radial gradient in the one accent colour
+  (`rgba(10,132,255,0.07)` at the centre, fading to fully transparent well
+  before the System Status panel on the right) -- centred roughly where the
+  orb actually sits in that column (`cy:0.42`, a little above dead-centre,
+  since the record button below the orb pulls the visual centre up).
+- **The bug this surfaced while doing it:** the third pass's blanket
+  `QMainWindow, QWidget { background-color: #0a0a0c; ... }` rule was, by
+  Qt's own stylesheet cascade, matching *every* widget that inherits
+  `QWidget` -- which is all of them, `QLabel` included. Every label in the
+  window (panel titles, metric values, the clock, settings rows) was
+  therefore painting its own small opaque `#0a0a0c` rectangle tight around
+  its text, on top of whatever surface it sat on (`#141417` panels, in most
+  cases) -- invisible enough at that low contrast to not read as an obvious
+  glitch, but exactly the kind of "nothing feels intentional" residue that
+  flattens a window further. Split into `QMainWindow { background-color:
+  #0a0a0c; }` (a fallback, mostly moot now that `#appBackground` covers the
+  whole client area) and a `QWidget { color; font-family; font-size; }` rule
+  with **no background-color at all** -- labels are transparent by default
+  now, which is what lets both the gradient and the glow actually show
+  through in the gaps between panels, and incidentally removes every one of
+  those invisible little boxes.
+- **Three elevations instead of two.** The third pass had background
+  (`#0a0a0c`) and surface (`#141417`) with nothing between them; header and
+  sidebar sat flush at the background colour, same as the window itself.
+  They're now `#0d0d10` -- one notch up from background, one notch down
+  from surface -- so chrome (header/sidebar) reads as its own distinct band
+  between the canvas and the content panels, the same three-tier depth cue
+  (canvas < chrome < card) a native macOS/iOS window uses before it ever
+  reaches for a shadow.
+- **The native menu bar had no rule at all until now**, which on Windows
+  means the OS's own light-themed menu bar -- a bright strip across the top
+  of an otherwise all-dark window, the single most glaring "this wasn't
+  finished" tell a screenshot could have shown. `QMenuBar`/`QMenuBar::item`/
+  `QMenu`/`QMenu::item` are now styled to match the header/chrome tone, with
+  the same accent-tinted hover the rest of the window uses.
+
+**Nothing about layout structure, object names, or behaviour changed again.**
+`center_frame` replaces a bare layout with a named `QFrame` holding the exact
+same children in the exact same order, so `_orb`/`record_button`'s own
+object names, the stretch ratio against `_build_home_sidebar()` (3:1,
+unchanged), and every other page are untouched. `tests/test_gui_shell.py`
+needed no new tests and no edits -- its 53 assertions are all on object
+names, text and behaviour, none of which this pass touched, and the suite
+still skips cleanly here (no PySide6).
+
+**Not yet hand-tested live.** Verified only against `py_compile` and the
+mocked suite, same sandbox constraint as every pass before it. Needs a
+visual check specifically for: does the gradient read as depth rather than
+a visible band or seam; does the glow behind the orb look like ambient
+light rather than a second, blurrier orb; does the menu bar now actually
+match the rest of the window instead of flashing light-themed; and does
+removing labels' background fix (or at least not visibly break) anything
+that happened to rely on it.
+
 ## Normalization
 
 `text.normalize()` is what every phrase list, every pattern and every stored

@@ -666,6 +666,12 @@ class MainWindow(QMainWindow):
 
     def _build_central_widget(self) -> None:
         central = QWidget(self)
+        central.setObjectName("appBackground")
+        # A plain QWidget subclass doesn't paint a stylesheet background on
+        # its own -- unlike QFrame/QLabel/QPushButton, which do -- so without
+        # this attribute the #appBackground gradient rule below would be
+        # silently ignored and the window would fall back to flat black.
+        central.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setCentralWidget(central)
 
         outer = QVBoxLayout(central)
@@ -787,7 +793,17 @@ class MainWindow(QMainWindow):
         layout = QHBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        center = QVBoxLayout()
+        # A QFrame, not a bare QVBoxLayout straight on the page -- a named
+        # widget is what the stylesheet's radial-gradient glow (homeGlow,
+        # below) needs to paint against; a layout has no rect of its own to
+        # paint a background on. The glow is deliberately not drawn by _Orb
+        # itself: it needs to extend well past the orb's own bounding box to
+        # read as ambient light in the room rather than another ring glued
+        # to the avatar, and a QFrame sized to the whole column is what gives
+        # it that room.
+        center_frame = QFrame()
+        center_frame.setObjectName("homeGlow")
+        center = QVBoxLayout(center_frame)
         center.setSpacing(28)
         center.addStretch(1)
 
@@ -807,7 +823,7 @@ class MainWindow(QMainWindow):
         center.addWidget(record_button, alignment=Qt.AlignmentFlag.AlignCenter)
         center.addStretch(1)
 
-        layout.addLayout(center, stretch=3)
+        layout.addWidget(center_frame, stretch=3)
         layout.addWidget(self._build_home_sidebar(), stretch=1)
 
         return page
@@ -1194,9 +1210,17 @@ def widget(window: MainWindow, object_name: str) -> QWidget:
 #
 # Tokens (hand-kept here rather than computed, since Qt's own QSS subset has
 # no variables):
-#   background        #0a0a0c   the window itself -- near-black, not navy
-#   surface            #141417   one elevation up: header, sidebar, panels,
-#                                 lists -- a single flat tone, not a gradient
+#   background        #0a0a0c   the window's own canvas -- near-black, not
+#                                 navy -- painted as a faint top-to-bottom
+#                                 gradient (#appBackground) rather than flat,
+#                                 which is the one deliberate exception to
+#                                 "no gradients" below: it reads as depth in
+#                                 the room, not as decoration on a control.
+#   chrome             #0d0d10   header/sidebar -- one notch above background,
+#                                 enough to read as a distinct band of UI
+#                                 chrome without competing with panels
+#   surface            #141417   one elevation up again: panels, lists -- a
+#                                 single flat tone, not a gradient
 #   surface-raised      #1c1c1f   hover/pressed states one step up again
 #   hairline           rgba(255,255,255,0.08)   every border in this sheet
 #   text-primary        #f5f5f7   headings, values, anything that matters
@@ -1204,17 +1228,91 @@ def widget(window: MainWindow, object_name: str) -> QWidget:
 #   text-tertiary       rgba(245,245,247,0.32)  placeholders, disabled text
 #   accent              #0a84ff   the one accent colour in the whole app
 #   accent-soft        rgba(10,132,255,0.14)    accent used as a fill, not text
+#
+# Three elevations (background < chrome < surface), not one flat colour
+# repeated everywhere -- that's what lets the header/sidebar/panels read as
+# distinct layers at a glance instead of by their borders alone, the same
+# depth cue a native macOS/iOS window uses before it ever reaches for a
+# shadow or a gradient.
 _STYLESHEET = """
-QMainWindow, QWidget {
+QMainWindow {
     background-color: #0a0a0c;
+}
+QWidget {
     color: #f5f5f7;
     font-family: "Segoe UI", sans-serif;
     font-size: 13px;
 }
 
+/* The window's own background -- a faint vertical gradient rather than one
+   flat fill, so the room has depth before any widget is even drawn. Applied
+   to one widget spanning the whole window (see _build_central_widget(),
+   which sets WA_StyledBackground -- a plain QWidget otherwise ignores a
+   stylesheet background entirely), not to the blanket QWidget rule above:
+   a gradient applied per-widget to every label and button in the window
+   would tile independently behind each one rather than reading as one
+   continuous surface. Everything above QWidget here is deliberately left
+   without its own background-color, so this gradient actually shows through
+   wherever nothing more specific (header/sidebar/panel/list/button) paints
+   over it. */
+QWidget#appBackground {
+    background-color: qlineargradient(
+        x1:0, y1:0, x2:0, y2:1,
+        stop:0 #0e0f13, stop:1 #09090b
+    );
+}
+
+/* A soft, low-alpha radial glow behind the orb on the Home page -- ambient
+   light in the room, not a second ring glued to the avatar (the orb's own
+   glow is painted in _Orb.paintEvent and stays tight around it). Centred
+   roughly where the orb sits within its own column (cy a little above
+   dead-centre, since the record button below it pulls the visual centre
+   up); fades to fully transparent well before the panel below, so it never
+   collides with the System Status/Quick Actions boxes on the right. */
+QFrame#homeGlow {
+    background-color: qradialgradient(
+        cx:0.5, cy:0.42, radius:0.75, fx:0.5, fy:0.42,
+        stop:0 rgba(10, 132, 255, 0.07),
+        stop:0.55 rgba(10, 132, 255, 0.02),
+        stop:1 rgba(10, 132, 255, 0.0)
+    );
+}
+
+/* The native menu bar had no rule at all before this -- meaning it fell
+   back to the OS's own light-themed menu, a bright strip across the top of
+   an otherwise dark window. Styled to match the header it sits above. */
+QMenuBar {
+    background-color: #0d0d10;
+    color: #f5f5f7;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+QMenuBar::item {
+    background-color: transparent;
+    padding: 4px 10px;
+}
+QMenuBar::item:selected {
+    background-color: rgba(255, 255, 255, 0.08);
+    border-radius: 5px;
+}
+QMenu {
+    background-color: #1c1c1f;
+    color: #f5f5f7;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 8px;
+    padding: 4px;
+}
+QMenu::item {
+    padding: 6px 24px 6px 12px;
+    border-radius: 5px;
+}
+QMenu::item:selected {
+    background-color: rgba(10, 132, 255, 0.14);
+    color: #f5f5f7;
+}
+
 /* --- Header ----------------------------------------------------------- */
 QFrame#header {
-    background-color: #0a0a0c;
+    background-color: #0d0d10;
     border-bottom: 1px solid rgba(255, 255, 255, 0.08);
     min-height: 56px;
     max-height: 56px;
@@ -1242,7 +1340,7 @@ QLabel#date_label {
 
 /* --- Sidebar ------------------------------------------------------------ */
 QFrame#sidebar {
-    background-color: #0a0a0c;
+    background-color: #0d0d10;
     border-right: 1px solid rgba(255, 255, 255, 0.08);
     min-width: 168px;
     max-width: 168px;
