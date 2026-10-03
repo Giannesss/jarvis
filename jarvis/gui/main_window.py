@@ -205,23 +205,20 @@ def _format_rate(bytes_per_second: float) -> str:
     return f"{kb / 1024:.1f} MB/s"
 
 
-def _panel_title(text: str, accent: str = "#0a84ff") -> QLabel:
+def _panel_title(text: str, accent: str | None = None) -> QLabel:
     """A panel's own heading (Κατάσταση Συστήματος, Γρήγορες Ενέργειες,
-    Τρέχουσα Εργασία), visually distinct from the plain body labels inside
-    the panel via the `panelTitle` object name in `_STYLESHEET`, plus a small
-    coloured dot that gives each panel its own identity (see `accent` below).
+    Σήμερα) -- plain text, no leading coloured dot.
 
-    No longer all-caps. The third design pass's small-caps treatment was a
-    quiet, correct choice for restraint, but it's also one of the commonest
-    "this was AI-generated" tells (tracked-out ALL-CAPS section labels), and
-    it was the one piece of English left in an otherwise all-Greek app
-    ("System Status" never had a Greek translation before this pass) --
-    sentence case in the caller's own language fixes both at once. The dot
-    is drawn as inline HTML rather than a separate widget: a QLabel can carry
-    rich text and still participate in the same layout as a plain one, so
-    this stays a drop-in replacement for every existing call site."""
-    label = QLabel(f'<span style="color:{accent};">●</span>&nbsp;&nbsp;{text}')
-    label.setTextFormat(Qt.TextFormat.RichText)
+    The ninth design pass removes the bullet the eighth pass drew here: a
+    small coloured dot in front of every single section heading is exactly
+    the kind of templated flourish that reads as generated rather than
+    designed -- a real settings/dashboard app (Linear, Things, Raycast)
+    tells its sections apart with quiet weight and spacing, not a different
+    coloured dot per card. `accent` is still accepted (nothing calling this
+    needed to change) but is now unused -- kept only so every existing call
+    site stays valid without an editing pass of its own; hierarchy here
+    comes from the `panelTitle` object name's own type styling alone."""
+    label = QLabel(text)
     label.setObjectName("panelTitle")
     return label
 
@@ -489,13 +486,17 @@ class _Orb(QWidget):
     a handful of waveform bars), deliberately not a recreation of the
     reference mockup's Iron Man face, which is a copyrighted character.
 
-    Restrained on purpose, per the second design pass: the first version's
-    double ring and nine fast-wobbling bars read as a "sci-fi HUD", busy even
-    at idle. This one sits almost still until a state actually calls for
-    motion -- one ring, five bars, a slower idle breath -- so attention goes
-    to the handful of pixels that are actually telling you something,
-    matching the orb's own job: the single place in the window that answers
-    "what is Jarvis doing right now" at a glance.
+    Restrained on purpose, and more so again as of the ninth design pass:
+    a glowing orb with a rotating arc and an orbiting particle swarm is one
+    of the most recognisable "AI assistant" visual cliches there is -- it's
+    close to the first thing an image generator draws for the prompt "AI
+    voice assistant UI", which is exactly what makes it read as generated
+    rather than designed, independent of how original the individual shapes
+    are. The arc and the particle swarm the seventh/eighth passes added are
+    gone; what's left is one ring, a handful of same-colour bars, and a
+    slow breathing glow -- enough to answer "what is Jarvis doing right
+    now" at a glance, without three independent layers of motion competing
+    for attention to do it.
 
     Colour changes are *animated*, not snapped -- `set_state()` starts a
     ~280ms QVariantAnimation from the orb's current displayed colour to the
@@ -507,12 +508,12 @@ class _Orb(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        # Up from 240 -- the redesign brief's own ask ("significantly more
-        # sophisticated than the current small circle", "the primary focus
-        # of the dashboard") is a size change as much as a content one, and
-        # the centre column (see _build_home_page, now 2:1 against the side
-        # panel) has the room to give it.
-        self.setMinimumSize(320, 320)
+        # Down from the eighth pass's 320 -- a giant glowing circle filling
+        # most of the centre column is itself a cliche ("the primary focus
+        # of the dashboard" was answered with sheer size, not with better
+        # content around it). 260 is still clearly the page's focal object
+        # without dominating it the way 320 did.
+        self.setMinimumSize(260, 260)
         self._state = State.IDLE
         self._phase = 0.0
         self._color = QColor(_ORB_COLOR[State.IDLE])
@@ -559,10 +560,10 @@ class _Orb(QWidget):
         speed = _PULSE_SPEED[self._state]
         pulse = (math.sin(self._phase * speed) + 1) / 2  # 0..1
 
-        glow_radius = side * (0.40 + 0.03 * pulse)
+        glow_radius = side * (0.38 + 0.02 * pulse)
         gradient = QRadialGradient(cx, cy, glow_radius)
         glow = QColor(color)
-        glow.setAlpha(60)
+        glow.setAlpha(42)
         gradient.setColorAt(0.0, glow)
         transparent = QColor(color)
         transparent.setAlpha(0)
@@ -584,62 +585,46 @@ class _Orb(QWidget):
             QRectF(cx - ring_radius, cy - ring_radius, ring_radius * 2, ring_radius * 2)
         )
 
-        # A slim rotating arc in the secondary accent, orbiting just outside
-        # the ring -- the one piece of the orb that answers "boring" on its
-        # own: a continuous, deliberate motion cue (not tied to any state's
-        # own meaning, which stays _ORB_COLOR's job above) that reads as
-        # "something is alive in here" even at idle. Idle rotates slowly
-        # enough to be almost subliminal -- "alive, not busy" is still the
-        # brief -- and only speeds up, never appears/disappears, when a
-        # state actually changes, so it never competes with the state colour
-        # itself for attention.
-        if self._state is not State.THINKING:
-            arc_radius = ring_radius + side * 0.045
-            rotate_speed = 0.5 if self._state is State.IDLE else 1.8
-            angle_deg = (self._phase * rotate_speed) % 360
-            arc_color = QColor(_SECONDARY_ACCENT)
-            arc_color.setAlpha(175)
-            arc_pen = QPen(QBrush(arc_color), max(side * 0.012, 2.0))
-            arc_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-            painter.setPen(arc_pen)
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            arc_rect = QRectF(
-                cx - arc_radius, cy - arc_radius, arc_radius * 2, arc_radius * 2
-            )
-            # Qt's arc angles are in 1/16th of a degree, and count counter-
-            # clockwise from the 3 o'clock position -- a plain constant, not
-            # a tuned one, just Qt's own convention for QPainter.drawArc.
-            painter.drawArc(arc_rect, int(angle_deg * 16), int(46 * 16))
-
+        # No rotating arc and no orbiting particles here any more (the
+        # seventh/eighth passes drew both). A continuously spinning ring
+        # plus a glowing core plus a particle swarm is the single most
+        # recognisable "AI assistant" cliche there is -- it's the first
+        # thing most image generators draw when asked for one, which makes
+        # it read as generated rather than designed, however original the
+        # individual shapes are. What is left is deliberately plain: one
+        # ring, a handful of bars, one colour, a slow breathing glow -- the
+        # orb's job is to answer "what is Jarvis doing" in one glance, and
+        # a glance doesn't need three independent layers of motion to do
+        # that.
         if self._state is State.THINKING:
-            # "Rotating/flowing particles" (the brief's own words) instead
-            # of the bars below -- three dots orbiting the ring, 120° apart,
-            # so THINKING reads as a visibly different *kind* of motion from
-            # LISTENING/SPEAKING's waveform rather than the same animation
-            # recoloured amber.
-            orbit_radius = ring_radius * 0.55
-            for i in range(3):
-                angle = math.radians(self._phase * 2.2 + i * 120)
-                px = cx + orbit_radius * math.cos(angle)
-                py = cy + orbit_radius * math.sin(angle)
-                particle_color = QColor(color if i % 2 == 0 else _SECONDARY_ACCENT)
-                particle_color.setAlpha(220)
-                painter.setBrush(particle_color)
-                painter.setPen(Qt.PenStyle.NoPen)
-                painter.drawEllipse(QRectF(px - 4, py - 4, 8, 8))
+            # A single short dash sweeping the ring, rather than a
+            # continuous arc or an orbiting swarm -- enough motion to read
+            # as "working", restrained enough not to be the loudest thing
+            # on the page.
+            angle_deg = (self._phase * 1.4) % 360
+            dash_pen = QPen(QBrush(color), max(side * 0.012, 2.0))
+            dash_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            painter.setPen(dash_pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            ring_rect = QRectF(
+                cx - ring_radius, cy - ring_radius, ring_radius * 2, ring_radius * 2
+            )
+            painter.drawArc(ring_rect, int(angle_deg * 16), int(34 * 16))
         else:
-            # Seven bars, alternating the state colour with the secondary
-            # accent -- richer than the second pass's flat five, without
-            # going back to the first pass's nine-bar, single-colour wall.
-            # Idle shows them as short flat dashes (a resting state, not
-            # "nothing is here"); SPEAKING wobbles them with more amplitude
-            # than LISTENING, so the one state the brief explicitly calls
-            # a "waveform" actually looks the most like one.
-            bar_count = 7
-            bar_area_width = side * 0.36
+            # Five bars, one colour, idle resting as short flat dashes --
+            # quieter than the seventh pass's seven alternating-colour bars.
+            # SPEAKING wobbles with a bit more amplitude than LISTENING, so
+            # the one state the brief calls a "waveform" still reads as the
+            # most active one, without needing a second hue to say so.
+            bar_count = 5
+            bar_area_width = side * 0.3
             bar_gap = bar_area_width / bar_count
             base_y = cy
-            amplitude = 0.09 if self._state is State.SPEAKING else 0.05
+            amplitude = 0.08 if self._state is State.SPEAKING else 0.045
+            bar_color = QColor(color)
+            bar_color.setAlpha(205)
+            painter.setBrush(bar_color)
+            painter.setPen(Qt.PenStyle.NoPen)
             for i in range(bar_count):
                 if self._state is State.IDLE:
                     height = side * 0.025
@@ -650,10 +635,6 @@ class _Orb(QWidget):
                     wobble = (math.sin(self._phase * 0.18 + i * 1.1) + 1) / 2
                     height = side * (0.03 + amplitude * wobble)
                 x = cx - bar_area_width / 2 + i * bar_gap
-                bar_color = QColor(color if i % 2 == 0 else _SECONDARY_ACCENT)
-                bar_color.setAlpha(210)
-                painter.setBrush(bar_color)
-                painter.setPen(Qt.PenStyle.NoPen)
                 painter.drawRoundedRect(
                     QRectF(x, base_y - height / 2, bar_gap * 0.45, height), 2, 2
                 )
@@ -881,22 +862,13 @@ class _GlassPanel(QFrame):
         painter.setPen(QPen(self._border, 1))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawPath(path)
-        # The panel's own per-card accent (System Status blue, Quick
-        # Actions violet, Σήμερα teal -- see _build_*_box()'s
-        # `accentColor` property) still needs to show, but this subclass
-        # bypasses QSS's own background/border painting entirely (that's
-        # the whole point -- QSS has no notion of "paint a blurred pixmap
-        # first") so the thin top accent line is drawn by hand here too,
-        # reading the same property QSS would have read.
-        accent_name = self.property("accentColor")
-        if accent_name in theme.ACCENTS:
-            accent = QColor(theme.ACCENTS[accent_name])
-            accent.setAlpha(140)
-            painter.setPen(QPen(accent, 1.4))
-            painter.drawLine(
-                QRectF(rect).topLeft() + QPointF(6, 0),
-                QRectF(rect).topRight() + QPointF(-6, 0),
-            )
+        # No per-card accent line here any more (the eighth pass drew one
+        # in a different colour per card -- blue/violet/teal). Three boxes
+        # on the same page each wearing their own hue reads as a dashboard
+        # template colour-coding itself for no reason a user asked for; a
+        # real app leaves colour for things that mean something (the record
+        # button, a selected state) and lets plain hairline borders do the
+        # quiet work of separating one card from the next.
 
 
 # Which sender a transcript line belongs to, and the text to actually show
@@ -1977,7 +1949,6 @@ class MainWindow(QMainWindow):
         # `accentColor` layers one more rule on top for the thin top border
         # that gives this card its own identity (blue, here) rather than
         # being identical to Quick Actions/Current Task next to it.
-        box.setProperty("accentColor", "blue")
         layout = QVBoxLayout(box)
         layout.setContentsMargins(18, 16, 18, 16)
         layout.setSpacing(10)
@@ -2024,7 +1995,6 @@ class MainWindow(QMainWindow):
         box = _GlassPanel(self._background)
         box.setObjectName("panel")
         self._glass_panels.append(box)
-        box.setProperty("accentColor", "violet")
         outer = QVBoxLayout(box)
         outer.setContentsMargins(18, 16, 18, 16)
         outer.setSpacing(10)
@@ -2057,15 +2027,22 @@ class MainWindow(QMainWindow):
             button.setProperty("quickAction", True)
             button.setProperty("quickActionTile", True)
             button.setIconSize(icon_size)
+            # One neutral icon colour for both kinds (not a different
+            # accent per button) -- a row of buttons each lit a different
+            # colour is a template tell on its own; the icon's *shape*
+            # (a globe for a site, a square for an app) already says what
+            # kind of action it is, which is what colour was standing in
+            # for.
+            icon_color = "#8a8a92"
             if kind == "site":
-                button.setIcon(icons.icon("site", theme.ACCENTS["blue"]))
+                button.setIcon(icons.icon("site", icon_color))
                 button.clicked.connect(
                     lambda _checked=False, label=label, url=payload: (
                         self._quick_action_site(label, url)
                     )
                 )
             else:
-                button.setIcon(icons.icon("app", _SECONDARY_ACCENT))
+                button.setIcon(icons.icon("app", icon_color))
                 button.clicked.connect(
                     lambda _checked=False, label=label, argv=payload: (
                         self._quick_action_app(label, argv)
@@ -2081,7 +2058,6 @@ class MainWindow(QMainWindow):
         box = _GlassPanel(self._background)
         box.setObjectName("panel")
         self._glass_panels.append(box)
-        box.setProperty("accentColor", "teal")
         layout = QVBoxLayout(box)
         layout.setContentsMargins(18, 16, 18, 16)
         layout.setSpacing(8)

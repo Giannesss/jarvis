@@ -3476,6 +3476,117 @@ wheel); and, if `tools\\fetch_fonts.py` was run, does the UI actually
 render in Inter/JetBrains Mono rather than the Segoe UI/Cascadia Mono
 fallback.
 
+### A ninth pass: removing the "AI-generated" tells the eighth pass added
+
+The user's next message, after the eighth pass's premium-product brief
+shipped: make it read as a premium *human-made* interface, not an
+AI-generated one. The eighth pass answered "boring" with real backdrop
+blur, a bigger glowing orb, a blue-to-violet gradient record button, a
+colour-coded panel per card and colour-coded quick-action icons -- every
+one of which, read back with fresh eyes, is a specific, recognisable
+"this was generated, not designed" tell rather than genuine polish. This
+pass is a removal pass: nothing new was built, several things the eighth
+pass added were cut, and the reasoning for each cut is the same shape
+throughout -- decoration that was standing in for information, or motion/
+colour spent somewhere a real app would have spent restraint instead.
+
+**The orb lost its rotating arc and its orbiting particle swarm.** A
+glowing circular avatar with a spinning ring and particles drifting around
+it is close to the single most recognisable "AI assistant" visual cliche
+there is -- it's near enough to the first image an AI image generator
+produces for the prompt "AI voice assistant interface" that keeping it was
+actively working against this pass's own goal, however original the
+individual shapes were. What's left in `_Orb.paintEvent()`: one ring, a
+single short dash sweeping it during THINKING (replacing both the
+continuous arc and the three-particle orbit), and five same-colour bars
+during LISTENING/SPEAKING (down from seven, and no longer alternating
+between two colours). The glow itself is dimmer (`alpha` 60 -> 42, pulse
+range narrowed) and the whole widget shrank from 320px to 260px minimum --
+still clearly the page's one focal object, no longer sized like the orb
+itself was the entire feature.
+
+**Every card lost its own accent colour.** The eighth pass gave System
+Status a blue top border, Quick Actions violet, Σήμερα teal -- three boxes
+on one page, each wearing a different hue for no reason a user asked for.
+That's `_GlassPanel`'s own version of a dashboard-template tell (colour-
+coding sections that don't need colour to tell apart), so the accent line
+is gone from `_GlassPanel.paintEvent()`, the three `box.setProperty
+("accentColor", ...)` calls in `_build_monitoring_box()`/
+`_build_quick_actions_box()`/`_build_current_task_box()` are gone, and
+`theme.py`'s three `QFrame#panel[accentColor=...]` rules are gone with
+them -- one quiet hairline border for every card now, the same one
+`QFrame#panel`'s base rule already drew.
+
+**The CPU/RAM/VRAM meters lost their per-metric colour too**, for the
+identical reason: three progress bars in blue/violet/teal was colour
+standing in for "which metric is this", when the label two pixels above
+each bar already says that in text. `QProgressBar::chunk` is now one
+neutral tone (`text_tertiary`) for all three.
+
+**Panel titles lost their coloured bullet dot.** `_panel_title()` drew a
+small coloured `●` before every single section heading (Κατάσταση
+Συστήματος, Γρήγορες Ενέργειες, Σήμερα, Εμφάνιση) -- a bullet-before-every-
+heading pattern is exactly the kind of templated flourish a real settings
+screen doesn't reach for; weight and spacing alone (the `panelTitle`
+object name's own styling) carry the same hierarchy without it. The
+function keeps its `accent` parameter (unused) rather than forcing an edit
+at every call site -- nothing calling it needed to change for the dot to
+disappear.
+
+**The record button lost its gradient fill.** A two-colour (blue-to-
+violet) gradient on the one button that matters most in the window is
+near the top of the same "this was generated" list the orb's spinning arc
+was on. `theme.py`'s new `_shade()` helper (a plain brightness multiply on
+a hex colour) gives the button's hover/pressed states their own tone of
+the *same* accent instead, so it's still the one visibly "important"
+control in the window -- it just earns that by being the one flat, fully-
+saturated fill, not by also being the one gradient.
+
+**Quick-action icons lost their per-kind accent colour.** Every site
+button's dot used to be accent blue, every app button's violet -- now
+both render in one neutral grey (`#8a8a92`); the icon's own *shape* (a
+globe for a site, a square for an app, from `icons.py`) already carries
+the distinction colour was duplicating.
+
+**The glow behind the orb is gone entirely.** `QFrame#homeGlow` painted a
+soft accent-coloured radial halo behind the avatar; a coloured light
+source glowing behind a circular avatar is, again, a specific and
+recognisable look rather than generic "ambiance" -- the rule is now a
+no-op (`background-color: transparent`), and the avatar reads as the
+page's focal point from its own glow and the bars/ring alone.
+
+**The home-page state word is quieter.** `ΕΤΟΙΜΟ`/`ΑΚΟΥΩ`/`ΣΚΕΦΤΟΜΑΙ`/
+`ΜΙΛΑΩ` kept its all-caps spelling (changing it would mean inventing new
+Greek strings nobody asked for) but dropped from 13px/700-weight/2px
+letter-spacing/secondary-text colour down to 12px/600/0.8px/tertiary-text
+-- a loud, wide-tracked all-caps readout is its own small "sci-fi HUD"
+tell, and the word still reads clearly at the quieter weight.
+
+**Nothing about turn logic, the worker threads, the state machine,
+`_get_reply()`, the tasks query, the quick-action click handlers, the
+debug line, the title bar, the command palette, toasts, or the theme/
+accent toggle's own mechanism changed in this pass.** Every edit is
+confined to `_Orb.paintEvent()`, `_GlassPanel.paintEvent()`,
+`_panel_title()`, the three `_build_*_box()` methods' `setProperty`
+calls, the quick-action icon colour, and a handful of rules in
+`theme.py` (`QFrame#homeGlow`, the panel accent-border rules, the
+progress-bar chunk rules, `QPushButton#record_button`, and
+`QLabel#home_state_label`). `tests/test_gui_shell.py` needed no edits --
+every one of its 53 assertions is on an object name, exact text or
+behaviour this pass left alone, and the suite still skips cleanly here
+(no PySide6); `python3 -m py_compile` passed on both changed files.
+
+**Not yet hand-tested live.** Needs a visual check specifically for:
+does the orb now read as calm rather than busy, with THINKING's single
+sweeping dash clearly a different, quieter motion than the old spinning
+arc; does the smaller 260px orb still feel like the page's obvious focal
+point rather than suddenly undersized; do the three side cards now read
+as one consistent set rather than three different-coloured ones; does
+the flat record button still feel like the window's one clearly-primary
+action without the gradient; and does the window as a whole feel calmer
+and more "crafted" rather than simply less colourful -- restraint, not
+blandness, is the actual target.
+
 ## Normalization
 
 `text.normalize()` is what every phrase list, every pattern and every stored

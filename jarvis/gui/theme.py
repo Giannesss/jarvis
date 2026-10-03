@@ -84,6 +84,18 @@ PALETTES = {
 }
 
 
+def _shade(hex_color: str, factor: float) -> str:
+    """"#0a84ff", 1.15 -> a brighter "#..." / 0.85 -> a darker one -- a flat
+    button's hover/pressed states need some shade of its own fill, without
+    reaching for a second colour or a gradient the way the record button
+    used to (a blue-to-violet gradient fill is itself a very recognisable
+    "AI product" tell -- see CLAUDE.md's ninth-pass notes)."""
+    hex_color = hex_color.lstrip("#")
+    r, g, b = (int(hex_color[i : i + 2], 16) for i in (0, 2, 4))
+    r, g, b = (min(255, max(0, int(c * factor))) for c in (r, g, b))
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
 def _rgba_from_hex(hex_color: str, alpha: float) -> str:
     """"#0a84ff", 0.14 -> "rgba(10, 132, 255, 0.14)" -- every accent-tinted
     fill in the sheet below needs the accent at some alpha, and the accent
@@ -124,13 +136,12 @@ QWidget {{
    every theme change (see MainWindow._apply_theme()) so its aurora wash
    matches whichever mode/accent is active. */
 
+/* No accent-coloured halo behind the orb any more. A glowing blue ring
+   painted into the page behind the avatar is the single most common
+   "AI product" visual tell there is -- restraint here means an almost
+   imperceptible neutral lift, not a coloured light source. */
 QFrame#homeGlow {{
-    background-color: qradialgradient(
-        cx:0.5, cy:0.42, radius:0.85, fx:0.5, fy:0.42,
-        stop:0 {_rgba_from_hex(a, 0.10)},
-        stop:0.5 {_rgba_from_hex(a, 0.035)},
-        stop:1 {_rgba_from_hex(a, 0.0)}
-    );
+    background-color: transparent;
 }}
 
 /* --- Custom title bar --------------------------------------------------- */
@@ -274,19 +285,14 @@ QPushButton[navButton="true"]:hover:!checked {{
 }}
 
 /* --- Panels (System Status / Quick Actions / Current Task / Settings) -- */
+/* One quiet hairline border for every card, not a different accent per
+   card -- three boxes on one page each wearing their own hue is a
+   dashboard-template tell (see _GlassPanel's own comment on this, now
+   that it no longer draws one either). */
 QFrame#panel {{
     background-color: {p['glass_fill']};
     border: 1px solid {p['hairline']};
     border-radius: 14px;
-}}
-QFrame#panel[accentColor="blue"] {{
-    border-top: 1px solid {_rgba_from_hex(ACCENTS['blue'], 0.55)};
-}}
-QFrame#panel[accentColor="violet"] {{
-    border-top: 1px solid {_rgba_from_hex(ACCENTS['violet'], 0.5)};
-}}
-QFrame#panel[accentColor="teal"] {{
-    border-top: 1px solid {_rgba_from_hex(ACCENTS['teal'], 0.5)};
 }}
 QLabel#panelTitle {{
     color: {p['text_secondary']};
@@ -302,22 +308,19 @@ QLabel[metric="true"] {{
     padding: 1px 0;
 }}
 
+/* One neutral colour for all three meters, not one hue each -- the
+   number and the label already say which metric is which; a different
+   colour per bar was decoration standing in for information the text
+   already carries, the same reasoning the panel borders above dropped
+   their own per-card colouring for. */
 QProgressBar {{
     background-color: {p['surface_raised']};
     border: none;
     border-radius: 2px;
 }}
 QProgressBar::chunk {{
+    background-color: {p['text_tertiary']};
     border-radius: 2px;
-}}
-QProgressBar#cpu_bar::chunk {{
-    background-color: {ACCENTS['blue']};
-}}
-QProgressBar#ram_bar::chunk {{
-    background-color: {ACCENTS['violet']};
-}}
-QProgressBar#vram_bar::chunk {{
-    background-color: {ACCENTS['teal']};
 }}
 QLabel#pageTitle {{
     font-size: 20px;
@@ -339,10 +342,10 @@ QLabel#home_greeting_label {{
     color: {p['text_secondary']};
 }}
 QLabel#home_state_label {{
-    font-size: 13px;
-    font-weight: 700;
-    letter-spacing: 2px;
-    color: {p['text_secondary']};
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.8px;
+    color: {p['text_tertiary']};
 }}
 QLabel#home_prompt_label {{
     font-size: 13px;
@@ -465,10 +468,13 @@ QPushButton[quickAction="true"]:pressed {{
     background-color: {p['surface']};
 }}
 
+/* A flat fill in the one chosen accent, not a two-colour gradient -- a
+   gradient-filled pill button is one of the clearest single "generated UI"
+   signals there is. Still the one strongly-coloured control in the window
+   (it's the one primary action), it just earns that by being the only
+   solid-accent button, not by also being the only gradient. */
 QPushButton#record_button {{
-    background-color: qlineargradient(
-        x1:0, y1:0, x2:1, y2:0, stop:0 {ACCENTS['blue']}, stop:1 {ACCENTS['violet']}
-    );
+    background-color: {a};
     border: none;
     border-radius: 22px;
     padding: 12px 40px;
@@ -477,14 +483,10 @@ QPushButton#record_button {{
     color: #ffffff;
 }}
 QPushButton#record_button:hover {{
-    background-color: qlineargradient(
-        x1:0, y1:0, x2:1, y2:0, stop:0 #2894ff, stop:1 #9d6ff7
-    );
+    background-color: {_shade(a, 1.12)};
 }}
 QPushButton#record_button:pressed {{
-    background-color: qlineargradient(
-        x1:0, y1:0, x2:1, y2:0, stop:0 #0870d6, stop:1 #7142d9
-    );
+    background-color: {_shade(a, 0.85)};
 }}
 QPushButton#record_button:disabled {{
     background-color: {p['surface_raised']};
