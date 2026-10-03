@@ -33,17 +33,47 @@ phases, with the model to use and the budget for each. It is the source of
 truth for what comes next; this file stays the source of truth for what is
 already built.
 
-**Current phase: Phase 5 — deep research and expertise.** Five steps: a
-`research` skill that runs several searches on a topic through the Claude API
-with web search enabled; a *structured summary* of what it found — not a
-document dump — stored as a dated "expertise" row; `memory.recall()` surfacing
-those rows on related questions the way it already surfaces profile facts and
-notes; a refresh trigger («ξανακάνε έρευνα για…») so a stale topic can be
-redone on request; and populating real data early — this semester's courses,
-syllabus topics and exam dates, and a description of each business.
+**Current phase: Phase 6 — a visible Jarvis, started out of order.** Phase
+5's step 5 (populating real data — syllabus topics, exam dates, each
+business's description) is still open, the same way Phase 2's brain half was
+built before Phase 1 closed: the pointer moved on because the user asked to,
+not because step 5 is done. It stays open, tracked below rather than quietly
+dropped, and nothing about Phase 6 depends on it.
 
-**Its prerequisite is built, and steps 1-3 of Phase 5 are now code — not yet
-hand-tested on live audio.** The roadmap lists Phase 5 as requiring the Claude
+Phase 6's own five steps (the roadmap's "Steps (do in order)"): an audit of
+the current architecture before any UI code; the UI framework decided by an
+actual comparison, not assumed; a functional shell first, empty states, no
+logic; the microphone/brain/TTS wired in one at a time, testing after each;
+then the state machine, real system monitoring, tasks, quick actions and
+settings/debug mode, in that order, never all at once.
+
+**Steps 1-3 are done.** The audit: everything under `jarvis/` outside
+`main.py` itself — `listener.py`, `brain.py`, `speaker.py`/`player.py`,
+`skills.py`, `policy.py`, `memory.py`, `scheduler.py`, `db.py`, `diag.py` —
+is already decoupled from the CLI (no `print()`s baked into the logic, no
+assumption about who's calling) and needs zero changes to work under a GUI.
+Only `main.py` is GUI-incompatible, and only because of its shape: a single
+blocking loop with no state machine, no threading, and terminal `print()` as
+its only output. The framework decision came down to PySide6 (native,
+in-process, LGPL — genuinely free, unlike PyQt6's GPL/commercial split) over
+a lightweight web-shell (pywebview + a local server): a single-machine,
+local-first assistant has no reason to run an HTTP server for itself, and
+Qt's signal/slot model is built for exactly the pattern this needs — a
+background thread finishes listening/thinking/speaking, the UI thread is
+told. See "The GUI shell" for what step 3 built.
+
+**Phase 5 — deep research and expertise — is what came before it, and is
+itself done except for step 5.** Five steps: a `research` skill that runs
+several searches on a topic through the Claude API with web search enabled; a
+*structured summary* of what it found — not a document dump — stored as a
+dated "expertise" row; `memory.recall()` surfacing those rows on related
+questions the way it already surfaces profile facts and notes; a refresh
+trigger («ξανακάνε έρευνα για…») so a stale topic can be redone on request;
+and populating real data early — this semester's courses, syllabus topics and
+exam dates, and a description of each business.
+
+**Its prerequisite is built, and steps 1-3 of Phase 5 are code, now
+hand-tested on live audio too** (see the three live tests below). The roadmap lists Phase 5 as requiring the Claude
 brain from Phase 2, so that half of Phase 2 was built first — see below. Step 1
 is where «δεν έχεις πρόσβαση στο ίντερνετ» in `SYSTEM_PROMPT` stops being true
 for one specific action: a brain reached *over* the network still cannot look
@@ -296,6 +326,10 @@ only falling back to the brain when a skill doesn't match (see "Skills").
   mic. Not part of the app.
 - `native_mic_test.py`, `wavein_capture_test.py`, `windows_capture_test.py` — throwaway
   experiments trying different Windows mic-capture APIs; not part of the app.
+- `gui_main.py` — entry point for the Phase 6 GUI shell, parallel to
+  `main.py`, not a replacement for it. See "The GUI shell".
+- `jarvis/gui/main_window.py` — `MainWindow`, the empty-state shell. See
+  "The GUI shell".
 
 ## Config
 
@@ -1872,6 +1906,75 @@ client (same idiom as `tests/test_brain_claude.py` — no key, no SDK, no
 network needed to run it), and the skill wired through `policy.dispatch()`'s
 CONFIRM gate end to end (confirmed, declined, no asker installed, the
 `ResearchUnavailable` and generic-error paths, and the audit row).
+
+## The GUI shell
+
+Phase 6 step 3 — "build a functional shell first (empty states, no logic)" —
+is built: `jarvis/gui/` is its own package, and `gui_main.py` at the repo root
+is its entry point, parallel to `main.py` rather than replacing it. Nothing
+in `jarvis/gui/` is imported by `main.py` or vice versa, so the Enter-press/
+wake-word CLI stays the always-available path while the GUI is built out one
+step at a time.
+
+```
+.\.venv\Scripts\python.exe gui_main.py
+```
+
+**The framework is PySide6** (Qt for Python), decided — per the roadmap's own
+step 2, "the UI framework decided by an actual comparison, not assumed" —
+against a lightweight web-shell (pywebview + a local server). A single-
+machine, local-first assistant has no reason to run an HTTP server for
+itself, and Qt's signal/slot model is built for exactly the pattern this
+needs: a background thread finishes listening/thinking/speaking, the UI
+thread is told. PySide6 over PyQt6 for the license alone — LGPL, genuinely
+free, rather than PyQt6's GPL/commercial split.
+
+**The audit that preceded it found nothing to change outside `main.py`.**
+`listener.py`, `brain.py`, `speaker.py`/`player.py`, `skills.py`, `policy.py`,
+`memory.py`, `scheduler.py`, `db.py` and `diag.py` were already decoupled from
+the CLI — no `print()`s baked into the logic, no assumption about who's
+calling — and need zero changes to work under a GUI. Only `main.py` is
+GUI-incompatible, and only because of its shape: a single blocking loop with
+no state machine, no threading, and terminal `print()` as its only output.
+That is why the GUI is its own parallel entry point rather than a rewrite of
+`main.py` in place — the old loop still works exactly as documented above.
+
+**`jarvis/gui/main_window.py`'s `MainWindow` is the shell**, and it is
+deliberately inert: a menu bar (Αρχείο/Έξοδος; a Ρυθμίσεις placeholder dialog;
+a checkable-but-unwired "Λειτουργία αποσφαλμάτωσης" debug toggle), a status
+label fixed at "Κατάσταση: Αδρανές", a splitter with an empty transcript list
+on the left and a side panel on the right — quick-action buttons sourced from
+`config.SKILL_SITES`/`SKILL_APPS` (disabled, not wired to a no-op: a button
+that looks clickable but does nothing is worse than one that's honestly not
+ready yet), an empty tasks list, and CPU/RAM labels reading "—" rather than
+"0%", since a real reading of zero and "nothing has measured this yet" must
+not look the same on screen. Every widget something will later need to find
+has a stable `objectName()` — centralized as module-level constants
+(`STATUS_LABEL`, `TRANSCRIPT_LIST`, `TASKS_LIST`, `CPU_LABEL`, `RAM_LABEL`,
+`DEBUG_ACTION`) — and a `widget(window, object_name)` helper looks one up,
+raising `LookupError` rather than returning `None` on a miss.
+
+Steps 4 and 5 are what give this content: wiring the microphone/brain/TTS in
+one at a time (each tested before the next), then the state machine, real
+system monitoring (`psutil`, most likely), the tasks list (rendering
+`memory.agenda()`, already built and voice-driven, as a list instead of
+speaking it), quick actions (wiring a click to `skills._open_site()`/
+`_open_app()`), and settings/debug mode (a real surface over what
+`jarvis/config.py` reads from `.env`) — in that order, never all at once.
+
+**Not yet hand-tested live, and not by oversight.** This sandbox cannot
+install PySide6 at all — `pypi.org`/`files.pythonhosted.org` sit in the
+proxy's `noProxy` list, so requests go direct and are refused — so nothing in
+`jarvis/gui/` has been run for real here, only syntax-checked with
+`python3 -m py_compile`. `tests/test_gui_shell.py` is written and will
+exercise real widget construction (`QT_QPA_PLATFORM=offscreen` lets it build
+widgets with no display attached) the moment it runs somewhere PySide6 is
+installed — skipped, not failed, in this sandbox, the same shape as the rest
+of the suite being skippable-by-environment rather than broken by it (see
+"Config"/"Providers" for the lazy-import idiom this mirrors). The roadmap's
+own hand-test rule applies before this step counts as closed: run
+`pip install -r requirements.txt` and `gui_main.py` on the real Windows
+machine to confirm the window actually renders before moving to step 4.
 
 ## Normalization
 
