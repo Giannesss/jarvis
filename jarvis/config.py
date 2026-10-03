@@ -329,6 +329,6 @@ SKILL_SITES = {
 # subprocess.Popen (never a shell), so only these exact programs can launch —
 # add new ones here, never let skills.py build a command from spoken text.
 SKILL_APPS = {
-    "υπολογιστή": ["calc.exe"],
+    "Υπολογιστής": ["calc.exe"],
     "Notepad": ["notepad.exe"],
 }

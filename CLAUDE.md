@@ -3238,6 +3238,244 @@ sidebar (brand caption, icons, the Automations group, Settings pinned to
 the bottom) look like a refined navigation hierarchy rather than a cramped
 version of the old flat list.
 
+### An eighth pass: a premium product pass, per a detailed Linear/Raycast-style brief
+
+The seventh pass answered "too plain and boring" with a command-centre
+layout. The next message raised the bar explicitly: redesign toward "a
+premium, high-end product (think Linear, Raycast, Arc, or an Iron Man-style
+HUD done tastefully)", in six numbered parts plus a short list of
+constraints, with an explicit two-step process -- a design plan first (a
+palette with hex codes, fonts, an animation list), implementation only
+after that, file by file. The plan was posted and three genuine ambiguities
+were resolved with the user directly before writing any code, because each
+one trades against the brief's own stated "keep CPU usage low" constraint
+or changes what ships in this one pass: **real backdrop blur** was chosen
+over a cheaper faux-glass tint; **all four "Extras"** (title bar, Ctrl+K
+palette, toasts, theme toggle) were chosen as in-scope for this pass rather
+than deferred; and **bundling real Inter/JetBrains Mono font files** was
+chosen over leaving the UI on its existing Segoe UI/Cascadia Mono fallback.
+
+**The brief's own vocabulary is CSS's, not Qt's, and that mismatch is the
+first thing worth recording.** "CSS variables/theme file", "GPU/CSS"
+animations, `backdrop-filter` -- none of these exist in PySide6/Qt the way
+the brief assumes. QSS (Qt's stylesheet subset) has no variables at all;
+there is no compositor-level backdrop blur, only `QGraphicsBlurEffect`
+applied to actual pixmap content; and "GPU/CSS" animation is, in this
+stack, `QPropertyAnimation`/`QTimer`/a custom `paintEvent()` -- CPU-side
+work, same as every animation every design pass before this one has
+already used (the orb, the background particles). Every item below is the
+Qt-native answer to the same brief, not a literal translation of it.
+
+**1. `jarvis/gui/theme.py` is the "CSS variables" answer.** A plain Python
+module holding `PALETTES` (a `"dark"` and a `"light"` dict of named tokens
+-- background/chrome/surface/text tiers, a glass fill, a scrollbar colour)
+and `ACCENTS` (blue/violet/teal, the three choices Settings exposes) plus
+`build_stylesheet(mode, accent)`, which string-formats those into the exact
+same QSS shape `_STYLESHEET` used to hold as one static constant. Nothing
+about the QSS selectors, object names or property names changed from the
+seventh pass's sheet -- only the literal hex values feeding them moved into
+this one file, which is the whole point: change a token here and every
+rule that reads it changes with it, the closest a QSS-based app gets to a
+CSS variables file. `main_window.py`'s old `_STYLESHEET` constant and its
+long "restrained, Apple-influenced palette" comment block are gone,
+replaced by a five-line pointer to this module.
+
+**2. Light/dark/accent-colour toggle (Settings, "Extras").** `MainWindow`
+now holds `self._theme_mode`/`self._accent` (defaulting to `"dark"`/
+`"blue"`) and `_apply_theme(mode=None, accent=None)` rebuilds the whole
+window's stylesheet from `theme.build_stylesheet()` and re-paints
+everything that reads colour outside QSS (`_Background.set_theme()`, the
+three `_GlassPanel`s' fill/border, the sidebar's baked-pixmap icons -- a
+`QIcon`'s colour is burned into its pixmap at render time, not a
+stylesheet property, so it has to be re-rendered by hand on a theme
+change). Two `QComboBox`es on the Settings page (`THEME_COMBO`/
+`ACCENT_COMBO`) call it directly. **This is the one row on the whole
+Settings page that is not read-only**, and that's a deliberate exception
+explained in `_apply_theme()`'s own docstring rather than a quiet
+inconsistency: every other row there reports what `.env` fixed at startup,
+because writing back to `.env` from a dialog would be exactly the thing
+the project's "never edit `.env`" working rule forbids, done through a
+GUI instead of a text editor. A theme toggle changes none of `config.py`'s
+own values, only how this window paints itself, so there is nothing to
+desync by letting it take effect immediately -- a restart still shows the
+same `.env`-driven rows it always has, just repainted in whichever theme
+was left selected (not persisted across a restart; there is no settings
+store yet for a GUI-only preference to live in, and inventing one for a
+single toggle was more machinery than this piece asked for).
+
+**3. Real backdrop blur, scoped narrowly -- `_GlassPanel`.** The user's own
+choice, over the cheaper faux-glass alternative offered alongside it. A
+live blur-behind-everything would cost real CPU on every repaint, which is
+what the brief's own "keep CPU usage low" constraint rules out doing
+carelessly, so the scope is deliberately narrow: only the three Home-page
+side cards (System Status/Quick Actions/Σήμερα) are `_GlassPanel`s --
+nothing that already repaints every animation frame (the orb, `_Background`
+itself) ever gets one. `_blur_pixmap()` is the standard Qt recipe for an
+actual blur (`QGraphicsBlurEffect` applied to a `QGraphicsPixmapItem`
+inside an offscreen `QGraphicsScene`, rendered to a fresh `QPixmap` --
+`QPainter` itself has no blur primitive), and `_GlassPanel.refresh_blur()`
+grabs a pixmap of `_Background` specifically (not the whole window -- these
+cards sit directly over the aurora canvas with nothing else behind them)
+at the region behind the card, blurs it, and caches the result; `paintEvent()`
+draws the cached pixmap clipped to a rounded-rect path, a themed semi-
+transparent tint over it, a hairline border, and -- since this subclass
+bypasses `QFrame`'s own QSS-driven background painting entirely, which is
+the whole point -- the card's own thin per-accent top line, read from the
+same `accentColor` property QSS used to read. Refreshed from the existing
+`_orb_timer` (one more connection, not a new `QTimer`), throttled further
+inside each panel to every fourth tick (`_REFRESH_EVERY_N_TICKS`, ~240ms)
+rather than on every 60ms frame -- a blur-behind only needs to track a
+background that drifts slowly, not to be instantaneous, so re-blurring at
+the orb's own animation rate would spend real CPU for a difference nobody
+would see.
+
+**4. The custom title bar (`TITLE_BAR`, "Extras").** `Qt.FramelessWindowHint`
+removes the OS-drawn bar and its minimize/maximize/close buttons;
+`_build_title_bar()` draws Jarvis's own, in the same chrome tone as the
+header beneath it, with three icon buttons wired to `showMinimized()`,
+a new `_toggle_maximize()`, and `close()`. Losing the OS chrome also loses
+the OS's own drag-to-move and edge-resize, so both are re-implemented on
+top of Qt6's own `QWindow` API rather than left broken: the title bar
+installs itself as an event filter on `MainWindow` and a press on it calls
+`windowHandle().startSystemMove()` (a double-click toggles maximize, the
+free gesture a native bar already gives); `MainWindow.mousePressEvent()`
+checks whether a press landed within `_RESIZE_MARGIN` (6px) of any edge
+and, if so, calls `windowHandle().startSystemResize(edges)` instead of
+handling the click itself. Both delegate the actual move/resize back to
+the OS/window manager -- this isn't a hand-rolled drag loop tracking mouse
+deltas, which is the fragile way to get this wrong -- so the window still
+behaves like an ordinary one everywhere except in which pixels draw its
+chrome. `QMainWindow.menuBar()` is untouched and still renders as an
+ordinary widget under a frameless top-level window on Windows (only native
+macOS moves a frameless window's menu into the system menu bar), so the
+Αρχείο/Προβολή menu is unaffected by any of this.
+
+**5. The command palette (Ctrl+K, "Extras") -- `_CommandPalette`.** A
+plain `QDialog` (frameless + `Popup`, so Escape and click-outside both
+close it for free) holding a `QLineEdit` and a filtered `QListWidget`:
+every sidebar page, "start a recording", and one entry per configured
+site/app from `config.SKILL_SITES`/`SKILL_APPS` -- built fresh on
+`MainWindow._open_command_palette()` each time (a `QShortcut` on
+`Ctrl+K`), so it can never list a site/app that's since been removed from
+`config.py`, the same freshness `_build_quick_actions_box()`'s own grid
+already keeps. Filtering is a plain case-insensitive substring match
+against each command's Greek label, typed into the input; Enter or a
+double-click runs whichever row is selected and closes the palette first,
+so a slow action (opening a browser, say) never leaves a stale dialog
+sitting on screen while it runs.
+
+**6. Toast notifications (`_show_toast`/`_remove_toast`, "Extras").** A
+small floating `QFrame` (object name `toast`), parented to the window so
+it rides on top of whichever page is showing, stacked downward from the
+header if more than one is live, faded in and out over 200ms via
+`QGraphicsOpacityEffect` + `QPropertyAnimation` and auto-dismissed after
+2.5s. Wired to the one place that already does something worth a passive
+notification for: a quick action succeeding or failing (`_quick_action_site()`/
+`_quick_action_app()`), alongside -- not instead of -- the existing
+transcript line and Recent Activity entry, since a toast is for "you might
+not be looking at that panel right now", not a replacement record of what
+happened.
+
+**7. Icons replace Unicode glyphs -- `jarvis/gui/icons.py`.** The seventh
+pass's sidebar glyphs (⌂◉✓▣⚙⚡◌) and `_dot_icon()`'s plain painted circles
+are both gone, replaced by a dozen small, hand-written inline SVG paths
+(`icon(name, color, size)`, rendered via `QSvgRenderer` into a `QPixmap` --
+the same "draw it once, hand back a `QIcon`" shape `_dot_icon()` used, so
+every existing `button.setIcon(...)` call site is unaffected and no
+object-name or exact-label assertion in `tests/test_gui_shell.py` is
+touched). Drawn from scratch rather than pulled from an existing icon font
+or set, for the same reason `_Orb` is an original avatar rather than a
+copy of Iron Man's helmet: nobody's icon set, nobody's licence to track.
+A consistent 24x24 stroke-only style (1.6px, rounded caps/joins) across
+every icon, rather than mixing weights, is what makes a dozen completely
+different glyphs read as one icon set rather than several borrowed ones.
+Nav button icons are re-tinted on a theme change (`_apply_theme()`, via
+the new `_nav_icon_names` dict each `_build_nav_button()` call populates)
+since a baked pixmap's colour can't be reached by the stylesheet the way a
+label's text colour can.
+
+**8. Typography -- `FONT_UI`/`FONT_MONO` in theme.py, and the one thing
+this pass could not finish from inside this sandbox.** The brief's own
+pairing (Inter for UI text, JetBrains Mono for numbers) is wired as the
+first name in every font-family chain the stylesheet uses, falling back to
+"Segoe UI"/"Cascadia Mono, Consolas, monospace" exactly as every existing
+font declaration in this project already does. `gui_main.py` now loads
+every `.ttf` under `assets/fonts/` via `QFontDatabase.addApplicationFont()`
+before constructing `MainWindow`, registering the family for this process
+only (nothing installed system-wide) -- but **the actual font files are
+not in this repo yet**, because this sandbox's network proxy refuses
+`raw.githubusercontent.com` (confirmed: a 403 from the proxy itself, not
+from GitHub) and no PyPI package carries either font's `.ttf` bytes, so
+they could not be fetched from here the way every other asset in this pass
+was. `tools/fetch_fonts.py` is the honest answer to that gap rather than
+silently shipping without them or fabricating placeholder files: a short,
+documented script that fetches the same six real, open-source (SIL OFL)
+`.ttf` files from their own upstream repos, meant to be run once on a
+machine that actually has ordinary internet access (the user's). Until
+that script is run, the app looks and runs identically on the fallback
+fonts -- nothing about this pass depends on the bundled fonts existing,
+the same "degrade to the next name in the chain" discipline every other
+font-family rule here already follows.
+
+**9. `config.SKILL_APPS`'s capitalization fix.** The brief's own flagged
+example -- `"υπολογιστή"` next to `"Notepad"` -- is now `"Υπολογιστής"`.
+Matching stays unaffected (`_find_match()` compares case/accent-insensitive
+normalized text, per `config.py`'s own docstring for `SKILL_SITES`/
+`SKILL_APPS`), so this only changes the label the quick-action button and
+the command palette show, never what utterance opens the calculator.
+
+**10. What this pass deliberately did not build.** The brief's "listening
+reacts to mic volume" is not wired to a real audio level: doing so would
+mean reaching into `listener.py`'s capture pipeline for a number this GUI
+layer doesn't otherwise need, the same boundary `ORB_TICK_MS`'s own
+comment already drew for the orb's existing bars, so LISTENING keeps its
+deterministic wobble rather than gaining a second, silently-fake "live"
+reading presented as real. Grain/noise texture (the brief's point 1) was
+left out of `_Background.paintEvent()` for this round -- the aurora wash,
+grid and accent-tinted particles already there absorbed most of the visual
+budget this pass had, and a static procedural noise layer is a smaller,
+separable addition for a later pass rather than something that needed to
+ship alongside six new features at once.
+
+**Nothing about turn logic changed.** The worker threads, the state
+machine, `_get_reply()`, `_load_tasks()`'s agenda query, the quick-action
+click handlers (beyond the toast call appended to each) and the debug
+line are all exactly what step 4/5, the dashboard redesign and the seventh
+pass built. `tests/test_gui_shell.py` needed no edits at all for this pass
+-- every one of its 53 assertions is on an object name, exact text or
+behaviour this pass left alone, and the suite still skips cleanly here (no
+PySide6 in this sandbox); `python3 -m py_compile` passed on every changed
+file (`jarvis/gui/main_window.py`, the two new modules `jarvis/gui/theme.py`
+and `jarvis/gui/icons.py`, `gui_main.py`, `tools/fetch_fonts.py`,
+`jarvis/config.py`).
+
+**Not yet hand-tested live, and this pass has more to actually check than
+any before it.** Needs, at minimum: `.\\.venv\\Scripts\\python.exe -m pip
+install -r requirements.txt` (QtSvg ships inside PySide6 itself, so no new
+dependency), then `tools\\fetch_fonts.py` once if the bundled fonts are
+wanted, then `gui_main.py`. Specifically check -- does the frameless window
+actually drag by its title bar and resize from every edge/corner the same
+as before (the single highest-risk change in this pass, since it touches
+window-manager behaviour directly rather than just repainting); do
+minimize/maximize/close all work and does double-clicking the title bar
+toggle maximize; does Ctrl+K open the command palette from any page, does
+typing filter it, does Enter run the selected command, does Escape/a click
+outside close it; do the three Home-page cards show an actual blurred
+aurora behind them that shifts as the background drifts, not a flat tint
+or a frozen snapshot; do quick actions produce a toast that fades in, sits
+briefly, and fades out, stacking sensibly if more than one fires close
+together; does the Settings page's theme/accent toggle actually repaint
+the whole window live (background, panels, icons, buttons) without a
+restart, and does light mode look like a coherent light theme rather than
+a dark theme with inverted text; does Recent Activity show its new empty
+state (icon + muted line) before anything has happened and switch to the
+timeline the moment a quick action or a turn completes; do the new SVG
+sidebar/quick-action/title-bar icons render crisply rather than as blank
+boxes (confirms QtSvg is actually available in the installed PySide6
+wheel); and, if `tools\\fetch_fonts.py` was run, does the UI actually
+render in Inter/JetBrains Mono rather than the Segoe UI/Cascadia Mono
+fallback.
+
 ## Normalization
 
 `text.normalize()` is what every phrase list, every pattern and every stored

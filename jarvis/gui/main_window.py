@@ -39,6 +39,10 @@ from enum import Enum, auto
 import psutil
 from PySide6.QtCore import (
     QEasingCurve,
+    QEvent,
+    QPoint,
+    QPointF,
+    QPropertyAnimation,
     QRect,
     QRectF,
     QSize,
@@ -54,20 +58,30 @@ from PySide6.QtGui import (
     QColor,
     QFontMetrics,
     QIcon,
+    QKeySequence,
     QPainter,
     QPainterPath,
     QPen,
     QPixmap,
     QRadialGradient,
+    QShortcut,
 )
 from PySide6.QtWidgets import (
     QCheckBox,
+    QComboBox,
+    QDialog,
     QFormLayout,
     QFrame,
+    QGraphicsBlurEffect,
+    QGraphicsOpacityEffect,
+    QGraphicsPixmapItem,
+    QGraphicsScene,
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QProgressBar,
     QPushButton,
@@ -79,6 +93,7 @@ from PySide6.QtWidgets import (
 
 from jarvis import brain, config, db, listener, memory, policy, skills, speaker
 from jarvis.config import SKILL_APPS, SKILL_SITES
+from jarvis.gui import icons, theme
 
 # Object names for every widget a later step, or a test, needs to find again.
 # Centralized here rather than scattered as string literals through the
@@ -114,6 +129,12 @@ OPEN_CONVERSATION_BUTTON = "open_conversation_button"
 RECENT_ACTIVITY_LIST = "recent_activity_list"
 NAV_AUTOMATIONS_ACTIVE = "nav_automations_active"
 NAV_AUTOMATIONS_HISTORY = "nav_automations_history"
+TITLE_BAR = "title_bar"
+THEME_COMBO = "theme_combo"
+ACCENT_COMBO = "accent_combo"
+COMMAND_PALETTE_INPUT = "command_palette_input"
+COMMAND_PALETTE_LIST = "command_palette_list"
+RECENT_ACTIVITY_EMPTY_LABEL = "recent_activity_empty_label"
 
 # How often _poll_system() refreshes the CPU/RAM/VRAM/network labels. 2s is
 # frequent enough to look live without polling psutil hard enough to show up
@@ -321,8 +342,13 @@ _STATUS_DOT_COLOR = {
 # blue-vs-violet pairing used for System Status vs Quick Actions. None of
 # this reuses _ORB_COLOR's SPEAKING blue for anything but SPEAKING -- the
 # panels' tints are purely decorative label colour, not state.
-_SECONDARY_ACCENT = "#8b5cf6"
-_ACCENT_TEAL = "#22c3b6"
+# Kept as module-level aliases of theme.py's own constants (the single
+# source of truth now that colour lives in a theme file) rather than
+# rewriting every `_SECONDARY_ACCENT`/`_ACCENT_TEAL` reference below --
+# both still name a fixed decorative pairing, never the user's chosen
+# accent (see theme.py's own docstring on why).
+_SECONDARY_ACCENT = theme.SECONDARY_ACCENT
+_ACCENT_TEAL = theme.ACCENT_TEAL
 
 # The big word under the orb on the Home page -- a second, larger rendering
 # of the same state _STATUS_TEXT already names in the header, because the
@@ -667,6 +693,26 @@ class _Background(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._phase = 0.0
+        self._mode = "dark"
+        self._accent = QColor(theme.ACCENTS["blue"])
+
+    def set_theme(self, mode: str, accent_hex: str) -> None:
+        """Ties the aurora wash to the active theme/accent (eighth design
+        pass, "a subtle animated aurora/mesh glow in blue and purple") --
+        the canvas's own colour now comes from theme.py the same way every
+        QSS rule in _STYLESHEET's replacement does, rather than the four
+        literal RGB triples this used to hold regardless of theme."""
+        self._mode = mode
+        self._accent = QColor(accent_hex)
+        self.update()
+
+    @staticmethod
+    def _mix(base: QColor, tint: QColor, amount: float) -> QColor:
+        return QColor(
+            int(base.red() + (tint.red() - base.red()) * amount),
+            int(base.green() + (tint.green() - base.green()) * amount),
+            int(base.blue() + (tint.blue() - base.blue()) * amount),
+        )
 
     def tick(self) -> None:
         self._phase += 1.0
@@ -677,16 +723,40 @@ class _Background(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         w, h = self.width(), self.height()
 
+        if self._mode == "light":
+            base_top, base_mid, base_edge = (
+                QColor(250, 250, 252),
+                QColor(242, 243, 247),
+                QColor(232, 233, 238),
+            )
+            grid_color = QColor(0, 0, 0)
+            grid_alpha = 10
+            particle_base = QColor(70, 90, 150)
+        else:
+            base_top, base_mid, base_edge = (
+                QColor(18, 20, 27),
+                QColor(13, 14, 18),
+                QColor(8, 8, 10),
+            )
+            grid_color = QColor(255, 255, 255)
+            grid_alpha = 5
+            particle_base = QColor(160, 190, 255)
+
+        # The aurora tint: the top stop leans toward the active accent
+        # (blue or violet or teal, whichever is selected) rather than a
+        # fixed hue, so "Χρώμα έμφασης" in Settings actually changes the
+        # one thing in the window with the most visual surface area, not
+        # just a handful of borders and buttons.
         gradient = QRadialGradient(w * 0.5, 0, max(w * 1.15, 1))
-        gradient.setColorAt(0.0, QColor(18, 20, 27))
-        gradient.setColorAt(0.45, QColor(13, 14, 18))
-        gradient.setColorAt(1.0, QColor(8, 8, 10))
+        gradient.setColorAt(0.0, self._mix(base_top, self._accent, 0.14))
+        gradient.setColorAt(0.45, base_mid)
+        gradient.setColorAt(1.0, base_edge)
         painter.fillRect(self.rect(), gradient)
 
         # A very faint technical grid, spaced wide (64px) so it reads as
-        # depth/texture rather than graph paper -- alpha 5/255 is close to
-        # the edge of being visible at all, which is the point.
-        painter.setPen(QPen(QColor(255, 255, 255, 5), 1))
+        # depth/texture rather than graph paper -- alpha stays close to the
+        # edge of being visible at all, which is the point.
+        painter.setPen(QPen(QColor(grid_color.red(), grid_color.green(), grid_color.blue(), grid_alpha), 1))
         step = 64
         for x in range(0, w, step):
             painter.drawLine(x, 0, x, h)
@@ -704,8 +774,129 @@ class _Background(QWidget):
             x = (math.sin(self._phase * 0.0035 + seed) + 1) / 2 * w
             y = (math.cos(self._phase * 0.0021 + seed * 1.7) + 1) / 2 * h
             alpha = 10 + int(8 * (math.sin(self._phase * 0.01 + seed) + 1) / 2)
-            painter.setBrush(QColor(160, 190, 255, alpha))
+            painter.setBrush(
+                QColor(particle_base.red(), particle_base.green(), particle_base.blue(), alpha)
+            )
             painter.drawEllipse(QRectF(x, y, 2.2, 2.2))
+
+
+def _parse_rgba(value: str) -> QColor:
+    """"rgba(20, 20, 24, 0.55)" -> QColor(20, 20, 24, 140) -- theme.py's
+    palette dict stores colours as CSS-style rgba() strings (so they drop
+    straight into QSS), but _GlassPanel paints by hand rather than through
+    QSS, so it needs an actual QColor. Parses only the shape theme.py
+    itself ever produces; not a general CSS colour parser."""
+    inner = value.strip()
+    inner = inner[inner.index("(") + 1 : inner.rindex(")")]
+    r, g, b, alpha = (part.strip() for part in inner.split(","))
+    return QColor(int(r), int(g), int(b), int(float(alpha) * 255))
+
+
+def _blur_pixmap(source: QPixmap, radius: float) -> QPixmap:
+    """A real Gaussian-style blur of `source`, via Qt's own
+    `QGraphicsBlurEffect` rendered through an offscreen `QGraphicsScene` --
+    the standard Qt recipe for blurring a pixmap, since `QPainter` has no
+    blur primitive of its own. Used by `_GlassPanel` below for actual
+    backdrop blur (the user's explicit choice over a cheaper faux-glass
+    tint, see CLAUDE.md's eighth-pass section) rather than a `box-shadow`-
+    style approximation."""
+    if source.isNull():
+        return source
+    scene = QGraphicsScene()
+    item = QGraphicsPixmapItem(source)
+    effect = QGraphicsBlurEffect()
+    effect.setBlurRadius(radius)
+    item.setGraphicsEffect(effect)
+    scene.addItem(item)
+    result = QPixmap(source.size())
+    result.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(result)
+    scene.render(painter, QRectF(result.rect()), QRectF(source.rect()))
+    painter.end()
+    return result
+
+
+class _GlassPanel(QFrame):
+    """A card with a *real* blurred backdrop behind it, not a flat tint --
+    the redesign brief's own glassmorphism ask, and specifically "real
+    backdrop blur" over a cheaper faux-glass alternative once the trade-off
+    against "keep CPU usage low" was spelled out (see CLAUDE.md's eighth
+    pass).
+
+    Deliberately narrow in scope, which is what keeps that trade-off
+    honest: only the three Home-page side cards (System Status/Quick
+    Actions/Σήμερα, see _build_monitoring_box() and its two siblings) are
+    `_GlassPanel`s -- nothing that repaints every animation frame (the orb,
+    `_Background` itself) ever needs one, and the blurred pixmap is
+    refreshed on a throttled cadence (every fourth tick of the shared
+    `_orb_timer`, ~240ms) rather than on every paint, which is what a live
+    blur-behind would otherwise cost on every single frame.
+
+    The blur source is `_Background` specifically, not the whole window --
+    these cards sit directly over the aurora canvas with nothing else
+    behind them, so capturing just that widget is the complete picture
+    without walking the rest of the widget tree per refresh."""
+
+    _REFRESH_EVERY_N_TICKS = 4
+    _BLUR_RADIUS = 28
+
+    def __init__(self, background: "_Background", parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._background_widget = background
+        self._blurred: QPixmap | None = None
+        self._tick_count = 0
+        self._fill = QColor(20, 20, 24, 140)
+        self._border = QColor(255, 255, 255, 20)
+
+    def set_palette(self, fill: QColor, border: QColor) -> None:
+        self._fill = fill
+        self._border = border
+        self.update()
+
+    def refresh_blur(self, force: bool = False) -> None:
+        self._tick_count += 1
+        if not force and self._tick_count % self._REFRESH_EVERY_N_TICKS:
+            return
+        if not self.isVisible() or self.width() <= 0 or self.height() <= 0:
+            return
+        top_left = self.mapTo(self._background_widget, self.rect().topLeft())
+        region = QRect(top_left, self.size()).intersected(self._background_widget.rect())
+        if region.isEmpty():
+            return
+        source = self._background_widget.grab(region)
+        self._blurred = _blur_pixmap(source, self._BLUR_RADIUS)
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802 -- Qt's own name
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        path = QPainterPath()
+        path.addRoundedRect(rect, 14, 14)
+        painter.setClipPath(path)
+        if self._blurred is not None:
+            painter.drawPixmap(self.rect(), self._blurred)
+        painter.fillPath(path, self._fill)
+        painter.setClipping(False)
+        painter.setPen(QPen(self._border, 1))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawPath(path)
+        # The panel's own per-card accent (System Status blue, Quick
+        # Actions violet, Σήμερα teal -- see _build_*_box()'s
+        # `accentColor` property) still needs to show, but this subclass
+        # bypasses QSS's own background/border painting entirely (that's
+        # the whole point -- QSS has no notion of "paint a blurred pixmap
+        # first") so the thin top accent line is drawn by hand here too,
+        # reading the same property QSS would have read.
+        accent_name = self.property("accentColor")
+        if accent_name in theme.ACCENTS:
+            accent = QColor(theme.ACCENTS[accent_name])
+            accent.setAlpha(140)
+            painter.setPen(QPen(accent, 1.4))
+            painter.drawLine(
+                QRectF(rect).topLeft() + QPointF(6, 0),
+                QRectF(rect).topRight() + QPointF(-6, 0),
+            )
 
 
 # Which sender a transcript line belongs to, and the text to actually show
@@ -846,6 +1037,94 @@ class _ChatTranscriptList(QListWidget):
         self.doItemsLayout()
 
 
+class _CommandPalette(QDialog):
+    """Ctrl+K (redesign brief, "Extras") -- a small, frameless, filterable
+    list of actions: every sidebar page plus every configured quick action
+    (config.SKILL_SITES/SKILL_APPS), read fresh each time the palette opens
+    rather than cached, so it can never show a site/app that was since
+    removed from config.py. Deliberately plain: a QDialog with a QLineEdit
+    and a QListWidget, not a custom overlay widget -- a modal popup is
+    exactly what a command palette is everywhere it's been copied from
+    (Linear, Raycast, VS Code's own Ctrl+Shift+P), and QDialog gives
+    Escape-to-close and click-outside-to-close for free."""
+
+    def __init__(self, window: "MainWindow") -> None:
+        super().__init__(
+            window, Qt.WindowType.FramelessWindowHint | Qt.WindowType.Popup
+        )
+        self.setObjectName("commandPalette")
+        self._window = window
+        self.setFixedWidth(440)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self._input = QLineEdit()
+        self._input.setObjectName(COMMAND_PALETTE_INPUT)
+        self._input.setPlaceholderText("Πληκτρολόγησε μια εντολή…")
+        layout.addWidget(self._input)
+
+        self._list = QListWidget()
+        self._list.setObjectName(COMMAND_PALETTE_LIST)
+        self._list.setMaximumHeight(280)
+        layout.addWidget(self._list)
+
+        self._commands = self._build_commands()
+        self._filter("")
+
+        self._input.textChanged.connect(self._filter)
+        self._input.returnPressed.connect(self._run_selected)
+        self._list.itemActivated.connect(lambda _item: self._run_selected())
+        self._input.setFocus()
+
+    def _build_commands(self) -> list[tuple[str, object]]:
+        w = self._window
+        commands: list[tuple[str, object]] = [
+            ("Μετάβαση: Αρχική", lambda: w._go_to_page(NAV_HOME, index=0)),
+            ("Μετάβαση: Συνομιλία", lambda: w._go_to_page(NAV_CHAT, index=1)),
+            ("Μετάβαση: Εργασίες", lambda: w._go_to_page(NAV_TASKS, index=2)),
+            ("Μετάβαση: Αρχεία", lambda: w._go_to_page(NAV_FILES, index=3)),
+            ("Μετάβαση: Ρυθμίσεις", lambda: w._go_to_page(NAV_SETTINGS, index=4)),
+            ("Ξεκίνα εγγραφή", w._start_listening),
+        ]
+        for label, url in SKILL_SITES.items():
+            commands.append(
+                (
+                    f"Άνοιξε {label}",
+                    lambda label=label, url=url: w._quick_action_site(label, url),
+                )
+            )
+        for label, argv in SKILL_APPS.items():
+            commands.append(
+                (
+                    f"Άνοιξε {label}",
+                    lambda label=label, argv=argv: w._quick_action_app(label, argv),
+                )
+            )
+        return commands
+
+    def _filter(self, text: str) -> None:
+        self._list.clear()
+        needle = text.strip().lower()
+        for label, _action in self._commands:
+            if needle in label.lower():
+                self._list.addItem(label)
+        if self._list.count():
+            self._list.setCurrentRow(0)
+
+    def _run_selected(self) -> None:
+        item = self._list.currentItem()
+        label = item.text() if item is not None else None
+        self.close()
+        if label is None:
+            return
+        for cmd_label, action in self._commands:
+            if cmd_label == label:
+                action()
+                return
+
+
 class MainWindow(QMainWindow):
     """Jarvis's main window. Construction starts no *worker* threads --
     `_listen_thread`/`_brain_thread`/`_speak_thread` are only ever created in
@@ -857,11 +1136,41 @@ class MainWindow(QMainWindow):
     "not until asked" discipline those three do. `gui_main.py` is the only
     thing that instantiates this."""
 
+    # How close to an edge (in px) a press has to land for _resize_edges()
+    # to treat it as a resize grab rather than an ordinary click -- only
+    # meaningful now that the window is frameless and the OS no longer
+    # draws its own resize border (see _build_title_bar()).
+    _RESIZE_MARGIN = 6
+
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Jarvis")
         self.resize(1200, 760)
-        self.setStyleSheet(_STYLESHEET)
+
+        # A custom title bar (redesign brief, "Extras") replaces the native
+        # one -- Qt.FramelessWindowHint removes the OS-drawn bar/buttons,
+        # and _build_title_bar() below draws Jarvis's own in the same dark
+        # chrome tone as the header beneath it, with minimize/maximize/close
+        # wired through startSystemMove()/startSystemResize() (see
+        # eventFilter()/mousePressEvent() below) so the window still drags
+        # and resizes exactly like an ordinary one -- only the pixels
+        # drawing the chrome changed, not the window-manager behaviour
+        # underneath it. QMainWindow's menuBar() still renders as an
+        # ordinary widget under a frameless top-level window on Windows
+        # (only native macOS moves it into the system menu), so the
+        # Αρχείο/Προβολή menu is unaffected.
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
+
+        # Theme state (eighth design pass): which palette/accent the whole
+        # window is painted with right now. Read once here and handed to
+        # every stylesheet build and to _Background's own paint code, so
+        # there is exactly one place ("Εμφάνιση" on the Settings page, see
+        # _build_settings_page) that ever changes it. Not persisted across
+        # a restart -- .env still owns every setting that survives one;
+        # this is the one setting on the whole page that's deliberately
+        # live instead (see _apply_theme()'s own docstring).
+        self._theme_mode = "dark"
+        self._accent = "blue"
 
         # Hold the in-flight worker, if any -- None the rest of the time.
         # Kept as an attribute rather than a local so the thread object isn't
@@ -886,8 +1195,28 @@ class MainWindow(QMainWindow):
         # _log_activity().
         self._recent_activity: list[tuple[str, str]] = []
 
+        # Toast notifications (redesign brief, "Extras") -- a small,
+        # transient overlay stack rather than a second logging path:
+        # _show_toast() below creates one, parents it to this window so it
+        # floats over whichever page is showing, and tears it down itself
+        # after a fade. Kept as a list only so a toast isn't garbage
+        # collected mid-animation.
+        self._active_toasts: list[QFrame] = []
+
+        # Cards that draw a real blurred backdrop (System Status/Quick
+        # Actions/Σήμερα -- see _GlassPanel) rather than a flat tint. Filled
+        # by _build_monitoring_box()/_build_quick_actions_box()/
+        # _build_current_task_box() as each is constructed; _orb_timer
+        # refreshes all three on the same tick the orb/background already
+        # animate on (each panel throttles its own refresh further
+        # internally -- see _GlassPanel._REFRESH_EVERY_N_TICKS), rather than
+        # inventing a fourth timer for one more thing that only needs to
+        # look alive, not instantaneous.
+        self._glass_panels: list[_GlassPanel] = []
+
         self._build_menu_bar()
         self._build_central_widget()
+        self._apply_theme()
 
         # The stored name, if any -- read once at construction rather than
         # on every clock tick, since it only ever changes from a voice save
@@ -911,12 +1240,20 @@ class MainWindow(QMainWindow):
         self._orb_timer = QTimer(self)
         self._orb_timer.timeout.connect(self._orb.tick)
         self._orb_timer.timeout.connect(self._background.tick)
+        self._orb_timer.timeout.connect(self._refresh_glass_panels)
         self._orb_timer.start(ORB_TICK_MS)
 
         self._clock_timer = QTimer(self)
         self._clock_timer.timeout.connect(self._update_clock)
         self._clock_timer.start(1000)
         self._update_clock()
+
+        # Ctrl+K command palette (redesign brief, "Extras") -- a global
+        # shortcut rather than a button, since its whole point is "summon it
+        # from anywhere without reaching for the mouse", the same as every
+        # Linear/Raycast-style palette it's modelled on.
+        self._command_palette_shortcut = QShortcut(QKeySequence("Ctrl+K"), self)
+        self._command_palette_shortcut.activated.connect(self._open_command_palette)
 
         # Initial fill of the tasks list -- same data _poll_system() above
         # fills CPU/RAM/VRAM with: a read that happens once here so the
@@ -966,6 +1303,110 @@ class MainWindow(QMainWindow):
             self._start_listening()
             return
         super().keyPressEvent(event)
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802 -- Qt's own name
+        """The title bar's own drag-to-move: a press anywhere on it (outside
+        its three buttons, which consume their own clicks before this ever
+        sees them) starts the OS's native window move via
+        `QWindow.startSystemMove()` -- the Qt6-documented way to get normal
+        window-dragging behaviour back once `Qt.FramelessWindowHint` has
+        taken the OS's own title bar away. A double-click toggles maximize,
+        the same gesture a native title bar already gives for free."""
+        if obj is getattr(self, "_title_bar", None):
+            if event.type() == QEvent.Type.MouseButtonDblClick:
+                self._toggle_maximize()
+                return True
+            if (
+                event.type() == QEvent.Type.MouseButtonPress
+                and event.button() == Qt.MouseButton.LeftButton
+            ):
+                handle = self.windowHandle()
+                if handle is not None:
+                    handle.startSystemMove()
+                return True
+        return super().eventFilter(obj, event)
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 -- Qt's own name
+        """A frameless window has no OS-drawn border to grab for resizing
+        either, so a press within `_RESIZE_MARGIN` px of an edge starts the
+        OS's native resize via `QWindow.startSystemResize()` -- same idiom
+        as the title bar's `startSystemMove()` above, just for the other
+        half of "a window behaves normally" that `FramelessWindowHint` took
+        away. Everywhere else, this defers to Qt's own handling exactly as
+        before this pass, so no existing click target anywhere in the
+        window is affected."""
+        if event.button() == Qt.MouseButton.LeftButton:
+            edges = self._resize_edges(event.position().toPoint())
+            if edges:
+                handle = self.windowHandle()
+                if handle is not None:
+                    handle.startSystemResize(edges)
+                    return
+        super().mousePressEvent(event)
+
+    def _resize_edges(self, pos: QPoint) -> Qt.Edges:
+        margin = self._RESIZE_MARGIN
+        edges = Qt.Edges()
+        if pos.x() <= margin:
+            edges |= Qt.Edge.LeftEdge
+        elif pos.x() >= self.width() - margin:
+            edges |= Qt.Edge.RightEdge
+        if pos.y() <= margin:
+            edges |= Qt.Edge.TopEdge
+        elif pos.y() >= self.height() - margin:
+            edges |= Qt.Edge.BottomEdge
+        return edges
+
+    def _toggle_maximize(self) -> None:
+        if self.isMaximized():
+            self.showNormal()
+        else:
+            self.showMaximized()
+
+    def _text_color(self) -> str:
+        """The current theme's primary text colour, as a hex string -- used
+        to re-tint the handful of baked-pixmap icons (icons.py) a theme
+        change can't reach through the stylesheet alone, since a QIcon's
+        colour is burned into its pixmap at render time, not a stylesheet
+        property the way a QLabel's `color` is."""
+        return theme.PALETTES[self._theme_mode]["text_primary"]
+
+    def _apply_theme(self, mode: str | None = None, accent: str | None = None) -> None:
+        """Rebuilds and reapplies the whole window's stylesheet from
+        `theme.build_stylesheet()` -- the one live setting on the Settings
+        page (see _build_settings_page's "Εμφάνιση" box), unlike every other
+        row there, which only ever reports what `.env` already fixed at
+        startup. There is nothing to desync by letting this take effect
+        immediately: it changes none of `config.py`'s own values, only how
+        this window paints itself, so "never edit .env" (CLAUDE.md's own
+        working rule) is untouched -- a restart still shows the same .env-
+        driven rows it always has, just repainted in whichever theme was
+        left selected.
+
+        Called once at construction with no arguments (locking in the
+        "dark"/"blue" defaults set in __init__), and again from the two
+        Settings-page combo boxes whenever either changes."""
+        if mode is not None:
+            self._theme_mode = mode
+        if accent is not None:
+            self._accent = accent
+        self.setStyleSheet(theme.build_stylesheet(self._theme_mode, self._accent))
+        self._background.set_theme(self._theme_mode, theme.ACCENTS[self._accent])
+        palette = theme.PALETTES[self._theme_mode]
+        fill = _parse_rgba(palette["glass_fill"])
+        border = _parse_rgba(palette["hairline"])
+        for panel in self._glass_panels:
+            panel.set_palette(fill, border)
+        text_color = self._text_color()
+        for object_name, button in self._nav_buttons.items():
+            icon_name = self._nav_icon_names.get(object_name)
+            if icon_name:
+                button.setIcon(icons.icon(icon_name, text_color))
+        self._refresh_glass_panels(force=True)
+
+    def _refresh_glass_panels(self, force: bool = False) -> None:
+        for panel in self._glass_panels:
+            panel.refresh_blur(force=force)
 
     def _update_clock(self) -> None:
         now = datetime.now()
@@ -1145,6 +1586,7 @@ class MainWindow(QMainWindow):
         outer = QVBoxLayout(central)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
+        outer.addWidget(self._build_title_bar())
         outer.addWidget(self._build_header())
 
         body = QHBoxLayout()
@@ -1162,6 +1604,43 @@ class MainWindow(QMainWindow):
         self._stack.addWidget(self._build_settings_page())
         self._stack.addWidget(self._build_automations_page())
         body.addWidget(self._stack, stretch=1)
+
+    def _build_title_bar(self) -> QWidget:
+        """Replaces the OS-drawn title bar (redesign brief, "Extras: a
+        custom title bar") -- Jarvis's own wordmark plus minimize/maximize/
+        close buttons, in the same dark chrome tone as the header
+        underneath it. Dragging and resizing still work exactly like an
+        ordinary window; they're just driven by `startSystemMove()`/
+        `startSystemResize()` now instead of the OS's own border (see
+        `eventFilter()`/`mousePressEvent()`), so only the pixels drawing
+        the chrome changed."""
+        bar = QFrame()
+        bar.setObjectName(TITLE_BAR)
+        layout = QHBoxLayout(bar)
+        layout.setContentsMargins(12, 0, 0, 0)
+        layout.setSpacing(0)
+
+        label = QLabel("JARVIS")
+        label.setObjectName("titleBarLabel")
+        layout.addWidget(label)
+        layout.addStretch(1)
+
+        for object_name, icon_name, slot in (
+            ("titleBarMinimize", "minimize", self.showMinimized),
+            ("titleBarMaximize", "maximize", self._toggle_maximize),
+            ("titleBarClose", "close", self.close),
+        ):
+            button = QPushButton()
+            button.setObjectName(object_name)
+            button.setProperty("titleBarButton", True)
+            button.setIcon(icons.icon(icon_name, "#9a9aa2"))
+            button.setIconSize(QSize(11, 11))
+            button.clicked.connect(slot)
+            layout.addWidget(button)
+
+        bar.installEventFilter(self)
+        self._title_bar = bar
+        return bar
 
     def _build_header(self) -> QWidget:
         """One row: the wordmark, a status indicator, the clock. The first
@@ -1235,6 +1714,7 @@ class MainWindow(QMainWindow):
         layout.setSpacing(2)
 
         self._nav_buttons: dict[str, QPushButton] = {}
+        self._nav_icon_names: dict[str, str] = {}
 
         brand = QLabel("JARVIS")
         brand.setObjectName("sidebarBrand")
@@ -1246,13 +1726,19 @@ class MainWindow(QMainWindow):
         # "Συνομιλία", a mismatch nobody asked for and nothing in the app
         # otherwise has: Jarvis speaks Greek throughout (see "Language" in
         # CLAUDE.md), and the sidebar was the one place still in English.
-        for object_name, label, index in (
-            (NAV_HOME, "⌂  Αρχική", 0),
-            (NAV_CHAT, "◉  Συνομιλία", 1),
-            (NAV_TASKS, "✓  Εργασίες", 2),
-            (NAV_FILES, "▣  Αρχεία", 3),
+        # A real vector icon (icons.py) replaces the Unicode glyph that used
+        # to be the first two characters of the label -- the redesign
+        # brief's own "add proper icons instead of text symbols" -- so the
+        # label text itself is now plain Greek with no leading symbol.
+        for object_name, icon_name, label, index in (
+            (NAV_HOME, "home", "Αρχική", 0),
+            (NAV_CHAT, "chat", "Συνομιλία", 1),
+            (NAV_TASKS, "tasks", "Εργασίες", 2),
+            (NAV_FILES, "files", "Αρχεία", 3),
         ):
-            layout.addWidget(self._build_nav_button(object_name, label, index))
+            layout.addWidget(
+                self._build_nav_button(object_name, icon_name, label, index)
+            )
 
         layout.addWidget(self._build_sidebar_divider())
         automations_label = QLabel("ΑΥΤΟΜΑΤΟΠΟΙΗΣΕΙΣ")
@@ -1267,30 +1753,41 @@ class MainWindow(QMainWindow):
         # and the stub page says plainly why there's only one view behind
         # them, rather than silently collapsing the ask down to nothing.
         layout.addWidget(
-            self._build_nav_button(NAV_AUTOMATIONS_ACTIVE, "⚡  Ενεργές", 5)
+            self._build_nav_button(
+                NAV_AUTOMATIONS_ACTIVE, "automation-active", "Ενεργές", 5
+            )
         )
         layout.addWidget(
-            self._build_nav_button(NAV_AUTOMATIONS_HISTORY, "◌  Ιστορικό", 5)
+            self._build_nav_button(
+                NAV_AUTOMATIONS_HISTORY, "automation-history", "Ιστορικό", 5
+            )
         )
 
         layout.addStretch(1)
         layout.addWidget(self._build_sidebar_divider())
-        layout.addWidget(self._build_nav_button(NAV_SETTINGS, "⚙  Ρυθμίσεις", 4))
+        layout.addWidget(
+            self._build_nav_button(NAV_SETTINGS, "settings", "Ρυθμίσεις", 4)
+        )
 
         self._nav_buttons[NAV_HOME].setChecked(True)
         return sidebar
 
-    def _build_nav_button(self, object_name: str, label: str, index: int) -> QPushButton:
+    def _build_nav_button(
+        self, object_name: str, icon_name: str, label: str, index: int
+    ) -> QPushButton:
         button = QPushButton(label)
         button.setObjectName(object_name)
         button.setCheckable(True)
         button.setProperty("navButton", True)
+        button.setIcon(icons.icon(icon_name, self._text_color()))
+        button.setIconSize(QSize(16, 16))
         button.clicked.connect(
             lambda _checked=False, i=index, name=object_name: self._go_to_page(
                 name, index=i
             )
         )
         self._nav_buttons[object_name] = button
+        self._nav_icon_names[object_name] = icon_name
         return button
 
     def _build_sidebar_divider(self) -> QFrame:
@@ -1408,7 +1905,30 @@ class MainWindow(QMainWindow):
         activity_list.setMaximumHeight(120)
         activity_list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         activity_list.setSelectionMode(QListWidget.SelectionMode.NoSelection)
+        activity_list.setVisible(False)
         center.addWidget(activity_list)
+
+        # The empty state (redesign brief: "make Recent Activity useful
+        # instead of empty -- an empty state with an icon, plus a timeline
+        # once there's activity"). Shown at construction (nothing has
+        # happened yet this session) and whenever _log_activity() finds the
+        # log empty; hidden the moment a real action is logged. An icon
+        # plus one muted line, never invented sample data.
+        empty_row = QWidget()
+        empty_row.setObjectName(RECENT_ACTIVITY_EMPTY_LABEL)
+        empty_layout = QHBoxLayout(empty_row)
+        empty_layout.setContentsMargins(2, 6, 2, 6)
+        empty_layout.setSpacing(8)
+        empty_icon = QLabel()
+        empty_icon.setPixmap(
+            icons.icon("empty-activity", "#8a8a92").pixmap(16, 16)
+        )
+        empty_layout.addWidget(empty_icon)
+        empty_text = QLabel("Καμία δραστηριότητα ακόμα.")
+        empty_text.setObjectName("recentActivityEmpty")
+        empty_layout.addWidget(empty_text)
+        empty_layout.addStretch(1)
+        center.addWidget(empty_row)
 
         # 2:1 rather than the first pass's 3:1 -- that ratio left the side
         # column narrow and the centre column mostly bare floor around a
@@ -1449,8 +1969,9 @@ class MainWindow(QMainWindow):
         return panel
 
     def _build_monitoring_box(self) -> QWidget:
-        box = QFrame()
+        box = _GlassPanel(self._background)
         box.setObjectName("panel")
+        self._glass_panels.append(box)
         # A dynamic property, not a second object name -- `panel` still
         # selects every card's shared shape/surface in `_STYLESHEET`, and
         # `accentColor` layers one more rule on top for the thin top border
@@ -1500,8 +2021,9 @@ class MainWindow(QMainWindow):
         return box
 
     def _build_quick_actions_box(self) -> QWidget:
-        box = QFrame()
+        box = _GlassPanel(self._background)
         box.setObjectName("panel")
+        self._glass_panels.append(box)
         box.setProperty("accentColor", "violet")
         outer = QVBoxLayout(box)
         outer.setContentsMargins(18, 16, 18, 16)
@@ -1536,14 +2058,14 @@ class MainWindow(QMainWindow):
             button.setProperty("quickActionTile", True)
             button.setIconSize(icon_size)
             if kind == "site":
-                button.setIcon(_dot_icon("#0a84ff"))
+                button.setIcon(icons.icon("site", theme.ACCENTS["blue"]))
                 button.clicked.connect(
                     lambda _checked=False, label=label, url=payload: (
                         self._quick_action_site(label, url)
                     )
                 )
             else:
-                button.setIcon(_dot_icon(_SECONDARY_ACCENT))
+                button.setIcon(icons.icon("app", _SECONDARY_ACCENT))
                 button.clicked.connect(
                     lambda _checked=False, label=label, argv=payload: (
                         self._quick_action_app(label, argv)
@@ -1556,8 +2078,9 @@ class MainWindow(QMainWindow):
         return box
 
     def _build_current_task_box(self) -> QWidget:
-        box = QFrame()
+        box = _GlassPanel(self._background)
         box.setObjectName("panel")
+        self._glass_panels.append(box)
         box.setProperty("accentColor", "teal")
         layout = QVBoxLayout(box)
         layout.setContentsMargins(18, 16, 18, 16)
@@ -1583,9 +2106,11 @@ class MainWindow(QMainWindow):
             widget(self, TRANSCRIPT_LIST).addItem(
                 f"Jarvis: Δεν μπόρεσα να ανοίξω το {label}."
             )
+            self._show_toast(f"Αποτυχία: {label}")
             return
         widget(self, TRANSCRIPT_LIST).addItem(f"Jarvis: Άνοιξα το {label}.")
         self._log_activity(f"Άνοιξε {label}")
+        self._show_toast(f"Άνοιξε {label}")
 
     def _quick_action_app(self, label: str, argv: list) -> None:
         """Same as _quick_action_site(), for a configured local app."""
@@ -1595,9 +2120,11 @@ class MainWindow(QMainWindow):
             widget(self, TRANSCRIPT_LIST).addItem(
                 f"Jarvis: Δεν μπόρεσα να ανοίξω το {label}."
             )
+            self._show_toast(f"Αποτυχία: {label}")
             return
         widget(self, TRANSCRIPT_LIST).addItem(f"Jarvis: Άνοιξα το {label}.")
         self._log_activity(f"Άνοιξε {label}")
+        self._show_toast(f"Άνοιξε {label}")
 
     def _log_activity(self, label: str) -> None:
         """Appends one line (timestamped) to the Home page's Recent Activity
@@ -1614,6 +2141,93 @@ class MainWindow(QMainWindow):
         activity_list.clear()
         for stamp, text in self._recent_activity:
             activity_list.addItem(f"{stamp}   {text}")
+
+        # The empty state (an icon plus a muted line) and the populated
+        # list are mutually exclusive -- never both, never neither. Per the
+        # redesign brief's own "make Recent Activity useful instead of
+        # empty (an empty state with an icon, plus a timeline once there's
+        # activity)".
+        has_activity = bool(self._recent_activity)
+        activity_list.setVisible(has_activity)
+        widget(self, RECENT_ACTIVITY_EMPTY_LABEL).setVisible(not has_activity)
+
+    def _show_toast(self, message: str, kind: str = "info") -> None:
+        """A transient notification card, floating over whichever page is
+        showing -- the redesign brief's "toast notifications", used for
+        things that already show up elsewhere (the transcript, Recent
+        Activity) but are easy to miss if the user isn't looking right at
+        that panel: a quick action that opened something, or one that
+        failed.
+
+        `kind` is accepted but not yet used to vary styling -- the
+        stylesheet's single `#toast` rule (accent-bordered, same surface
+        tone as everything else) covers every case so far; a distinct
+        "error" treatment is a reasonable next step once there's a second
+        kind of toast that actually needs one, not invented ahead of that."""
+        toast = QFrame(self)
+        toast.setObjectName("toast")
+        layout = QHBoxLayout(toast)
+        layout.setContentsMargins(14, 10, 14, 10)
+        label = QLabel(message)
+        label.setObjectName("toastLabel")
+        label.setWordWrap(True)
+        layout.addWidget(label)
+        toast.setMaximumWidth(320)
+        toast.adjustSize()
+
+        margin = 20
+        stack_offset = sum(t.height() + 8 for t in self._active_toasts)
+        toast.move(
+            self.width() - toast.width() - margin,
+            56 + margin + stack_offset,
+        )
+        toast.show()
+        toast.raise_()
+
+        effect = QGraphicsOpacityEffect(toast)
+        toast.setGraphicsEffect(effect)
+        effect.setOpacity(0.0)
+        fade_in = QPropertyAnimation(effect, b"opacity", toast)
+        fade_in.setDuration(200)
+        fade_in.setStartValue(0.0)
+        fade_in.setEndValue(1.0)
+        fade_in.start()
+        # Kept as attributes on the toast itself so neither animation is
+        # garbage-collected mid-flight -- same reasoning _Orb.set_state()
+        # already follows for its own QVariantAnimation.
+        toast._fade_in = fade_in  # type: ignore[attr-defined]
+        self._active_toasts.append(toast)
+
+        def _dismiss() -> None:
+            fade_out = QPropertyAnimation(effect, b"opacity", toast)
+            fade_out.setDuration(200)
+            fade_out.setStartValue(1.0)
+            fade_out.setEndValue(0.0)
+            fade_out.finished.connect(lambda: self._remove_toast(toast))
+            fade_out.start()
+            toast._fade_out = fade_out  # type: ignore[attr-defined]
+
+        QTimer.singleShot(2500, _dismiss)
+
+    def _remove_toast(self, toast: QFrame) -> None:
+        if toast in self._active_toasts:
+            self._active_toasts.remove(toast)
+        toast.deleteLater()
+
+    def _open_command_palette(self) -> None:
+        """Ctrl+K (redesign brief, "Extras") -- a lightweight QDialog
+        listing every page and every configured quick action, filtered as
+        you type. Built fresh on each open rather than kept alive hidden:
+        it's a handful of widgets and SKILL_SITES/SKILL_APPS entries, cheap
+        enough that there's no reason to manage its lifetime across opens,
+        the same reasoning _CommandPalette's own commands are rebuilt from
+        the *current* config.SKILL_SITES/SKILL_APPS every time rather than
+        cached at construction."""
+        palette = _CommandPalette(self)
+        center = self.geometry().center()
+        palette.move(center.x() - palette.width() // 2, self.geometry().top() + 120)
+        palette.show()
+        palette.raise_()
 
     # --- Chat page ------------------------------------------------------------
 
@@ -1732,6 +2346,48 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(24, 20, 24, 20)
         layout.setSpacing(12)
         layout.addWidget(_page_title("Ρυθμίσεις"))
+
+        # The one live setting on this otherwise read-only page -- see
+        # _apply_theme()'s own docstring for why changing this is safe
+        # against the project's "never edit .env" rule (it changes nothing
+        # .env owns, only how this window paints itself).
+        theme_box = QFrame()
+        theme_box.setObjectName("panel")
+        theme_layout = QVBoxLayout(theme_box)
+        theme_layout.setContentsMargins(18, 16, 18, 16)
+        theme_layout.setSpacing(10)
+        theme_layout.addWidget(_panel_title("Εμφάνιση", accent=theme.ACCENTS["blue"]))
+
+        theme_row = QHBoxLayout()
+        theme_row.addWidget(QLabel("Θέμα"))
+        theme_combo = QComboBox()
+        theme_combo.setObjectName(THEME_COMBO)
+        theme_combo.addItem("Σκοτεινό", "dark")
+        theme_combo.addItem("Ανοιχτό", "light")
+        theme_combo.setCurrentIndex(0 if self._theme_mode == "dark" else 1)
+        theme_combo.currentIndexChanged.connect(
+            lambda _i: self._apply_theme(mode=theme_combo.currentData())
+        )
+        theme_row.addWidget(theme_combo)
+        theme_row.addStretch(1)
+        theme_layout.addLayout(theme_row)
+
+        accent_row = QHBoxLayout()
+        accent_row.addWidget(QLabel("Χρώμα έμφασης"))
+        accent_combo = QComboBox()
+        accent_combo.setObjectName(ACCENT_COMBO)
+        accent_names = {"blue": "Μπλε", "violet": "Μοβ", "teal": "Τιρκουάζ"}
+        for choice in theme.ACCENT_CHOICES:
+            accent_combo.addItem(accent_names.get(choice, choice), choice)
+        accent_combo.setCurrentIndex(list(theme.ACCENT_CHOICES).index(self._accent))
+        accent_combo.currentIndexChanged.connect(
+            lambda _i: self._apply_theme(accent=accent_combo.currentData())
+        )
+        accent_row.addWidget(accent_combo)
+        accent_row.addStretch(1)
+        theme_layout.addLayout(accent_row)
+
+        layout.addWidget(theme_box)
 
         form_box = QFrame()
         form_box.setObjectName("panel")
@@ -1916,451 +2572,8 @@ def widget(window: MainWindow, object_name: str) -> QWidget:
     return found
 
 
-# A restrained, Apple-influenced palette -- the third version of this
-# stylesheet. The first pass was flat and "γραφικό" (plain); the second
-# pass's answer to that was gradients, a 3px accent border on every panel
-# and a glowing gradient record button -- more decoration, not more design,
-# and it read as a gaming/RGB dashboard rather than a calm product. This
-# pass instead narrows the palette to a handful of tokens (documented below)
-# and spends restraint, not colour, on communicating hierarchy: one accent,
-# used sparingly (the record button, the active nav item, the status dot);
-# everything else is tone, weight and spacing. No gradients anywhere in this
-# version -- every fill is a single flat colour.
-#
-# Tokens (hand-kept here rather than computed, since Qt's own QSS subset has
-# no variables):
-#   background        #0a0a0c   the window's own canvas -- near-black, not
-#                                 navy -- painted as a gradient by code, not
-#                                 QSS, now that it also carries a faint grid
-#                                 and a few drifting particles (_Background,
-#                                 object name #appBackground); the one
-#                                 deliberate exception to "no gradients"
-#                                 below, since it reads as depth in the
-#                                 room, not as decoration on a control.
-#   chrome             #0d0d10   header/sidebar -- one notch above background,
-#                                 enough to read as a distinct band of UI
-#                                 chrome without competing with panels
-#   surface            #141417   one elevation up again: panels, lists -- a
-#                                 single flat tone, not a gradient
-#   surface-raised      #1c1c1f   hover/pressed states one step up again
-#   hairline           rgba(255,255,255,0.08)   every border in this sheet
-#   text-primary        #f5f5f7   headings, values, anything that matters
-#   text-secondary      rgba(245,245,247,0.55)  labels, captions, metadata
-#   text-tertiary       rgba(245,245,247,0.32)  placeholders, disabled text
-#   accent              #0a84ff   the one accent colour in the whole app
-#   accent-soft        rgba(10,132,255,0.14)    accent used as a fill, not text
-#
-# Three elevations (background < chrome < surface), not one flat colour
-# repeated everywhere -- that's what lets the header/sidebar/panels read as
-# distinct layers at a glance instead of by their borders alone, the same
-# depth cue a native macOS/iOS window uses before it ever reaches for a
-# shadow or a gradient.
-_STYLESHEET = """
-QMainWindow {
-    background-color: #0a0a0c;
-}
-QWidget {
-    color: #f5f5f7;
-    font-family: "Segoe UI", sans-serif;
-    font-size: 13px;
-}
-
-/* The window's own background used to be painted here, as a QSS
-   qradialgradient on #appBackground -- it no longer is. QSS has no notion
-   of a repeating grid texture or of motion, and the redesign brief asks
-   for both (a faint technical texture, a few extremely restrained drifting
-   particles), so the canvas is now a real custom-painted widget instead
-   (_Background, see its own docstring and _build_central_widget()) and
-   paints the same soft radial wash itself, in code, alongside the texture
-   and particles QSS could never express. No rule for #appBackground
-   remains here on purpose -- everything above QWidget stays without its
-   own background-color so the custom paint actually shows through
-   wherever nothing more specific (header/sidebar/panel/list/button) paints
-   over it, exactly as before. */
-
-/* A soft, low-alpha radial glow behind the orb on the Home page -- ambient
-   light in the room, not a second ring glued to the avatar (the orb's own
-   glow is painted in _Orb.paintEvent and stays tight around it). Centred
-   roughly where the orb sits within its own column (cy a little above
-   dead-centre, since the record button below it pulls the visual centre
-   up); fades to fully transparent well before the panel below, so it never
-   collides with the System Status/Quick Actions boxes on the right. Wider
-   and a touch stronger than the first version of this glow -- the orb grew
-   (see _Orb.__init__) and the centre column got more width to fill (see
-   _build_home_page's 2:1 split), so the glow needed more reach to still
-   read as the light source behind it rather than a halo tight to the ring. */
-QFrame#homeGlow {
-    background-color: qradialgradient(
-        cx:0.5, cy:0.42, radius:0.85, fx:0.5, fy:0.42,
-        stop:0 rgba(10, 132, 255, 0.10),
-        stop:0.5 rgba(10, 132, 255, 0.035),
-        stop:1 rgba(10, 132, 255, 0.0)
-    );
-}
-
-/* The native menu bar had no rule at all before this -- meaning it fell
-   back to the OS's own light-themed menu, a bright strip across the top of
-   an otherwise dark window. Styled to match the header it sits above. */
-QMenuBar {
-    background-color: #0d0d10;
-    color: #f5f5f7;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-}
-QMenuBar::item {
-    background-color: transparent;
-    padding: 4px 10px;
-}
-QMenuBar::item:selected {
-    background-color: rgba(255, 255, 255, 0.08);
-    border-radius: 5px;
-}
-QMenu {
-    background-color: #1c1c1f;
-    color: #f5f5f7;
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    border-radius: 8px;
-    padding: 4px;
-}
-QMenu::item {
-    padding: 6px 24px 6px 12px;
-    border-radius: 5px;
-}
-QMenu::item:selected {
-    background-color: rgba(10, 132, 255, 0.14);
-    color: #f5f5f7;
-}
-
-/* --- Header ----------------------------------------------------------- */
-QFrame#header {
-    background-color: #0d0d10;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-    min-height: 56px;
-    max-height: 56px;
-}
-QLabel#brandTitle {
-    font-size: 15px;
-    font-weight: 600;
-    letter-spacing: 0.4px;
-    color: #f5f5f7;
-}
-QLabel#status_label {
-    font-size: 12px;
-    font-weight: 500;
-    color: rgba(245, 245, 247, 0.55);
-}
-QLabel#clock_label {
-    font-family: "Cascadia Mono", Consolas, monospace;
-    font-size: 17px;
-    font-weight: 600;
-    letter-spacing: 0.5px;
-    color: #f5f5f7;
-}
-QLabel#date_label {
-    color: rgba(245, 245, 247, 0.4);
-    font-size: 11px;
-}
-
-/* --- Sidebar ------------------------------------------------------------ */
-QFrame#sidebar {
-    background-color: #0d0d10;
-    border-right: 1px solid rgba(255, 255, 255, 0.08);
-    min-width: 188px;
-    max-width: 188px;
-}
-QLabel#sidebarBrand {
-    color: rgba(245, 245, 247, 0.85);
-    font-size: 12px;
-    font-weight: 700;
-    letter-spacing: 2px;
-    padding: 4px 10px 10px 10px;
-}
-QLabel#sidebarSection {
-    color: rgba(245, 245, 247, 0.32);
-    font-size: 10.5px;
-    font-weight: 600;
-    letter-spacing: 1.2px;
-    padding: 10px 10px 2px 10px;
-}
-QFrame#sidebarDivider {
-    background-color: rgba(255, 255, 255, 0.08);
-    max-height: 1px;
-    min-height: 1px;
-    border: none;
-    margin: 6px 4px;
-}
-QPushButton[navButton="true"] {
-    text-align: left;
-    padding: 9px 14px;
-    margin: 1px 12px;
-    border: none;
-    border-radius: 7px;
-    background-color: transparent;
-    color: rgba(245, 245, 247, 0.5);
-    font-weight: 500;
-    font-size: 13px;
-}
-QPushButton[navButton="true"]:checked {
-    background-color: rgba(10, 132, 255, 0.14);
-    color: #0a84ff;
-    font-weight: 600;
-}
-QPushButton[navButton="true"]:hover:!checked {
-    background-color: rgba(255, 255, 255, 0.05);
-    color: #f5f5f7;
-}
-
-/* --- Panels (System Status / Quick Actions / Current Task / Settings) -- */
-QFrame#panel {
-    background-color: #141417;
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    border-radius: 12px;
-}
-/* A thin, low-saturation top accent per card -- System Status/Quick
-   Actions/Current Task each own one of the two accent colours or the teal
-   (see _SECONDARY_ACCENT/_ACCENT_TEAL), so three otherwise-identical boxes
-   read as three distinct cards instead of one card repeated three times.
-   1px and rgba rather than the heavier 2px solid hex this used to be --
-   "subtle borders instead of heavy card outlines" and "less saturated
-   colors" are both the redesign brief's own words. The Settings page's
-   form panel sets no accentColor property, so it falls back to the plain
-   hairline border above -- a settings form doesn't need the same visual
-   energy a glanceable dashboard card does. */
-QFrame#panel[accentColor="blue"] {
-    border-top: 1px solid rgba(10, 132, 255, 0.55);
-}
-QFrame#panel[accentColor="violet"] {
-    border-top: 1px solid rgba(139, 92, 246, 0.5);
-}
-QFrame#panel[accentColor="teal"] {
-    border-top: 1px solid rgba(34, 195, 182, 0.5);
-}
-QLabel#panelTitle {
-    color: rgba(245, 245, 247, 0.72);
-    font-size: 12.5px;
-    font-weight: 600;
-}
-QLabel[metric="true"] {
-    font-family: "Cascadia Mono", Consolas, monospace;
-    font-size: 13.5px;
-    font-weight: 500;
-    letter-spacing: 0.2px;
-    color: #f5f5f7;
-    padding: 1px 0;
-}
-
-/* The three live meters under CPU/RAM/VRAM -- thin, flat, one colour per
-   metric so a glance tells them apart without reading the label first.
-   QProgressBar's text is hidden (setTextVisible(False)); the number still
-   lives in the QLabel[metric="true"] line above it. */
-QProgressBar {
-    background-color: rgba(255, 255, 255, 0.07);
-    border: none;
-    border-radius: 2px;
-}
-QProgressBar::chunk {
-    border-radius: 2px;
-}
-QProgressBar#cpu_bar::chunk {
-    background-color: #0a84ff;
-}
-QProgressBar#ram_bar::chunk {
-    background-color: #8b5cf6;
-}
-QProgressBar#vram_bar::chunk {
-    background-color: #22c3b6;
-}
-QLabel#pageTitle {
-    font-size: 20px;
-    font-weight: 600;
-    color: #f5f5f7;
-}
-QLabel#mutedText {
-    color: rgba(245, 245, 247, 0.45);
-}
-QLabel#current_task_label {
-    color: #f5f5f7;
-    font-size: 13px;
-}
-
-/* --- Home page: greeting / state word / prompt / divider / activity ---- */
-QLabel#home_greeting_label {
-    font-size: 15px;
-    font-weight: 500;
-    color: rgba(245, 245, 247, 0.6);
-}
-QLabel#home_state_label {
-    font-size: 13px;
-    font-weight: 700;
-    letter-spacing: 2px;
-    color: rgba(245, 245, 247, 0.55);
-}
-QLabel#home_prompt_label {
-    font-size: 13px;
-    font-style: italic;
-    color: rgba(245, 245, 247, 0.4);
-}
-QFrame#divider {
-    background-color: rgba(255, 255, 255, 0.08);
-    max-height: 1px;
-    min-height: 1px;
-    border: none;
-    margin: 10px 0;
-}
-QPushButton[secondaryAction="true"] {
-    background-color: transparent;
-    border: 1px solid rgba(255, 255, 255, 0.14);
-    color: rgba(245, 245, 247, 0.75);
-    padding: 12px 28px;
-    border-radius: 22px;
-    font-weight: 500;
-}
-QPushButton[secondaryAction="true"]:hover {
-    background-color: rgba(255, 255, 255, 0.05);
-}
-QListWidget#recent_activity_list {
-    background-color: transparent;
-    border: none;
-    padding: 0;
-}
-QListWidget#recent_activity_list::item {
-    color: rgba(245, 245, 247, 0.6);
-    font-size: 12px;
-    padding: 3px 4px;
-}
-
-QLabel#settingKey {
-    color: rgba(245, 245, 247, 0.45);
-    font-weight: 500;
-}
-QLabel#settingValue {
-    color: #f5f5f7;
-    font-weight: 500;
-}
-
-/* --- Lists -------------------------------------------------------------- */
-QListWidget {
-    background-color: #141417;
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    border-radius: 12px;
-    padding: 4px;
-    outline: none;
-}
-QListWidget::item {
-    padding: 8px 10px;
-    border-radius: 7px;
-    color: #f5f5f7;
-}
-QListWidget::item:selected {
-    background-color: rgba(10, 132, 255, 0.14);
-    color: #f5f5f7;
-}
-QScrollBar:vertical {
-    background: transparent;
-    width: 8px;
-    margin: 0;
-}
-QScrollBar::handle:vertical {
-    background: rgba(255, 255, 255, 0.14);
-    border-radius: 4px;
-    min-height: 24px;
-}
-QScrollBar::handle:vertical:hover {
-    background: rgba(255, 255, 255, 0.22);
-}
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
-    height: 0;
-}
-
-/* --- Buttons -------------------------------------------------------------- */
-QPushButton {
-    background-color: #1c1c1f;
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    border-radius: 9px;
-    padding: 8px 14px;
-    color: #f5f5f7;
-    font-weight: 500;
-}
-QPushButton:hover {
-    background-color: #242428;
-}
-QPushButton:pressed {
-    background-color: #18181b;
-}
-QPushButton:disabled {
-    color: rgba(245, 245, 247, 0.28);
-    background-color: #141417;
-    border: 1px solid rgba(255, 255, 255, 0.05);
-}
-QPushButton[quickAction="true"] {
-    text-align: left;
-    padding: 9px 12px;
-    background-color: transparent;
-    border: none;
-}
-/* The grid-tile variant (_build_quick_actions_box's two-column layout) --
-   tighter padding and a smaller face than the full-width rule above, since
-   a tile only has half the panel's width to work with. Both properties are
-   set together on every quick-action button, so this simply narrows what
-   the rule above already applies. */
-QPushButton[quickActionTile="true"] {
-    padding: 7px 9px;
-    font-size: 12px;
-    border-radius: 7px;
-}
-QPushButton[quickAction="true"]:hover {
-    background-color: rgba(255, 255, 255, 0.06);
-}
-QPushButton[quickAction="true"]:pressed {
-    background-color: rgba(255, 255, 255, 0.03);
-}
-
-/* record_button is the one place in the window a control is filled with
-   the full blue-to-violet accent pairing, rather than tinting with one --
-   paired with the orb (same two colours, see _SECONDARY_ACCENT), it's the
-   one deliberately bold moment in the window; everything else stays
-   neutral tone or a single thin accent border. */
-QPushButton#record_button {
-    background-color: qlineargradient(
-        x1:0, y1:0, x2:1, y2:0, stop:0 #0a84ff, stop:1 #8b5cf6
-    );
-    border: none;
-    border-radius: 22px;
-    padding: 12px 40px;
-    font-size: 14px;
-    font-weight: 600;
-    color: #ffffff;
-}
-QPushButton#record_button:hover {
-    background-color: qlineargradient(
-        x1:0, y1:0, x2:1, y2:0, stop:0 #2894ff, stop:1 #9d6ff7
-    );
-}
-QPushButton#record_button:pressed {
-    background-color: qlineargradient(
-        x1:0, y1:0, x2:1, y2:0, stop:0 #0870d6, stop:1 #7142d9
-    );
-}
-QPushButton#record_button:disabled {
-    background-color: #1c1c1f;
-    color: rgba(245, 245, 247, 0.3);
-}
-
-/* --- Form (Settings page) ------------------------------------------------- */
-QCheckBox {
-    font-weight: 500;
-    spacing: 8px;
-    padding: 4px 0;
-    color: #f5f5f7;
-}
-QCheckBox::indicator {
-    width: 16px;
-    height: 16px;
-    border: 1px solid rgba(255, 255, 255, 0.2);
-    border-radius: 4px;
-    background-color: #141417;
-}
-QCheckBox::indicator:checked {
-    background-color: #0a84ff;
-    border: 1px solid #0a84ff;
-}
-"""
+# The window's QSS is built by jarvis/gui/theme.py's build_stylesheet(),
+# parametrized on the live theme mode/accent (see MainWindow._apply_theme())
+# rather than kept here as a single static string -- see that module's own
+# docstring for the full token table and why it replaced this file's old
+# hand-kept _STYLESHEET constant.
