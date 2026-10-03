@@ -479,6 +479,22 @@ class ReminderTests(unittest.TestCase):
         self.assertEqual(parsed.table, "reminders")
         self.assertEqual(parsed.fields["due_at"], "2026-09-23T08:00:00")
 
+    def test_glued_hour_and_part_still_reads_as_pm(self) -> None:
+        # The exact live-audio transcript this fix was hand-tested against:
+        # "Υπερθήμησε μου ότι φοράω τα γυαλιά μου στις οκτώτο βράδυ." --
+        # Whisper both mangled the verb (ν->ρ, caught by RE_REMIND_ABS's
+        # unanchored search rather than anything new here) and glued "οκτώ"
+        # to "το" with no space. RE_CLOCK used to require a literal \s+
+        # before "part", so "οκτωτο βραδι" matched only the hour and lost
+        # the evening marker entirely -- silently 8am tomorrow instead of
+        # 8pm today.
+        parsed = memory.parse(
+            "Υπερθήμησε μου ότι φοράω τα γυαλιά μου στις οκτώτο βράδυ.",
+            NOW,
+        )
+        self.assertEqual(parsed.table, "reminders")
+        self.assertEqual(parsed.fields["due_at"], "2026-09-22T20:00:00")
+
     def test_time_after_oti_instead_of_before_it(self) -> None:
         # The live-audio miss: RE_REMIND_ABS's "when" is non-greedy, so
         # phrasing the time AFTER "ότι" instead of before it left "when"

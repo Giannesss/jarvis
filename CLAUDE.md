@@ -1513,6 +1513,29 @@ rolling to pm, a spelled-out hour, the time after both «ότι» and «να», 
 date variant and its inherited noon quirk, and a genuinely unparseable
 reminder still coming back `None` rather than a guessed time.
 
+**Hand-tested on live audio on 2026-10-03, and a third bug fell out of the
+test itself.** «Υπενθύμισέ μου ότι φοράω τα γυαλιά μου στις 8 το βράδυ»
+came back through Whisper as «Υπερθήμησε μου ότι φοράω τα γυαλιά μου στις
+οκτώτο βράδυ.» — two separate kinds of noise in one utterance. The verb
+mangled ν→ρ («υπερθήμησε» for «υπενθύμισε»), caught only because
+`RE_REMIND_ABS.search()` is unanchored and happens to find «θιμισε μου» as
+a substring inside the garbled word — incidental, pre-existing, and out of
+this fix's scope. But «οκτώ» and «το» came back **glued into one word**
+with no space at all («οκτώτο»), and `RE_CLOCK`'s part group required a
+literal `\s+` before «το βράδυ» — so the hour matched («οκτώ» is still a
+prefix of «οκτώτο») but the evening marker silently didn't, and the
+reminder would have fired at 8am tomorrow instead of 8pm that same night.
+Exactly the kind of silent-wrong-time failure this whole area exists to
+prevent, found by the hand test it was built to pass.
+
+Fixed by reusing `_JOIN` (already built for "zero or more separators",
+which covers a vanished one as well as an inserted one) as the gap before
+`part` and inside it, in place of a bare `\s+` — `_GAP`/`_JOIN`/`_OTI`
+moved up the file ahead of `RE_CLOCK`, since it now needs them before
+`RE_TRIGGER` does. Re-ran the exact live transcription after the fix:
+correctly resolves to 8pm the same day. Pinned as
+`test_glued_hour_and_part_still_reads_as_pm`.
+
 ### Tags
 
 Every content table carries a `tags` column: the row's life area, so

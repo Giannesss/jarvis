@@ -209,15 +209,40 @@ _UNIT_RE = "|".join(stem + r"\w*" for stem, _ in UNITS)
 # which would let a stray multi-digit number masquerade as an hour).
 _HOUR_RE = r"\d{1,2}|" + "|".join(sorted(NUMBER_WORDS, key=len, reverse=True))
 
+# Whisper punctuates what it transcribes, sometimes splits a word in two --
+# and, the live case RE_CLOCK below needs, sometimes drops the space between
+# two words entirely. A real hand test of "στις οκτώ το βράδυ" came back as
+# "στις οκτώτο βράδυ" (no space before "το"): RE_CLOCK's part group required
+# a literal "\s+" there, found none, and the whole phrase silently resolved
+# as 8am instead of 8pm -- the clock half matched ("οκτώ" is still a prefix
+# of "οκτώτο"), only the am/pm half was lost. _GAP and _JOIN moved up here
+# from where RE_TRIGGER needs them (a few hundred lines down, where the
+# original "Θυμί σου, ό,τι..." mangling is described) because RE_CLOCK now
+# needs them first; nothing about what they match changed.
+#
+# Stripping punctuation in normalize() instead would be the wrong fix twice
+# over: commas and periods are load-bearing further down this ladder (see
+# RE_COURSE_OF, which uses them to find where a course name ends), and every
+# stored `norm` would change, needing another migration.
+_GAP = r"[\s,.·]+"     # between two words of the trigger phrase
+_JOIN = r"[\s,]*"      # inside one word the recognizer may have split -- or
+                       # glued two together, which is zero separators, also
+                       # covered by "*"
+_OTI = rf"ο{_JOIN}τι"  # "ότι" and "ό,τι" both normalize into this
+
 # --- Dates and clock times -------------------------------------------------
 
 RE_DATE_NUM = _re(r"\b(?P<d>\d{1,2})[/\-.](?P<m>\d{1,2})(?:[/\-.](?P<y>\d{2,4}))?\b")
 RE_DATE_WORD = _re(rf"\b(?P<d>\d{{1,2}})\s+(?P<month>{_MONTHS_RE})(?:\s+(?P<y>\d{{4}}))?\b")
 RE_DATE_REL = _re(rf"\b(?P<rel>{_RELDAY_RE})\b")
 RE_DATE_WDAY = _re(rf"\b(?:την\s+|το\s+)?(?P<wday>{_WEEKDAYS_RE})\b")
+# The gap before "part", and the one inside it before "πρωί"/"μεσημέρι"/
+# "απόγευμα"/"βράδυ", are both _JOIN rather than \s+ for the reason above:
+# "στις 8 το βράδυ" transcribed with either gap glued shut must still read
+# as evening, not silently fall back to the literal (am) hour.
 RE_CLOCK = _re(
     rf"\bστισ\s+(?P<h>{_HOUR_RE})(?:[:.](?P<min>\d{{2}}))?"
-    r"(?:\s+(?P<part>το\s+πρωι|το\s+μεσημερι|το\s+απογευμα|το\s+βραδυ))?"
+    rf"(?:{_JOIN}(?P<part>το{_JOIN}(?:πρωι|μεσημερι|απογευμα|βραδυ)))?"
 )
 
 
@@ -325,21 +350,15 @@ def _unit_seconds(token: str) -> int | None:
 
 # --- The trigger, and the pattern families ---------------------------------
 
-# Whisper punctuates what it transcribes, and sometimes splits a word in two.
-# A real hand test of "Θυμήσου ότι με λένε Γιάννη" came back as "Θυμί σου,
-# ό,τι με λένε Γιάννη": a space dropped into the verb, a comma after it, and
-# "ό,τι" for "ότι". Each of those defeated a separator written as a plain
-# \s+, so the save fell through to the brain -- which role-played having
-# saved it, and only the next recall showed that nothing had been. The
-# separators below tolerate what the recognizer actually emits.
-#
-# Stripping punctuation in normalize() instead would be the wrong fix twice
-# over: commas and periods are load-bearing further down this ladder (see
-# RE_COURSE_OF, which uses them to find where a course name ends), and every
-# stored `norm` would change, needing another migration.
-_GAP = r"[\s,.·]+"     # between two words of the trigger phrase
-_JOIN = r"[\s,]*"      # inside one word the recognizer may have split
-_OTI = rf"ο{_JOIN}τι"  # "ότι" and "ό,τι" both normalize into this
+# _GAP, _JOIN and _OTI are defined earlier now (above "Dates and clock
+# times"), where RE_CLOCK needs them first -- see the comment there for what
+# each one tolerates. The case that put them here originally is the same
+# kind: a real hand test of "Θυμήσου ότι με λένε Γιάννη" came back as "Θυμί
+# σου, ό,τι με λένε Γιάννη" (a space dropped into the verb, a comma after
+# it, "ό,τι" for "ότι"), each of which defeated a separator written as a
+# plain \s+ and sent the save falling through to the brain -- which
+# role-played having saved it, and only the next recall showed that nothing
+# had been.
 
 RE_TRIGGER = _re(
     rf"^(?:τζαρβισ{_GAP})?"
