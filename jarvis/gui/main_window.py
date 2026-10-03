@@ -37,7 +37,15 @@ from datetime import datetime
 from enum import Enum, auto
 
 import psutil
-from PySide6.QtCore import QRectF, QThread, QTimer, Qt, Signal
+from PySide6.QtCore import (
+    QEasingCurve,
+    QRectF,
+    QThread,
+    QTimer,
+    Qt,
+    QVariantAnimation,
+    Signal,
+)
 from PySide6.QtGui import QAction, QColor, QPainter, QRadialGradient
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -49,7 +57,6 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QPushButton,
     QStackedWidget,
-    QStatusBar,
     QVBoxLayout,
     QWidget,
 )
@@ -80,6 +87,7 @@ NAV_FILES = "nav_files"
 NAV_SETTINGS = "nav_settings"
 CLOCK_LABEL = "clock_label"
 DATE_LABEL = "date_label"
+STATUS_DOT = "status_dot"
 
 # How often _poll_system() refreshes the CPU/RAM/VRAM/network labels. 2s is
 # frequent enough to look live without polling psutil hard enough to show up
@@ -151,21 +159,29 @@ def _format_rate(bytes_per_second: float) -> str:
 
 
 def _panel_title(text: str) -> QLabel:
-    """A small-caps, letter-spaced label for a panel's own heading (System
-    Status, Quick Actions, Current Task), visually distinct from the plain
-    body labels inside the panel -- styled via the `panelTitle` object name
-    in `_STYLESHEET` rather than repeating font/color calls at every call
-    site that builds one of these panels."""
-    label = QLabel(text)
+    """A small, letter-spaced, uppercase label for a panel's own heading
+    (System Status, Quick Actions, Current Task), visually distinct from the
+    plain body labels inside the panel -- styled via the `panelTitle` object
+    name in `_STYLESHEET` rather than repeating font/colour calls at every
+    call site that builds one of these panels. Upper-cased here rather than
+    relying on a stylesheet `text-transform` -- Qt's QSS subset doesn't
+    support that CSS property, so the caller writes the label in natural
+    case and this is where it becomes the small-caps look."""
+    label = QLabel(text.upper())
     label.setObjectName("panelTitle")
     return label
 
 
 def _page_title(text: str) -> QLabel:
     """A page's own headline label (Συνομιλία, Εργασίες, ...), styled via
-    the `pageTitle` object name -- larger and underlined with the accent
-    colour, so a page reads as having a real header rather than the same
-    plain QLabel every other piece of text on it uses."""
+    the `pageTitle` object name -- larger and heavier than body text, so a
+    page reads as having a real header rather than the same plain QLabel
+    every other piece of text on it uses. No underline or rule beneath it
+    (the first pass drew one in the accent colour): a page title earns its
+    weight from size and spacing alone, the same way a native macOS/iOS
+    screen title does -- a coloured rule under every heading in the window
+    is exactly the kind of "exists because it looks cool" detail the second
+    design pass asks to remove."""
     label = QLabel(text)
     label.setObjectName("pageTitle")
     return label
@@ -217,15 +233,28 @@ _STATUS_TEXT = {
     State.SPEAKING: "Κατάσταση: Μιλάει...",
 }
 
-# The orb's glow colour per state -- idle a dim blue, listening/speaking a
-# bright one (it's doing the thing a microphone/speaker icon would show),
-# thinking an amber (visually distinct from "I'm listening to you" without
-# needing a third colour family).
+# One accent per state, restrained rather than neon -- idle a quiet grey-blue
+# (barely a colour at all; the orb should look almost off), listening/
+# speaking the single accent blue a click would also use, thinking a muted
+# amber. Three colour families, not four: listening and speaking share one,
+# since both are "doing the thing a mic/speaker icon would show" and a
+# fourth hue would just be more to visually parse for no new information.
 _ORB_COLOR = {
-    State.IDLE: QColor(70, 110, 160),
-    State.LISTENING: QColor(70, 170, 255),
-    State.THINKING: QColor(230, 170, 60),
-    State.SPEAKING: QColor(70, 220, 190),
+    State.IDLE: QColor(90, 100, 120),
+    State.LISTENING: QColor(10, 132, 255),
+    State.THINKING: QColor(210, 150, 60),
+    State.SPEAKING: QColor(10, 132, 255),
+}
+
+# Same per-state colour, as a hex string, for the small status dot in the
+# header (see _build_header()) -- a plain QLabel can't take a QColor
+# directly in a stylesheet string, so this is the same table in the other
+# format rather than converting _ORB_COLOR at every _set_state() call.
+_STATUS_DOT_COLOR = {
+    State.IDLE: "#5a6478",
+    State.LISTENING: "#0a84ff",
+    State.THINKING: "#d2963c",
+    State.SPEAKING: "#0a84ff",
 }
 
 # Same text as main.py's own BRAIN_ERROR_REPLY. Duplicated rather than
@@ -321,21 +350,54 @@ class _SpeakWorker(QThread):
 
 
 class _Orb(QWidget):
-    """The central glowing avatar -- an original design (concentric rings +
-    a row of waveform bars), deliberately not a recreation of the reference
-    mockup's Iron Man face, which is a copyrighted character. Colour and
-    "activity" (whether the waveform bars move) follow the state machine via
-    `set_state()`; a `QTimer` outside this class drives `tick()` to animate
-    it, since a widget with no events of its own otherwise never repaints."""
+    """The central avatar -- an original design (a soft glow, a single ring,
+    a handful of waveform bars), deliberately not a recreation of the
+    reference mockup's Iron Man face, which is a copyrighted character.
+
+    Restrained on purpose, per the second design pass: the first version's
+    double ring and nine fast-wobbling bars read as a "sci-fi HUD", busy even
+    at idle. This one sits almost still until a state actually calls for
+    motion -- one ring, five bars, a slower idle breath -- so attention goes
+    to the handful of pixels that are actually telling you something,
+    matching the orb's own job: the single place in the window that answers
+    "what is Jarvis doing right now" at a glance.
+
+    Colour changes are *animated*, not snapped -- `set_state()` starts a
+    ~280ms QVariantAnimation from the orb's current displayed colour to the
+    new state's, eased out, so a state change reads as a deliberate
+    transition rather than a flicker. "Smooth, physical, intentional" is the
+    brief; an instant colour swap is none of those."""
+
+    _COLOR_TRANSITION_MS = 280
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setMinimumSize(220, 220)
+        self.setMinimumSize(200, 200)
         self._state = State.IDLE
         self._phase = 0.0
+        self._color = QColor(_ORB_COLOR[State.IDLE])
+        self._color_anim: QVariantAnimation | None = None
 
     def set_state(self, state: State) -> None:
         self._state = state
+        target = _ORB_COLOR[state]
+        if target == self._color:
+            return
+        anim = QVariantAnimation(self)
+        anim.setStartValue(QColor(self._color))
+        anim.setEndValue(QColor(target))
+        anim.setDuration(self._COLOR_TRANSITION_MS)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        anim.valueChanged.connect(self._apply_color)
+        anim.start()
+        # Kept as an attribute, not a local, so Python doesn't garbage
+        # collect it mid-flight -- the same reason MainWindow holds its
+        # worker threads as attributes rather than locals.
+        self._color_anim = anim
+
+    def _apply_color(self, value: QColor) -> None:
+        self._color = value
+        self.update()
 
     def tick(self) -> None:
         self._phase += 1.0
@@ -347,61 +409,64 @@ class _Orb(QWidget):
 
         side = min(self.width(), self.height())
         cx, cy = self.width() / 2, self.height() / 2
-        color = _ORB_COLOR[self._state]
+        color = self._color
 
-        # A slow pulse on the outer glow radius -- idle breathes gently;
-        # listening/thinking/speaking pulse a bit faster and wider, so the
-        # orb visibly "comes alive" without needing real audio levels to do
-        # it (see ORB_TICK_MS's comment on why those aren't wired in).
-        speed = 0.03 if self._state is State.IDLE else 0.08
+        # A slow breathing pulse on the glow radius -- idle breathes gently
+        # and slowly; an active state breathes a little faster, but nothing
+        # here is meant to be eye-catching on its own. "Almost still when
+        # idle, alive only when something is actually happening" is the
+        # brief, so even an active state's pulse stays subtle.
+        speed = 0.02 if self._state is State.IDLE else 0.045
         pulse = (math.sin(self._phase * speed) + 1) / 2  # 0..1
 
-        outer_radius = side * (0.42 + 0.04 * pulse)
-        gradient = QRadialGradient(cx, cy, outer_radius)
+        glow_radius = side * (0.40 + 0.03 * pulse)
+        gradient = QRadialGradient(cx, cy, glow_radius)
         glow = QColor(color)
-        glow.setAlpha(90)
+        glow.setAlpha(60)
         gradient.setColorAt(0.0, glow)
         transparent = QColor(color)
         transparent.setAlpha(0)
         gradient.setColorAt(1.0, transparent)
         painter.setBrush(gradient)
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.drawEllipse(QRectF(cx - outer_radius, cy - outer_radius, outer_radius * 2, outer_radius * 2))
+        painter.drawEllipse(
+            QRectF(cx - glow_radius, cy - glow_radius, glow_radius * 2, glow_radius * 2)
+        )
 
-        # Two solid rings, the inner one slightly brighter -- reads as a
-        # "core" the glow sits around, the same idea as an arc reactor
-        # without copying one.
-        for radius_frac, alpha in ((0.30, 160), (0.24, 220)):
-            radius = side * radius_frac
-            ring = QColor(color)
-            ring.setAlpha(alpha)
-            painter.setPen(ring)
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawEllipse(QRectF(cx - radius, cy - radius, radius * 2, radius * 2))
+        # A single ring -- a "core" the glow sits around, without the
+        # arc-reactor double-ring the first pass drew.
+        ring_radius = side * 0.27
+        ring = QColor(color)
+        ring.setAlpha(190)
+        painter.setPen(ring)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(
+            QRectF(cx - ring_radius, cy - ring_radius, ring_radius * 2, ring_radius * 2)
+        )
 
-        # The waveform: a row of bars across the core, only animated
-        # (varying height) while something is actually happening -- idle
-        # shows them flat, a visual "nothing to hear right now".
-        bar_count = 9
-        bar_area_width = side * 0.5
-        bar_spacing = bar_area_width / bar_count
+        # Five bars, not nine -- fewer, calmer, each a touch wider. Idle
+        # shows them as short flat dashes (a resting state, not "nothing is
+        # here"); an active state wobbles them, still gently.
+        bar_count = 5
+        bar_area_width = side * 0.32
+        bar_gap = bar_area_width / bar_count
         base_y = cy
         for i in range(bar_count):
             if self._state is State.IDLE:
-                height = side * 0.03
+                height = side * 0.025
             else:
                 # A deterministic pseudo-wave from the phase and the bar's
                 # own index -- decorative, not a real audio level (see
                 # ORB_TICK_MS above).
-                wobble = (math.sin(self._phase * 0.25 + i * 0.9) + 1) / 2
-                height = side * (0.04 + 0.12 * wobble)
-            x = cx - bar_area_width / 2 + i * bar_spacing
+                wobble = (math.sin(self._phase * 0.18 + i * 1.1) + 1) / 2
+                height = side * (0.03 + 0.08 * wobble)
+            x = cx - bar_area_width / 2 + i * bar_gap
             bar_color = QColor(color)
-            bar_color.setAlpha(230)
+            bar_color.setAlpha(210)
             painter.setBrush(bar_color)
             painter.setPen(Qt.PenStyle.NoPen)
             painter.drawRoundedRect(
-                QRectF(x, base_y - height / 2, bar_spacing * 0.5, height), 2, 2
+                QRectF(x, base_y - height / 2, bar_gap * 0.45, height), 2, 2
             )
 
 
@@ -438,7 +503,6 @@ class MainWindow(QMainWindow):
 
         self._build_menu_bar()
         self._build_central_widget()
-        self._build_status_bar()
 
         # psutil.cpu_percent()'s first-ever call in a process measures usage
         # since the process started, which is not a meaningful snapshot --
@@ -575,6 +639,13 @@ class MainWindow(QMainWindow):
         widget(self, STATUS_LABEL).setText(_STATUS_TEXT[state])
         widget(self, RECORD_BUTTON).setEnabled(state is State.IDLE)
         self._orb.set_state(state)
+        # The dot's colour is per-instance, not per-class, so it's set here
+        # directly rather than through _STYLESHEET -- a plain object-name or
+        # property selector can't express "whichever colour this state maps
+        # to" the way _STATUS_DOT_COLOR already holds it.
+        widget(self, STATUS_DOT).setStyleSheet(
+            f"background-color: {_STATUS_DOT_COLOR[state]}; border-radius: 3px;"
+        )
 
     # --- Menu bar -----------------------------------------------------------
 
@@ -618,26 +689,44 @@ class MainWindow(QMainWindow):
         body.addWidget(self._stack, stretch=1)
 
     def _build_header(self) -> QWidget:
+        """One row: the wordmark, a status indicator, the clock. The first
+        design pass also put a tagline ("Always here. Ready.") under the
+        wordmark -- removed here, since it communicated nothing the window
+        title bar doesn't already say and existed only to fill space under
+        the logo. Less UI, not more, per the second pass's own brief."""
         header = QFrame()
         header.setObjectName("header")
         layout = QHBoxLayout(header)
+        layout.setContentsMargins(24, 0, 24, 0)
 
-        brand = QVBoxLayout()
-        title = QLabel("JARVIS")
+        title = QLabel("Jarvis")
         title.setObjectName("brandTitle")
-        tagline = QLabel("Always here. Ready.")
-        tagline.setObjectName("tagline")
-        brand.addWidget(title)
-        brand.addWidget(tagline)
-        layout.addLayout(brand)
+        layout.addWidget(title)
         layout.addStretch(1)
 
+        # A small colour-coded dot plus plain text, instead of the first
+        # pass's filled "pill" -- the same information (what state Jarvis is
+        # in) with less visual weight. The dot's colour is set directly in
+        # _set_state() (see STATUS_DOT_COLOR) rather than through the global
+        # stylesheet, since it has to change per state, not just on
+        # hover/press/disabled the way a QSS pseudo-state can express.
+        status_row = QHBoxLayout()
+        status_row.setSpacing(8)
+        status_dot = QFrame()
+        status_dot.setObjectName(STATUS_DOT)
+        status_dot.setFixedSize(7, 7)
+        status_dot.setStyleSheet(
+            f"background-color: {_STATUS_DOT_COLOR[State.IDLE]}; border-radius: 3px;"
+        )
+        status_row.addWidget(status_dot)
         status_label = QLabel(_STATUS_TEXT[State.IDLE])
         status_label.setObjectName(STATUS_LABEL)
-        layout.addWidget(status_label)
+        status_row.addWidget(status_label)
+        layout.addLayout(status_row)
         layout.addStretch(1)
 
         clock_box = QVBoxLayout()
+        clock_box.setSpacing(0)
         clock_label = QLabel("--:--")
         clock_label.setObjectName(CLOCK_LABEL)
         clock_label.setAlignment(Qt.AlignmentFlag.AlignRight)
@@ -696,20 +785,21 @@ class MainWindow(QMainWindow):
     def _build_home_page(self) -> QWidget:
         page = QWidget()
         layout = QHBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
 
         center = QVBoxLayout()
+        center.setSpacing(28)
         center.addStretch(1)
 
         self._orb = _Orb()
         center.addWidget(self._orb, alignment=Qt.AlignmentFlag.AlignCenter)
-
-        quote = QLabel(
-            '"Great things are not done by impulse, but by a series of\n'
-            'small things brought together." — Vincent van Gogh'
-        )
-        quote.setObjectName("quote")
-        quote.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        center.addWidget(quote)
+        # No caption or quote under the orb -- the first pass had a
+        # decorative quote here that named nothing and did nothing; the
+        # second pass's brief is explicit that an element earns its place by
+        # communicating information, enabling interaction, or giving
+        # feedback, not by filling empty space. The orb's own state (colour,
+        # motion) and the status row in the header already say what Jarvis
+        # is doing; a quote said nothing further.
 
         record_button = QPushButton("Εγγραφή")
         record_button.setObjectName(RECORD_BUTTON)
@@ -725,6 +815,8 @@ class MainWindow(QMainWindow):
     def _build_home_sidebar(self) -> QWidget:
         panel = QWidget()
         layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 24, 24, 24)
+        layout.setSpacing(16)
 
         layout.addWidget(self._build_monitoring_box())
         layout.addWidget(self._build_quick_actions_box())
@@ -737,9 +829,9 @@ class MainWindow(QMainWindow):
         box = QFrame()
         box.setObjectName("panel")
         layout = QVBoxLayout(box)
-        layout.setContentsMargins(16, 14, 16, 14)
-        layout.setSpacing(8)
-        layout.addWidget(_panel_title("SYSTEM STATUS"))
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(10)
+        layout.addWidget(_panel_title("System Status"))
 
         for object_name, placeholder in (
             (CPU_LABEL, "CPU: —"),
@@ -763,9 +855,9 @@ class MainWindow(QMainWindow):
         box = QFrame()
         box.setObjectName("panel")
         layout = QVBoxLayout(box)
-        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setContentsMargins(18, 16, 18, 16)
         layout.setSpacing(8)
-        layout.addWidget(_panel_title("QUICK ACTIONS"))
+        layout.addWidget(_panel_title("Quick Actions"))
 
         # One button per site/app Jarvis can already open by voice
         # (config.SKILL_SITES / SKILL_APPS) -- so the panel reflects what's
@@ -799,9 +891,9 @@ class MainWindow(QMainWindow):
         box = QFrame()
         box.setObjectName("panel")
         layout = QVBoxLayout(box)
-        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setContentsMargins(18, 16, 18, 16)
         layout.setSpacing(8)
-        layout.addWidget(_panel_title("CURRENT TASK"))
+        layout.addWidget(_panel_title("Current Task"))
 
         label = QLabel("Έτοιμος — περιμένω εντολή.")
         label.setObjectName(CURRENT_TASK_LABEL)
@@ -1072,12 +1164,12 @@ class MainWindow(QMainWindow):
         # when a turn changes it.
         self._load_tasks()
 
-    # --- Status bar -----------------------------------------------------------
-
-    def _build_status_bar(self) -> None:
-        bar = QStatusBar()
-        bar.showMessage("Jarvis — Phase 6 complete")
-        self.setStatusBar(bar)
+    # No status bar. The first pass had one showing a developer-facing
+    # "Jarvis — Phase 6 complete" string -- meant nothing to the person using
+    # the app, and a window chrome element that exists to report the
+    # project's own build status is exactly the "developer dashboard" feel
+    # the second design pass asks to move away from. The header's status row
+    # (see _build_header()) is where Jarvis's own state actually belongs.
 
 
 def widget(window: MainWindow, object_name: str) -> QWidget:
@@ -1089,170 +1181,161 @@ def widget(window: MainWindow, object_name: str) -> QWidget:
     return found
 
 
-# Dark, "premium" palette matching the reference mockup's register (deep
-# navy/black backgrounds, a single blue accent, soft rounded panels) without
-# any of its copyrighted imagery -- a stylesheet, not a design system, so
-# it's one block rather than split across every _build_*() method.
+# A restrained, Apple-influenced palette -- the third version of this
+# stylesheet. The first pass was flat and "γραφικό" (plain); the second
+# pass's answer to that was gradients, a 3px accent border on every panel
+# and a glowing gradient record button -- more decoration, not more design,
+# and it read as a gaming/RGB dashboard rather than a calm product. This
+# pass instead narrows the palette to a handful of tokens (documented below)
+# and spends restraint, not colour, on communicating hierarchy: one accent,
+# used sparingly (the record button, the active nav item, the status dot);
+# everything else is tone, weight and spacing. No gradients anywhere in this
+# version -- every fill is a single flat colour.
+#
+# Tokens (hand-kept here rather than computed, since Qt's own QSS subset has
+# no variables):
+#   background        #0a0a0c   the window itself -- near-black, not navy
+#   surface            #141417   one elevation up: header, sidebar, panels,
+#                                 lists -- a single flat tone, not a gradient
+#   surface-raised      #1c1c1f   hover/pressed states one step up again
+#   hairline           rgba(255,255,255,0.08)   every border in this sheet
+#   text-primary        #f5f5f7   headings, values, anything that matters
+#   text-secondary      rgba(245,245,247,0.55)  labels, captions, metadata
+#   text-tertiary       rgba(245,245,247,0.32)  placeholders, disabled text
+#   accent              #0a84ff   the one accent colour in the whole app
+#   accent-soft        rgba(10,132,255,0.14)    accent used as a fill, not text
 _STYLESHEET = """
 QMainWindow, QWidget {
-    background-color: #090d16;
-    color: #e6edf7;
+    background-color: #0a0a0c;
+    color: #f5f5f7;
     font-family: "Segoe UI", sans-serif;
     font-size: 13px;
 }
 
 /* --- Header ----------------------------------------------------------- */
 QFrame#header {
-    background-color: qlineargradient(
-        x1:0, y1:0, x2:1, y2:0,
-        stop:0 #0d1322, stop:1 #111a30
-    );
-    border-bottom: 1px solid #202c4a;
-    min-height: 64px;
-    max-height: 64px;
+    background-color: #0a0a0c;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    min-height: 56px;
+    max-height: 56px;
 }
 QLabel#brandTitle {
-    font-size: 21px;
-    font-weight: 700;
-    letter-spacing: 4px;
-    color: #ffffff;
-}
-QLabel#tagline {
-    color: #5d7099;
-    font-size: 11px;
-    letter-spacing: 1px;
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: 0.4px;
+    color: #f5f5f7;
 }
 QLabel#status_label {
     font-size: 12px;
-    font-weight: 600;
-    color: #8fd6ff;
-    background-color: rgba(70, 170, 255, 0.12);
-    border: 1px solid rgba(70, 170, 255, 0.35);
-    border-radius: 11px;
-    padding: 4px 14px;
+    font-weight: 500;
+    color: rgba(245, 245, 247, 0.55);
 }
 QLabel#clock_label {
-    font-size: 17px;
-    font-weight: 700;
-    color: #ffffff;
+    font-size: 13px;
+    font-weight: 600;
+    color: #f5f5f7;
 }
 QLabel#date_label {
-    color: #5d7099;
+    color: rgba(245, 245, 247, 0.4);
     font-size: 11px;
 }
 
 /* --- Sidebar ------------------------------------------------------------ */
 QFrame#sidebar {
-    background-color: #0c1120;
-    border-right: 1px solid #1c2740;
-    min-width: 176px;
-    max-width: 176px;
+    background-color: #0a0a0c;
+    border-right: 1px solid rgba(255, 255, 255, 0.08);
+    min-width: 168px;
+    max-width: 168px;
 }
 QPushButton[navButton="true"] {
     text-align: left;
-    padding: 11px 16px;
-    margin: 2px 10px;
+    padding: 9px 14px;
+    margin: 1px 12px;
     border: none;
-    border-radius: 8px;
+    border-radius: 7px;
     background-color: transparent;
-    color: #8695b3;
-    font-weight: 600;
+    color: rgba(245, 245, 247, 0.5);
+    font-weight: 500;
+    font-size: 13px;
 }
 QPushButton[navButton="true"]:checked {
-    background-color: qlineargradient(
-        x1:0, y1:0, x2:1, y2:0,
-        stop:0 #1b4ed8, stop:1 #2f6fff
-    );
-    color: #ffffff;
+    background-color: rgba(10, 132, 255, 0.14);
+    color: #0a84ff;
+    font-weight: 600;
 }
 QPushButton[navButton="true"]:hover:!checked {
-    background-color: #161f38;
-    color: #d6e2f7;
+    background-color: rgba(255, 255, 255, 0.05);
+    color: #f5f5f7;
 }
 
 /* --- Panels (System Status / Quick Actions / Current Task / Settings) -- */
 QFrame#panel {
-    background-color: qlineargradient(
-        x1:0, y1:0, x2:0, y2:1,
-        stop:0 #141c30, stop:1 #101726
-    );
-    border: 1px solid #22304f;
-    border-left: 3px solid #3773ff;
+    background-color: #141417;
+    border: 1px solid rgba(255, 255, 255, 0.08);
     border-radius: 12px;
-    margin: 7px;
 }
 QLabel#panelTitle {
-    color: #6f86b8;
+    color: rgba(245, 245, 247, 0.4);
     font-size: 11px;
-    font-weight: 700;
-    letter-spacing: 2px;
-    padding-bottom: 4px;
-    border-bottom: 1px solid #22304f;
-    margin-bottom: 4px;
+    font-weight: 600;
+    letter-spacing: 0.6px;
 }
 QLabel[metric="true"] {
     font-size: 13px;
-    font-weight: 600;
-    color: #d6e2f7;
-    padding: 2px 0;
+    font-weight: 500;
+    color: #f5f5f7;
+    padding: 1px 0;
 }
 QLabel#pageTitle {
-    font-size: 19px;
-    font-weight: 700;
-    color: #ffffff;
-    padding-bottom: 8px;
-    border-bottom: 2px solid #3773ff;
+    font-size: 20px;
+    font-weight: 600;
+    color: #f5f5f7;
 }
 QLabel#mutedText {
-    color: #6f86b8;
-}
-QLabel#quote {
-    color: #5d7099;
-    font-style: italic;
-    font-size: 12px;
-    padding: 10px;
+    color: rgba(245, 245, 247, 0.45);
 }
 QLabel#current_task_label {
-    color: #e6edf7;
+    color: #f5f5f7;
     font-size: 13px;
 }
 QLabel#settingKey {
-    color: #6f86b8;
-    font-weight: 600;
+    color: rgba(245, 245, 247, 0.45);
+    font-weight: 500;
 }
 QLabel#settingValue {
-    color: #e6edf7;
-    font-weight: 600;
+    color: #f5f5f7;
+    font-weight: 500;
 }
 
 /* --- Lists -------------------------------------------------------------- */
 QListWidget {
-    background-color: #0d1322;
-    border: 1px solid #1c2740;
-    border-radius: 10px;
-    padding: 6px;
+    background-color: #141417;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 12px;
+    padding: 4px;
     outline: none;
 }
 QListWidget::item {
-    padding: 7px 8px;
-    border-radius: 6px;
+    padding: 8px 10px;
+    border-radius: 7px;
+    color: #f5f5f7;
 }
 QListWidget::item:selected {
-    background-color: #1b2440;
-    color: #ffffff;
+    background-color: rgba(10, 132, 255, 0.14);
+    color: #f5f5f7;
 }
 QScrollBar:vertical {
     background: transparent;
-    width: 10px;
+    width: 8px;
     margin: 0;
 }
 QScrollBar::handle:vertical {
-    background: #2a3658;
-    border-radius: 5px;
+    background: rgba(255, 255, 255, 0.14);
+    border-radius: 4px;
     min-height: 24px;
 }
 QScrollBar::handle:vertical:hover {
-    background: #3a4a78;
+    background: rgba(255, 255, 255, 0.22);
 }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
     height: 0;
@@ -1260,75 +1343,76 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
 
 /* --- Buttons -------------------------------------------------------------- */
 QPushButton {
-    background-color: #1b2440;
-    border: 1px solid #2a3658;
-    border-radius: 8px;
+    background-color: #1c1c1f;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 9px;
     padding: 8px 14px;
-    color: #e6edf7;
-    font-weight: 600;
+    color: #f5f5f7;
+    font-weight: 500;
 }
 QPushButton:hover {
-    background-color: #243058;
-    border: 1px solid #3773ff;
+    background-color: #242428;
 }
 QPushButton:pressed {
-    background-color: #182036;
+    background-color: #18181b;
 }
 QPushButton:disabled {
-    color: #475070;
-    border: 1px solid #1c2740;
-    background-color: #111728;
+    color: rgba(245, 245, 247, 0.28);
+    background-color: #141417;
+    border: 1px solid rgba(255, 255, 255, 0.05);
 }
 QPushButton[quickAction="true"] {
     text-align: left;
     padding: 9px 12px;
+    background-color: transparent;
+    border: none;
 }
+QPushButton[quickAction="true"]:hover {
+    background-color: rgba(255, 255, 255, 0.06);
+}
+QPushButton[quickAction="true"]:pressed {
+    background-color: rgba(255, 255, 255, 0.03);
+}
+
+/* record_button is the one place in the window the accent colour fills a
+   whole control, rather than tinting one -- the single primary action
+   earns the single accent; everything else stays neutral tone. */
 QPushButton#record_button {
-    background-color: qlineargradient(
-        x1:0, y1:0, x2:1, y2:0,
-        stop:0 #1b4ed8, stop:1 #3773ff
-    );
+    background-color: #0a84ff;
     border: none;
     border-radius: 22px;
-    padding: 12px 36px;
+    padding: 12px 40px;
     font-size: 14px;
-    font-weight: 700;
-    letter-spacing: 1px;
+    font-weight: 600;
     color: #ffffff;
 }
 QPushButton#record_button:hover {
-    background-color: qlineargradient(
-        x1:0, y1:0, x2:1, y2:0,
-        stop:0 #2457e0, stop:1 #4a82ff
-    );
+    background-color: #2894ff;
+}
+QPushButton#record_button:pressed {
+    background-color: #0870d6;
 }
 QPushButton#record_button:disabled {
-    background-color: #182036;
-    color: #566180;
+    background-color: #1c1c1f;
+    color: rgba(245, 245, 247, 0.3);
 }
 
 /* --- Form (Settings page) ------------------------------------------------- */
 QCheckBox {
-    font-weight: 600;
+    font-weight: 500;
     spacing: 8px;
     padding: 4px 0;
+    color: #f5f5f7;
 }
 QCheckBox::indicator {
     width: 16px;
     height: 16px;
-    border: 1px solid #3a4a78;
+    border: 1px solid rgba(255, 255, 255, 0.2);
     border-radius: 4px;
-    background-color: #0d1322;
+    background-color: #141417;
 }
 QCheckBox::indicator:checked {
-    background-color: #3773ff;
-    border: 1px solid #3773ff;
-}
-
-/* --- Status bar ------------------------------------------------------------ */
-QStatusBar {
-    background-color: #0c1120;
-    color: #5d7099;
-    border-top: 1px solid #1c2740;
+    background-color: #0a84ff;
+    border: 1px solid #0a84ff;
 }
 """

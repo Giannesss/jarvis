@@ -2629,6 +2629,115 @@ accent border show up against the dark background, does the record button
 read as the obvious primary action, and does the Settings page's key/value
 layout look like a settings screen rather than a column of identical labels.
 
+### A third pass: restraint over decoration
+
+The second pass's own fix made the panels and headers *visible* — gradients,
+a 3px accent-blue left border on every box, a blue gradient record button, a
+pill-shaped status badge. That answered "the boxes look flat" the way more
+paint answers it, and the result reads as a gaming/RGB dashboard rather than
+a calm product — closer to the "generic AI template" and "developer
+dashboard" look the design brief explicitly rules out than to the first
+pass was. The user's own framing made the actual target explicit: Apple's
+design *principles* (restraint, hierarchy, precise spacing, typography,
+subtle depth, feedback that is immediate but quiet) — not Apple's UI
+elements, logos or products, and not more visual noise of any kind.
+
+**The palette went from "a handful of blues plus a gradient for everything"
+to a small, named set of tokens**, documented directly above `_STYLESHEET`:
+`background` (#0a0a0c, near-black rather than the second pass's navy),
+`surface` (#141417, one flat elevation for every header/sidebar/panel/list —
+no gradients anywhere in this version), `surface-raised` for hover/press,
+one `hairline` border colour (`rgba(255,255,255,0.08)`) used everywhere
+instead of a different border colour per panel, three text tones by opacity
+rather than three unrelated hex colours, and exactly **one** accent
+(`#0a84ff`, close to Apple's own system blue) spent sparingly — the record
+button's fill, the active sidebar item's tint, the status dot's colour when
+something is happening. Everything else in the window is a shade of grey.
+Restraint is the design move here, not a weaker version of the second
+pass's palette.
+
+**The panels lost their accent border and gradient fill.** `QFrame#panel`
+is now a single flat `surface` colour with a hairline border and a 12px
+radius — a "this is a distinct surface" cue comes from the colour step
+between `background` and `surface`, the same way iOS/macOS cards read as
+elevated without a coloured edge. The panel title lost its divider line and
+heavy letter-spacing too (`panelTitle` is now a quiet, small, medium-weight
+label, not a loud all-caps heading with a border under it) — a section
+label in a real settings app is understated, not shouted.
+
+**The page title lost its accent-coloured underline.** `pageTitle` is now
+plain size-and-weight hierarchy (20px, 600 weight) with nothing drawn under
+it — a coloured rule under every single page heading in the window was
+decoration repeated four times, not a design choice made once.
+
+**The status indicator is a 7px dot plus plain text, not a filled pill.**
+The second pass's status badge (a translucent blue background and border
+around the whole string) outranked the clock, the nav, and everything else
+in the header by sheer visual weight for a string that just says "idle" most
+of the time. `_build_header()` now builds a small `QFrame` (`STATUS_DOT`)
+coloured per state via `_STATUS_DOT_COLOR` (a hex-string twin of
+`_ORB_COLOR`, since a stylesheet colour has to be a string) next to the
+existing `STATUS_LABEL`, updated directly in `_set_state()` rather than
+through `_STYLESHEET` — a per-instance colour that changes with state isn't
+something an object-name or property selector can express, the same reason
+the orb's colour was always painted in Python rather than styled in QSS.
+`STATUS_LABEL`'s own text is untouched (still exactly `_STATUS_TEXT[state]`,
+no markup), which is also why the existing exact-text-equality assertions
+in `tests/test_gui_shell.py` needed no changes.
+
+**The tagline under the wordmark, the quote under the orb, and the status
+bar's "Jarvis — Phase 6 complete" line are all gone.** None of them
+communicated information, enabled interaction, gave feedback, or carried
+hierarchy — the design brief's own five-item test for why a pixel earns its
+place — so removing them is the direct answer to "prefer less UI with
+better information architecture", not an afterthought. The status bar's
+line in particular was a developer-facing build-status string with no
+reason to be in the window chrome at all once Phase 6 had, in fact, already
+shipped; `MainWindow` no longer calls `self.setStatusBar(...)` at all.
+
+**The record button is a single flat accent fill**, not a gradient, with
+plain `:hover`/`:pressed` states one shade lighter/darker — still the one
+button in the window with real visual weight (it is the one primary
+action), but "the brightest button in the room" no longer also means "a
+glowing sci-fi gradient". Quick-action buttons went the other way: flat,
+borderless, left-aligned text with only a subtle hover tint, closer to a
+real settings-app row than to a bordered button — a panel full of
+individually-bordered buttons reads as a toolbar, not a list of actions.
+
+**The orb itself is calmer, not just differently coloured.** `_Orb` went
+from two rings and nine fast-wobbling bars to one ring and five slower
+bars, and its idle breathing pulse is both smaller and slower — "almost
+still when idle, alive only when something is actually happening" is the
+animation brief verbatim, and the second pass's orb was never actually
+still. **Colour changes are now animated, not snapped**: `set_state()`
+starts a ~280ms `QVariantAnimation` (eased out) from the orb's currently
+displayed colour to the new state's, so a state transition reads as a
+deliberate, physical change rather than a flicker — the first and second
+passes both set `_ORB_COLOR[state]` directly in `paintEvent()`, with no
+transition at all. `_state` is still set synchronously inside `set_state()`
+before the animation starts, which is why `OrbTests.
+test_set_state_updates_the_orbs_own_state` (asserting `window._orb._state
+is state` right after calling it) needed no change.
+
+**Nothing about the actual turn logic, worker threads, state machine,
+system-monitoring data, tasks query, quick-action wiring or debug line
+changed again** — same as both passes before it, this one only touched
+`_STYLESHEET`, the handful of `_build_*()` layout/spacing calls, `_Orb`'s
+paint code and animation, and the new status-dot plumbing in `_build_header`/
+`_set_state()`. `tests/test_gui_shell.py` needed no new tests and no edits:
+every assertion it makes is on object names, text content and behaviour,
+none of which this pass touched, and the suite still skips cleanly here (no
+PySide6).
+
+**Not yet hand-tested live, same as the two passes before it.** Verified
+only against `py_compile` and the mocked suite in this sandbox. Needs a
+visual pass on the real machine specifically for calm vs. flashy: does the
+window read as quiet at idle and only come alive when Jarvis is actually
+listening/thinking/speaking, does the single accent colour still feel
+purposeful rather than washed-out now that it's used so much more
+sparingly, and does the orb's colour transition actually look smooth rather
+than too fast/too slow at 280ms.
+
 ## Normalization
 
 `text.normalize()` is what every phrase list, every pattern and every stored
