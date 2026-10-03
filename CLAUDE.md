@@ -1993,6 +1993,51 @@ window is never torn down out from under a running recording.
 turn appends the right transcript line and restores the button/status; a
 `None` turn appends nothing; and a second click while listening is ignored.
 
+**Hand-tested live on 2026-10-03.** «Γεια σου Τζάρβις», spoken into the real
+microphone after clicking "Εγγραφή", came back through the real pipeline —
+`[timing] Recording: 8.77s`, `[timing] Whisper load: 4.05s`,
+`[timing] Transcription: 2.10s`, the same lines `main.py` prints — and
+appeared in the transcript list as `"Εσύ: Γεια σου Τζάρβις"`. No reply
+followed, correctly: `brain.ask()`/`speaker.speak()` were parts 2 and 3 of
+this step, not yet wired at that point. Step 4 part 1 is closed.
+
+**Step 4, part 2 of 3: the brain's reply.** `_get_reply()` re-derives
+`main._answer()`'s text-generation half rather than importing `main.py`
+(the two entry points stay uncoupled, per "The audit that preceded it",
+above): a skill first (`skills.handle()`, which already runs the kill switch
+through `policy.intercept()`), the `policy.is_frozen()` backstop
+`main._answer()` also keeps, then the brain
+(`brain.ask(text, memory.recall_safe(text))`) when nothing matched, with
+`policy.record("brain", "allowed", "no_skill_matched")` logging the same
+audit row the CLI does. A failed brain call returns the same fixed line
+`main.py`'s own `BRAIN_ERROR_REPLY` is (duplicated as a local constant, for
+the same uncoupling reason, not imported). It returns the reply text rather
+than speaking it — `speaker.speak()`/TTS is part 3, not this one — so a
+reply now appears as `"Jarvis: …"` in the transcript, silently, with nothing
+spoken aloud yet.
+
+**`_BrainWorker` runs `_get_reply()` on its own `QThread`, same reasoning as
+`_ListenWorker`.** `brain.ask()` blocks on a local model or a network round
+trip, and either one on the UI thread freezes the window. The status label
+reads "Κατάσταση: Σκέφτεται..." for the duration, and the record button
+stays disabled across *both* halves of a turn — a click landing after
+transcription but before the reply comes back must not start a second
+recording, so `_start_listening()`'s guard checks `_brain_thread` as well as
+`_listen_thread`. `closeEvent()` waits on both threads before closing, for
+the same reason it already waited on one.
+
+`tests/test_gui_shell.py`'s `BrainWiringTests` pins `_get_reply()`'s four
+branches with `skills.handle`/`policy`/`brain.ask` all mocked (never a real
+skill, database or model in the suite): a matching skill answers without
+calling `brain.ask()` at all; no match falls through to the brain; the
+frozen backstop produces no reply line; and a raised exception falls back
+to the fixed error line. `MicrophoneWiringTests` is updated alongside it —
+a spoken turn now also waits out the `_brain_thread` it triggers, and a new
+test pins the "thinking" half of the double-click guard.
+
+Not yet hand-tested live with a real brain call (Ollama or Claude) behind
+it — only against mocks, same caveat as step 3 before its own hand test.
+
 **Built in a sandbox that cannot run it, hand-tested on the real machine
 instead.** This sandbox cannot install PySide6 at all — `pypi.org`/
 `files.pythonhosted.org` sit in the proxy's `noProxy` list, so requests go

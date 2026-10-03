@@ -105,7 +105,9 @@ class MicrophoneWiringTests(unittest.TestCase):
     listener.listen() on a background thread and reports back onto the UI
     thread. listener.listen() itself is mocked throughout -- these tests
     pin the wiring, not the recording/transcription it was already pinned
-    for in test_record_timing.py."""
+    for in test_record_timing.py. skills.handle is also mocked, to a fixed
+    reply, so a spoken turn doesn't fall through into a real brain call --
+    that path belongs to BrainWiringTests below, not here."""
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -117,48 +119,171 @@ class MicrophoneWiringTests(unittest.TestCase):
         # delivers the queued finished_with_text signal to the slot on this
         # thread afterwards -- without it the assertions below would read
         # pre-signal state even though the worker thread has already exited.
+        # A second wait+processEvents covers the _BrainWorker thread that
+        # start triggers whenever there was something to transcribe.
         with mock.patch(
             "jarvis.gui.main_window.listener.listen", return_value=spoken
+        ), mock.patch(
+            "jarvis.gui.main_window.skills.handle", return_value="Εντάξει."
         ):
             window._start_listening()
             self.assertIsNotNone(window._listen_thread)
             self.assertFalse(widget(window, RECORD_BUTTON).isEnabled())
             window._listen_thread.wait(2000)
+            self.app.processEvents()
+            if window._brain_thread is not None:
+                window._brain_thread.wait(2000)
         self.app.processEvents()
 
-    def test_a_transcript_is_appended_and_the_button_recovers(self) -> None:
+    def test_a_transcript_and_reply_are_appended_and_the_button_recovers(
+        self,
+    ) -> None:
         window = MainWindow()
         self._run_one_turn(window, "Τι ώρα είναι")
 
         transcript = widget(window, TRANSCRIPT_LIST)
-        self.assertEqual(transcript.count(), 1)
+        self.assertEqual(transcript.count(), 2)
         self.assertEqual(transcript.item(0).text(), "Εσύ: Τι ώρα είναι")
+        self.assertEqual(transcript.item(1).text(), "Jarvis: Εντάξει.")
 
         self.assertEqual(widget(window, STATUS_LABEL).text(), "Κατάσταση: Αδρανές")
         self.assertTrue(widget(window, RECORD_BUTTON).isEnabled())
         self.assertIsNone(window._listen_thread)
+        self.assertIsNone(window._brain_thread)
 
-    def test_no_speech_appends_nothing(self) -> None:
+    def test_no_speech_appends_nothing_and_never_starts_a_brain_thread(
+        self,
+    ) -> None:
         # listener.listen() returning None is an ordinary outcome (no
         # speech, a device failure), not an error -- same as main.py's own
-        # "if not text: continue". Nothing should land in the transcript.
+        # "if not text: continue". Nothing should land in the transcript,
+        # and with nothing transcribed there is nothing to send to the
+        # brain either.
         window = MainWindow()
         self._run_one_turn(window, None)
 
         self.assertEqual(widget(window, TRANSCRIPT_LIST).count(), 0)
         self.assertTrue(widget(window, RECORD_BUTTON).isEnabled())
+        self.assertIsNone(window._brain_thread)
 
     def test_a_second_click_while_listening_is_ignored(self) -> None:
         window = MainWindow()
         with mock.patch(
             "jarvis.gui.main_window.listener.listen", return_value="Γεια"
+        ), mock.patch(
+            "jarvis.gui.main_window.skills.handle", return_value="Γεια σου."
         ):
             window._start_listening()
             first_thread = window._listen_thread
             window._start_listening()  # the guard this pins
             self.assertIs(window._listen_thread, first_thread)
             first_thread.wait(2000)
+            self.app.processEvents()
+            if window._brain_thread is not None:
+                window._brain_thread.wait(2000)
         self.app.processEvents()
+
+    def test_a_click_while_the_brain_is_thinking_is_ignored(self) -> None:
+        # The guard also has to hold during the second (brain) half of a
+        # turn, not just the first -- a click landing after transcription
+        # but before the reply comes back must not start a second recording.
+        window = MainWindow()
+        with mock.patch(
+            "jarvis.gui.main_window.listener.listen", return_value="Γεια"
+        ), mock.patch(
+            "jarvis.gui.main_window.skills.handle", return_value="Γεια σου."
+        ):
+            window._start_listening()
+            window._listen_thread.wait(2000)
+            self.app.processEvents()
+
+            self.assertIsNotNone(window._brain_thread)
+            self.assertFalse(widget(window, RECORD_BUTTON).isEnabled())
+            window._start_listening()  # must be a no-op while thinking
+            self.assertIsNone(window._listen_thread)
+
+            window._brain_thread.wait(2000)
+        self.app.processEvents()
+
+
+@unittest.skipUnless(_PYSIDE6_AVAILABLE, "PySide6 is not installed here")
+class BrainWiringTests(unittest.TestCase):
+    """Phase 6 step 4's second piece: _get_reply()/_BrainWorker, exercised
+    directly rather than through a recording -- the microphone half is
+    already pinned above. skills.handle, policy and brain are all mocked,
+    so these tests touch neither a real skill, a real database nor a real
+    model."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def _run_brain(self, window: MainWindow, text: str) -> None:
+        window._on_listen_finished(text)  # starts the _BrainWorker
+        self.assertIsNotNone(window._brain_thread)
+        window._brain_thread.wait(2000)
+        self.app.processEvents()
+
+    def test_a_matching_skill_answers_without_touching_the_brain(self) -> None:
+        window = MainWindow()
+        with mock.patch(
+            "jarvis.gui.main_window.skills.handle", return_value="Η ώρα είναι 5."
+        ), mock.patch("jarvis.gui.main_window.brain.ask") as ask:
+            self._run_brain(window, "Τι ώρα είναι")
+            ask.assert_not_called()
+
+        transcript = widget(window, TRANSCRIPT_LIST)
+        self.assertEqual(transcript.item(1).text(), "Jarvis: Η ώρα είναι 5.")
+
+    def test_no_skill_match_falls_through_to_the_brain(self) -> None:
+        window = MainWindow()
+        with mock.patch(
+            "jarvis.gui.main_window.skills.handle", return_value=None
+        ), mock.patch(
+            "jarvis.gui.main_window.policy.is_frozen", return_value=False
+        ), mock.patch("jarvis.gui.main_window.policy.record"), mock.patch(
+            "jarvis.gui.main_window.memory.recall_safe", return_value=None
+        ), mock.patch(
+            "jarvis.gui.main_window.brain.ask", return_value="Καλησπέρα!"
+        ):
+            self._run_brain(window, "Γεια σου Τζάρβις")
+
+        transcript = widget(window, TRANSCRIPT_LIST)
+        self.assertEqual(transcript.item(1).text(), "Jarvis: Καλησπέρα!")
+
+    def test_frozen_backstop_speaks_nothing(self) -> None:
+        # Same case main._answer()'s Answer(spoke=False) exists for: a skill
+        # returned None while the kill switch is on. _get_reply() returns ""
+        # and no "Jarvis: ..." line should appear.
+        window = MainWindow()
+        with mock.patch(
+            "jarvis.gui.main_window.skills.handle", return_value=None
+        ), mock.patch(
+            "jarvis.gui.main_window.policy.is_frozen", return_value=True
+        ), mock.patch("jarvis.gui.main_window.brain.ask") as ask:
+            self._run_brain(window, "οτιδήποτε")
+            ask.assert_not_called()
+
+        self.assertEqual(widget(window, TRANSCRIPT_LIST).count(), 1)  # "Εσύ: ..." only
+
+    def test_a_brain_exception_falls_back_to_the_fixed_error_line(self) -> None:
+        window = MainWindow()
+        with mock.patch(
+            "jarvis.gui.main_window.skills.handle", return_value=None
+        ), mock.patch(
+            "jarvis.gui.main_window.policy.is_frozen", return_value=False
+        ), mock.patch("jarvis.gui.main_window.policy.record"), mock.patch(
+            "jarvis.gui.main_window.memory.recall_safe", return_value=None
+        ), mock.patch(
+            "jarvis.gui.main_window.brain.ask", side_effect=RuntimeError("down")
+        ):
+            self._run_brain(window, "Τι γίνεται")
+
+        transcript = widget(window, TRANSCRIPT_LIST)
+        self.assertEqual(
+            transcript.item(1).text(),
+            "Jarvis: Συγγνώμη, δεν μπορώ να απαντήσω αυτή τη στιγμή.",
+        )
 
 
 if __name__ == "__main__":
