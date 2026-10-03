@@ -721,5 +721,68 @@ class RenderAgendaItemTests(unittest.TestCase):
         )
 
 
+@unittest.skipUnless(_PYSIDE6_AVAILABLE, "PySide6 is not installed here")
+class QuickActionWiringTests(unittest.TestCase):
+    """Phase 6 step 5's fourth piece: the quick-action buttons, wired to
+    exactly the functions the voice skill itself calls --
+    skills._open_site()/_open_app() -- rather than a second copy of "how to
+    open a site/app". skills._open_site/_open_app are mocked directly in
+    every test here, so no test ever opens a real browser or launches a real
+    process."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    @staticmethod
+    def _button(window: MainWindow, label: str):
+        from PySide6.QtWidgets import QPushButton
+
+        for button in window.findChildren(QPushButton):
+            if button.text() == label:
+                return button
+        raise LookupError(f"no quick-action button labelled {label!r}")
+
+    def test_a_site_button_is_enabled_and_calls_open_site(self) -> None:
+        window = MainWindow()
+        button = self._button(window, "YouTube")
+        self.assertTrue(button.isEnabled())
+
+        with mock.patch("jarvis.gui.main_window.skills._open_site") as open_site:
+            button.click()
+
+        open_site.assert_called_once_with("https://www.youtube.com")
+        transcript = widget(window, TRANSCRIPT_LIST)
+        self.assertEqual(transcript.item(transcript.count() - 1).text(), "Jarvis: Άνοιξα το YouTube.")
+
+    def test_an_app_button_is_enabled_and_calls_open_app(self) -> None:
+        window = MainWindow()
+        button = self._button(window, "Notepad")
+        self.assertTrue(button.isEnabled())
+
+        with mock.patch("jarvis.gui.main_window.skills._open_app") as open_app:
+            button.click()
+
+        open_app.assert_called_once_with(["notepad.exe"])
+        transcript = widget(window, TRANSCRIPT_LIST)
+        self.assertEqual(transcript.item(transcript.count() - 1).text(), "Jarvis: Άνοιξα το Notepad.")
+
+    def test_a_failed_launch_reports_failure_without_raising(self) -> None:
+        window = MainWindow()
+        button = self._button(window, "Gmail")
+
+        with mock.patch(
+            "jarvis.gui.main_window.skills._open_site",
+            side_effect=OSError("no browser"),
+        ):
+            button.click()  # must not raise
+
+        transcript = widget(window, TRANSCRIPT_LIST)
+        self.assertEqual(
+            transcript.item(transcript.count() - 1).text(),
+            "Jarvis: Δεν μπόρεσα να ανοίξω το Gmail.",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -204,6 +204,22 @@ def _handle_timer(norm_text: str) -> str | None:
     return f"Ξεκίνησε το χρονόμετρο για {number} {label}."
 
 
+def _open_site(url: str) -> None:
+    """Opens a configured website (SKILL_SITES) in the default browser.
+    Split out of _handle_open() so the GUI's quick-action buttons (Phase 6
+    step 5) can call exactly the same code the voice skill does, rather
+    than a second copy of "how to open a site" -- unlike _render_agenda_item
+    in main_window.py, there's a clean function boundary here to share."""
+    webbrowser.open(url)
+
+
+def _open_app(argv: list) -> None:
+    """Launches a configured local app (SKILL_APPS) by its fixed argv list
+    -- never a shell, never a command built from spoken or clicked text.
+    Split out for the same reason _open_site() is."""
+    subprocess.Popen(argv)
+
+
 def _handle_open(norm_text: str) -> str | None:
     if OPEN_VERB not in norm_text:
         return None
@@ -211,13 +227,13 @@ def _handle_open(norm_text: str) -> str | None:
     match = _find_match(norm_text, SKILL_SITES)
     if match is not None:
         key, url = match
-        webbrowser.open(url)
+        _open_site(url)
         return f"Άνοιξα το {key}."
 
     match = _find_match(norm_text, SKILL_APPS)
     if match is not None:
         key, argv = match
-        subprocess.Popen(argv)
+        _open_app(argv)
         return f"Άνοιξα το {key}."
 
     return None

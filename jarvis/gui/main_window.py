@@ -557,19 +557,62 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(box)
         layout.addWidget(QLabel("Γρήγορες ενέργειες"))
 
-        # One disabled button per site/app Jarvis can already open by voice
+        # One button per site/app Jarvis can already open by voice
         # (config.SKILL_SITES / SKILL_APPS) -- so the panel reflects what's
         # really configured rather than a fixed, separately-maintained list
-        # that drifts from it. Disabled rather than wired to a no-op: a
-        # button that looks clickable but does nothing is worse than one
-        # that's honestly not ready yet. Wiring a click to
-        # skills._open_site()/_open_app() is quick-actions' own later step.
-        for label in list(SKILL_SITES) + list(SKILL_APPS):
+        # that drifts from it. Each one is now wired to exactly the function
+        # the voice skill itself calls (skills._open_site()/_open_app()), via
+        # _quick_action_site()/_quick_action_app() below -- so a click and
+        # the matching spoken command do the same thing, not two
+        # independently-maintained ways to open the same site or app.
+        # Enabled now that there's something real behind the click; a button
+        # that looks clickable but does nothing would be worse than the
+        # disabled placeholder step 3 built.
+        for label, url in SKILL_SITES.items():
             button = QPushButton(label)
-            button.setEnabled(False)
+            button.clicked.connect(
+                lambda _checked=False, label=label, url=url: self._quick_action_site(
+                    label, url
+                )
+            )
+            layout.addWidget(button)
+
+        for label, argv in SKILL_APPS.items():
+            button = QPushButton(label)
+            button.clicked.connect(
+                lambda _checked=False, label=label, argv=argv: self._quick_action_app(
+                    label, argv
+                )
+            )
             layout.addWidget(button)
 
         return box
+
+    def _quick_action_site(self, label: str, url: str) -> None:
+        """A quick-action button's click, for a configured site. Calls the
+        exact function the voice skill calls (skills._open_site()) rather
+        than a second copy of "how to open a site" -- and reports the result
+        in the transcript the same way a spoken «άνοιξε ...» command would,
+        so the two feel like the same feature from two different inputs."""
+        try:
+            skills._open_site(url)
+        except Exception:
+            widget(self, TRANSCRIPT_LIST).addItem(
+                f"Jarvis: Δεν μπόρεσα να ανοίξω το {label}."
+            )
+            return
+        widget(self, TRANSCRIPT_LIST).addItem(f"Jarvis: Άνοιξα το {label}.")
+
+    def _quick_action_app(self, label: str, argv: list) -> None:
+        """Same as _quick_action_site(), for a configured local app."""
+        try:
+            skills._open_app(argv)
+        except Exception:
+            widget(self, TRANSCRIPT_LIST).addItem(
+                f"Jarvis: Δεν μπόρεσα να ανοίξω το {label}."
+            )
+            return
+        widget(self, TRANSCRIPT_LIST).addItem(f"Jarvis: Άνοιξα το {label}.")
 
     def _build_tasks_box(self) -> QWidget:
         box = QWidget()

@@ -2280,6 +2280,51 @@ list, and "—" CPU/RAM placeholders all rendered as built. The roadmap's own
 hand-test rule is satisfied; step 4 (wiring in the microphone/brain/TTS, one
 at a time) is next.
 
+**Step 5, piece 4: quick actions.** The side panel's quick-action buttons
+have been disabled placeholders since step 3 — one per entry in
+`config.SKILL_SITES`/`SKILL_APPS`, so the panel always reflects what's
+really configured rather than a separately-maintained list that could drift
+from it, but with nothing behind the click.
+
+**`skills._open_site(url)`/`_open_app(argv)` didn't exist before this piece**
+— the voice skill's `_handle_open()` called `webbrowser.open(url)`/
+`subprocess.Popen(argv)` inline. Extracted as their own functions first, as a
+behavior-preserving refactor, so the GUI's buttons can call the *exact* code
+the voice command does rather than a second copy of "how to open a site/app"
+— unlike `_render_agenda_item()` in `main_window.py`, which is a deliberate
+second copy because `skills.py`'s agenda rendering has no clean function
+boundary to share, this one does, so it's shared rather than duplicated.
+`_handle_open()` itself now calls these two functions instead of
+`webbrowser`/`subprocess` directly; its own existing tests
+(`tests/test_skills.py`'s `OpenSkillTests`, which patch `skills.webbrowser`/
+`skills.subprocess` directly) pass unchanged, since the extraction doesn't
+change which module-level names get called.
+
+**Each button is now enabled and wired to a click handler**
+(`_quick_action_site()`/`_quick_action_app()`) that calls the matching
+function and reports the result in the transcript list, the same way a
+spoken «άνοιξε το …» command's reply would: `"Jarvis: Άνοιξα το {label}."`
+on success, `"Jarvis: Δεν μπόρεσα να ανοίξω το {label}."` if the call raises
+— caught and shown rather than left to crash the GUI, same discipline as
+`_load_tasks()` swallowing a database error. A click doesn't touch
+`_state`/the state machine at all: it's a fire-and-forget action outside the
+listen/think/speak turn cycle, not a conversation turn, so it never disables
+the record button or any other control.
+
+`QuickActionWiringTests` (`tests/test_gui_shell.py`) pins all of it, with
+`skills._open_site`/`_open_app` mocked in every test so nothing here ever
+opens a real browser or launches a real process: a site button is enabled
+and calls `_open_site` with the configured URL, appending the right
+transcript line; an app button is enabled and calls `_open_app` with the
+configured argv; and a raised exception from either is caught and reported
+rather than propagating.
+
+Not yet hand-tested live — say which button opens which label is expected
+to open on the real machine next: click each quick-action button (YouTube,
+Gmail, Google, υπολογιστή, Notepad) and confirm the right site opens in the
+default browser / the right app launches, and that the transcript list
+shows the matching "Άνοιξα το …" line after each click.
+
 ## Normalization
 
 `text.normalize()` is what every phrase list, every pattern and every stored
