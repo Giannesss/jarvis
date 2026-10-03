@@ -1,8 +1,11 @@
 """The Phase 6 shell. Step 3 built the empty states ("Build a functional
-shell first"); step 4 -- "wire in mic/brain/TTS one at a time, testing after
-each" -- has now wired in all three: the microphone (part 1), the brain's
-reply (part 2), and `speaker.speak()`/TTS (part 3). A reply now appears in
-the transcript *and* is spoken aloud.
+shell first"); step 4 wired in the microphone, the brain's reply and
+`speaker.speak()`/TTS, one at a time, each hand-tested before the next. Step
+5 -- "the state machine, real system monitoring, tasks, quick actions and
+settings/debug mode" -- is now underway, starting with the state machine
+(`State`, below): one explicit value for what Jarvis is doing right now,
+read by everything that used to ask three different thread attributes
+whether they were `None`.
 
 Every widget that something will eventually read or write from outside this
 file has a stable `objectName()` set on it (see `_NAMED_WIDGETS` and the
@@ -24,6 +27,8 @@ reason.
 """
 
 from __future__ import annotations
+
+from enum import Enum, auto
 
 from PySide6.QtCore import QThread, Qt, Signal
 from PySide6.QtGui import QAction
@@ -56,10 +61,36 @@ RAM_LABEL = "ram_label"
 DEBUG_ACTION = "debug_mode_action"
 RECORD_BUTTON = "record_button"
 
-_STATUS_IDLE = "Κατάσταση: Αδρανές"
-_STATUS_LISTENING = "Κατάσταση: Ακούω..."
-_STATUS_THINKING = "Κατάσταση: Σκέφτεται..."
-_STATUS_SPEAKING = "Κατάσταση: Μιλάει..."
+class State(Enum):
+    """What Jarvis is doing right now -- the one thing `_listen_thread`,
+    `_brain_thread` and `_speak_thread` were each separately standing in for
+    (every guard and every status-label update used to ask "is this
+    particular thread attribute `None`?", three times over, instead of
+    asking one question once). Exposed at module level, not nested in
+    `MainWindow`, because a later step (debug mode's own status surface,
+    most likely) and this file's own smoke test both need to name it
+    without an instance in hand.
+
+    IDLE is the only state a second click is allowed to start a turn from;
+    every other state means a worker is already running, and
+    `_start_listening()`'s guard is just "state != IDLE" now, not three
+    separate `is not None` checks."""
+
+    IDLE = auto()
+    LISTENING = auto()
+    THINKING = auto()
+    SPEAKING = auto()
+
+
+# One status line and one record-button-enabled bit per state -- the two
+# things every transition used to set by hand, in the same order, at every
+# call site. _set_state() below is the one place that reads this table now.
+_STATUS_TEXT = {
+    State.IDLE: "Κατάσταση: Αδρανές",
+    State.LISTENING: "Κατάσταση: Ακούω...",
+    State.THINKING: "Κατάσταση: Σκέφτεται...",
+    State.SPEAKING: "Κατάσταση: Μιλάει...",
+}
 
 # Same text as main.py's own BRAIN_ERROR_REPLY. Duplicated rather than
 # imported -- jarvis/gui/ is never imported by main.py and the reverse is
@@ -169,11 +200,14 @@ class MainWindow(QMainWindow):
         # Hold the in-flight worker, if any -- None the rest of the time.
         # Kept as an attribute rather than a local so the thread object isn't
         # garbage-collected out from under itself while it's running, and so
-        # _start_listening can refuse a second click while a turn (recording
-        # or thinking) is already in flight.
+        # closeEvent() has something to wait() on. _state (below) is what
+        # decides whether a turn is in flight now -- these three are purely
+        # "which worker, if I need to wait for or start one", never read as
+        # a None-check anywhere outside closeEvent().
         self._listen_thread: _ListenWorker | None = None
         self._brain_thread: _BrainWorker | None = None
         self._speak_thread: _SpeakWorker | None = None
+        self._state = State.IDLE
 
         self._build_menu_bar()
         self._build_central_widget()
@@ -194,6 +228,17 @@ class MainWindow(QMainWindow):
         if self._speak_thread is not None:
             self._speak_thread.wait()
         super().closeEvent(event)
+
+    def _set_state(self, state: State) -> None:
+        """The one place that updates the status label and the record
+        button together. Every transition below calls this instead of
+        touching either widget directly, so the two can never drift apart
+        (a status label reading "Σκέφτεται..." with the button somehow
+        still enabled, say) the way three separate call sites eventually
+        would."""
+        self._state = state
+        widget(self, STATUS_LABEL).setText(_STATUS_TEXT[state])
+        widget(self, RECORD_BUTTON).setEnabled(state is State.IDLE)
 
     # --- Menu bar -----------------------------------------------------------
 
@@ -240,9 +285,10 @@ class MainWindow(QMainWindow):
 
         outer = QVBoxLayout(central)
 
-        # The status strip. A static placeholder today; the state machine
-        # step is what makes this track listening/thinking/speaking instead
-        # of always reading "Αδρανές" (idle).
+        # The status strip. Its text and the record button's enabled state
+        # are both driven from one place now -- _set_state() -- so "Αδρανές"
+        # here is only the one-time construction value; every transition
+        # afterwards goes through _set_state(), never setText() directly.
         status_label = QLabel("Κατάσταση: Αδρανές")
         status_label.setObjectName(STATUS_LABEL)
         status_label.setStyleSheet("font-weight: bold; padding: 4px;")
@@ -285,15 +331,10 @@ class MainWindow(QMainWindow):
         # meant to run concurrently with another, and the button is disabled
         # for the same reason, so this is a backstop for anything that can
         # still reach here (e.g. a held Enter key) rather than the only guard.
-        if (
-            self._listen_thread is not None
-            or self._brain_thread is not None
-            or self._speak_thread is not None
-        ):
+        if self._state is not State.IDLE:
             return
 
-        widget(self, STATUS_LABEL).setText(_STATUS_LISTENING)
-        widget(self, RECORD_BUTTON).setEnabled(False)
+        self._set_state(State.LISTENING)
 
         self._listen_thread = _ListenWorker(self)
         self._listen_thread.finished_with_text.connect(self._on_listen_finished)
@@ -308,10 +349,10 @@ class MainWindow(QMainWindow):
 
         if isinstance(text, str) and text:
             widget(self, TRANSCRIPT_LIST).addItem(f"Εσύ: {text}")
-            widget(self, STATUS_LABEL).setText(_STATUS_THINKING)
-            # The button stays disabled and the thread guard stays set
-            # (_brain_thread, below) until the reply comes back -- a turn
-            # isn't over just because the recording half is.
+            # The record button stays disabled (State.THINKING isn't IDLE)
+            # until the reply comes back -- a turn isn't over just because
+            # the recording half is.
+            self._set_state(State.THINKING)
             self._brain_thread = _BrainWorker(text, self)
             self._brain_thread.finished_with_reply.connect(self._on_reply_finished)
             self._brain_thread.start()
@@ -320,8 +361,7 @@ class MainWindow(QMainWindow):
         # No transcript, same as main.py's own "if not text: continue" --
         # silence, a device failure, or nothing said is not an error here,
         # just a turn with nothing to show, and nothing to send to the brain.
-        widget(self, STATUS_LABEL).setText(_STATUS_IDLE)
-        widget(self, RECORD_BUTTON).setEnabled(True)
+        self._set_state(State.IDLE)
 
     def _on_reply_finished(self, reply: str) -> None:
         # _get_reply() returns "" for the frozen backstop (see its
@@ -331,17 +371,16 @@ class MainWindow(QMainWindow):
         self._brain_thread = None
 
         if not reply:
-            widget(self, STATUS_LABEL).setText(_STATUS_IDLE)
-            widget(self, RECORD_BUTTON).setEnabled(True)
+            self._set_state(State.IDLE)
             return
 
         widget(self, TRANSCRIPT_LIST).addItem(f"Jarvis: {reply}")
         # The transcript line appears now, before speech starts -- speak()
         # can take a second or more just to synthesize, and there is no
         # reason to make the user wait to see text that is already decided.
-        # The button and thread guard (see _start_listening) stay as they
-        # are; the turn is not over until speaking is too.
-        widget(self, STATUS_LABEL).setText(_STATUS_SPEAKING)
+        # The button stays disabled (State.SPEAKING isn't IDLE); the turn
+        # is not over until speaking is too.
+        self._set_state(State.SPEAKING)
 
         self._speak_thread = _SpeakWorker(reply, self)
         self._speak_thread.finished_speaking.connect(self._on_speak_finished)
@@ -349,8 +388,7 @@ class MainWindow(QMainWindow):
 
     def _on_speak_finished(self) -> None:
         self._speak_thread = None
-        widget(self, STATUS_LABEL).setText(_STATUS_IDLE)
-        widget(self, RECORD_BUTTON).setEnabled(True)
+        self._set_state(State.IDLE)
 
     def _build_side_panel(self) -> QWidget:
         panel = QWidget()
@@ -422,7 +460,7 @@ class MainWindow(QMainWindow):
     def _build_status_bar(self) -> None:
         bar = QStatusBar()
         bar.showMessage(
-            "Jarvis — Phase 6, βήμα 4: μικρόφωνο + απάντηση + φωνή συνδεδεμένα"
+            "Jarvis — Phase 6, βήμα 5: state machine"
         )
         self.setStatusBar(bar)
 

@@ -34,6 +34,7 @@ try:
         TASKS_LIST,
         TRANSCRIPT_LIST,
         MainWindow,
+        State,
         widget,
     )
 
@@ -68,6 +69,7 @@ class ShellConstructionTests(unittest.TestCase):
         # network call, this test is where that would surface first.
         window = MainWindow()
         self.assertEqual(window.windowTitle(), "Jarvis")
+        self.assertIs(window._state, State.IDLE)
 
     def test_every_named_widget_is_present_and_empty(self) -> None:
         window = MainWindow()
@@ -160,6 +162,7 @@ class MicrophoneWiringTests(unittest.TestCase):
 
         self.assertEqual(widget(window, STATUS_LABEL).text(), "Κατάσταση: Αδρανές")
         self.assertTrue(widget(window, RECORD_BUTTON).isEnabled())
+        self.assertIs(window._state, State.IDLE)
         self.assertIsNone(window._listen_thread)
         self.assertIsNone(window._brain_thread)
         self.assertIsNone(window._speak_thread)
@@ -188,8 +191,10 @@ class MicrophoneWiringTests(unittest.TestCase):
         ), mock.patch("jarvis.gui.main_window.speaker.speak"):
             window._start_listening()
             first_thread = window._listen_thread
+            self.assertIs(window._state, State.LISTENING)
             window._start_listening()  # the guard this pins
             self.assertIs(window._listen_thread, first_thread)
+            self.assertIs(window._state, State.LISTENING)
             first_thread.wait(2000)
             self.app.processEvents()
             if window._brain_thread is not None:
@@ -215,6 +220,7 @@ class MicrophoneWiringTests(unittest.TestCase):
 
             self.assertIsNotNone(window._brain_thread)
             self.assertFalse(widget(window, RECORD_BUTTON).isEnabled())
+            self.assertIs(window._state, State.THINKING)
             window._start_listening()  # must be a no-op while thinking
             self.assertIsNone(window._listen_thread)
 
@@ -242,6 +248,7 @@ class MicrophoneWiringTests(unittest.TestCase):
 
             self.assertIsNotNone(window._speak_thread)
             self.assertFalse(widget(window, RECORD_BUTTON).isEnabled())
+            self.assertIs(window._state, State.SPEAKING)
             window._start_listening()  # must be a no-op while speaking
             self.assertIsNone(window._listen_thread)
 
@@ -365,6 +372,7 @@ class SpeechWiringTests(unittest.TestCase):
                 widget(window, STATUS_LABEL).text(), "Κατάσταση: Μιλάει..."
             )
             self.assertFalse(widget(window, RECORD_BUTTON).isEnabled())
+            self.assertIs(window._state, State.SPEAKING)
 
             window._speak_thread.wait(2000)
             self.app.processEvents()
@@ -372,6 +380,7 @@ class SpeechWiringTests(unittest.TestCase):
 
         self.assertEqual(widget(window, STATUS_LABEL).text(), "Κατάσταση: Αδρανές")
         self.assertTrue(widget(window, RECORD_BUTTON).isEnabled())
+        self.assertIs(window._state, State.IDLE)
         self.assertIsNone(window._speak_thread)
 
     def test_an_empty_reply_never_starts_a_speak_thread(self) -> None:
@@ -386,6 +395,41 @@ class SpeechWiringTests(unittest.TestCase):
         self.assertEqual(widget(window, TRANSCRIPT_LIST).count(), 0)
         self.assertEqual(widget(window, STATUS_LABEL).text(), "Κατάσταση: Αδρανές")
         self.assertTrue(widget(window, RECORD_BUTTON).isEnabled())
+        self.assertIs(window._state, State.IDLE)
+
+
+@unittest.skipUnless(_PYSIDE6_AVAILABLE, "PySide6 is not installed here")
+class StateMachineTests(unittest.TestCase):
+    """Phase 6 step 5's first piece: _set_state()/State, exercised directly
+    rather than through a full turn -- the transitions a real turn drives it
+    through are already pinned above (Microphone/Brain/SpeechWiringTests all
+    assert on window._state at the relevant point now). This class pins
+    _set_state() itself: every state's status text, and that only IDLE
+    leaves the record button enabled."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_every_state_sets_its_own_status_text(self) -> None:
+        window = MainWindow()
+        expected = {
+            State.IDLE: "Κατάσταση: Αδρανές",
+            State.LISTENING: "Κατάσταση: Ακούω...",
+            State.THINKING: "Κατάσταση: Σκέφτεται...",
+            State.SPEAKING: "Κατάσταση: Μιλάει...",
+        }
+        for state, text in expected.items():
+            window._set_state(state)
+            self.assertEqual(widget(window, STATUS_LABEL).text(), text)
+
+    def test_only_idle_leaves_the_record_button_enabled(self) -> None:
+        window = MainWindow()
+        for state in State:
+            window._set_state(state)
+            self.assertEqual(
+                widget(window, RECORD_BUTTON).isEnabled(), state is State.IDLE
+            )
 
 
 if __name__ == "__main__":

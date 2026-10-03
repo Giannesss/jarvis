@@ -2091,6 +2091,43 @@ matters most for a voice assistant: refusing to make things up. Step 4 part 3
 is closed, and Phase 6 step 4 as a whole — microphone, brain, voice, all
 three wired in and hand-tested one at a time — is done.
 
+**Step 5, piece 1: the state machine.** Before this, "what is Jarvis doing
+right now" had no single answer — it was three separate questions
+(`_listen_thread is not None`? `_brain_thread`? `_speak_thread`?), asked
+anew at every guard and every status-label update, with the status text and
+the record button's enabled state set by hand at each of the four
+transition points. `State` (module-level `Enum`: `IDLE`, `LISTENING`,
+`THINKING`, `SPEAKING`) and `MainWindow._set_state()` collapse that into one
+value and one call site: every transition now calls `_set_state(state)`,
+which looks the status text up in `_STATUS_TEXT` and enables the record
+button iff the new state is `IDLE` — so the label and the button can no
+longer drift apart the way three separate call sites eventually would have.
+`_start_listening()`'s guard is `self._state is not State.IDLE`, replacing
+the three-attribute check. The three thread attributes
+(`_listen_thread`/`_brain_thread`/`_speak_thread`) still exist — `closeEvent()`
+still needs something to `wait()` on — but nothing outside `closeEvent()`
+reads them as a None-check anymore; `_state` is the one source of truth for
+that question now, which is what a later step (debug mode's own status
+surface, most likely) will read rather than reaching into three private
+attributes.
+
+`State` is exported at module level, not nested in `MainWindow`, for the
+same reason the object-name constants are: a later step and this file's own
+test both need to name it without an instance in hand.
+`tests/test_gui_shell.py`'s new `StateMachineTests` pins `_set_state()`
+directly — every state's status text, and that only `IDLE` leaves the
+record button enabled — and `MicrophoneWiringTests`/`BrainWiringTests`/
+`SpeechWiringTests` all gained a `window._state` assertion at the point in
+each turn where a specific state is expected, alongside the status-text and
+button-enabled assertions that were already there. No behavior changes: the
+status strings and button states a turn produces are identical to before
+this refactor, which is the point — this is a structural change, not a new
+feature, so nothing it's not meant to touch should move.
+
+Not yet hand-tested live — this piece has no new observable behavior to
+hand-test (the status text and button timing are unchanged), so the mocked
+suite is the whole bar for it, unlike the three pieces of step 4 before it.
+
 **Built in a sandbox that cannot run it, hand-tested on the real machine
 instead.** This sandbox cannot install PySide6 at all — `pypi.org`/
 `files.pythonhosted.org` sit in the proxy's `noProxy` list, so requests go
