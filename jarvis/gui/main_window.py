@@ -1,9 +1,8 @@
 """The Phase 6 shell. Step 3 built the empty states ("Build a functional
 shell first"); step 4 -- "wire in mic/brain/TTS one at a time, testing after
-each" -- has now wired in two of the three: the microphone (part 1) and the
-brain's reply (part 2). `speaker.speak()`/TTS (part 3) is still not called
-anywhere here -- a reply appears in the transcript, but Jarvis doesn't yet
-say it out loud.
+each" -- has now wired in all three: the microphone (part 1), the brain's
+reply (part 2), and `speaker.speak()`/TTS (part 3). A reply now appears in
+the transcript *and* is spoken aloud.
 
 Every widget that something will eventually read or write from outside this
 file has a stable `objectName()` set on it (see `_NAMED_WIDGETS` and the
@@ -11,15 +10,17 @@ file has a stable `objectName()` set on it (see `_NAMED_WIDGETS` and the
 can find it without reaching into private attributes or rebuilding the
 layout to get a handle on something.
 
-**Both the microphone and the brain run on their own `QThread`, never on
-the UI thread.** `listener.listen()` blocks on ffmpeg + Whisper, and
-`brain.ask()` blocks on a local model or a network round trip -- either one
-freezes the window (no repaint, no click, the OS offers to kill it) if run
-inline. `_ListenWorker` and `_BrainWorker` each run one blocking call on its
-own thread and report back over a signal, which Qt marshals onto the UI
-thread automatically -- the one safe way to touch a widget from work that
-started elsewhere. `MainWindow` never calls `listener.listen()` or
-`_get_reply()` directly for that reason.
+**The microphone, the brain and the voice each run on their own `QThread`,
+never on the UI thread.** `listener.listen()` blocks on ffmpeg + Whisper,
+`brain.ask()` blocks on a local model or a network round trip, and
+`speaker.speak()` blocks for as long as the reply takes to play -- any one
+of them freezes the window (no repaint, no click, the OS offers to kill it)
+if run inline. `_ListenWorker`, `_BrainWorker` and `_SpeakWorker` each run
+one blocking call on its own thread and report back over a signal, which Qt
+marshals onto the UI thread automatically -- the one safe way to touch a
+widget from work that started elsewhere. `MainWindow` never calls
+`listener.listen()`, `_get_reply()` or `speaker.speak()` directly for that
+reason.
 """
 
 from __future__ import annotations
@@ -39,7 +40,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from jarvis import brain, listener, memory, policy, skills
+from jarvis import brain, listener, memory, policy, skills, speaker
 from jarvis.config import SKILL_APPS, SKILL_SITES
 
 # Object names for every widget a later step, or a test, needs to find again.
@@ -58,6 +59,7 @@ RECORD_BUTTON = "record_button"
 _STATUS_IDLE = "Κατάσταση: Αδρανές"
 _STATUS_LISTENING = "Κατάσταση: Ακούω..."
 _STATUS_THINKING = "Κατάσταση: Σκέφτεται..."
+_STATUS_SPEAKING = "Κατάσταση: Μιλάει..."
 
 # Same text as main.py's own BRAIN_ERROR_REPLY. Duplicated rather than
 # imported -- jarvis/gui/ is never imported by main.py and the reverse is
@@ -129,6 +131,30 @@ class _BrainWorker(QThread):
         self.finished_with_reply.emit(_get_reply(self._text))
 
 
+class _SpeakWorker(QThread):
+    """Runs speaker.speak() off the UI thread, for the same reason the other
+    two workers exist: speak() blocks for the full length of the reply (Edge
+    TTS's network round trip plus however long the audio takes to play), and
+    that on the UI thread freezes the window for the same duration.
+
+    Carries no payload back -- speak() returns nothing and raises nothing a
+    caller here needs to react to (its own Edge/Piper fallback is handled
+    inside speaker.py, same as the CLI). `finished_speaking` exists only to
+    tell the UI thread "the turn is over now", the same role Qt's own
+    QThread.finished could play, but a dedicated signal keeps this worker's
+    contract explicit and matches the other two workers' shape."""
+
+    finished_speaking = Signal()
+
+    def __init__(self, text: str, parent: "MainWindow") -> None:
+        super().__init__(parent)
+        self._text = text
+
+    def run(self) -> None:
+        speaker.speak(self._text)
+        self.finished_speaking.emit()
+
+
 class MainWindow(QMainWindow):
     """Jarvis's main window. Construction starts no timers and no threads --
     `_listen_thread`/`_brain_thread` are only ever created in response to a
@@ -147,6 +173,7 @@ class MainWindow(QMainWindow):
         # or thinking) is already in flight.
         self._listen_thread: _ListenWorker | None = None
         self._brain_thread: _BrainWorker | None = None
+        self._speak_thread: _SpeakWorker | None = None
 
         self._build_menu_bar()
         self._build_central_widget()
@@ -164,6 +191,8 @@ class MainWindow(QMainWindow):
             self._listen_thread.wait()
         if self._brain_thread is not None:
             self._brain_thread.wait()
+        if self._speak_thread is not None:
+            self._speak_thread.wait()
         super().closeEvent(event)
 
     # --- Menu bar -----------------------------------------------------------
@@ -247,16 +276,20 @@ class MainWindow(QMainWindow):
 
         return panel
 
-    # --- Microphone + brain (Phase 6 step 4, parts 1-2 of 3) -----------------
+    # --- Microphone + brain + voice (Phase 6 step 4, all three of 3) --------
 
     def _start_listening(self) -> None:
         # Guards against a second click starting a second turn while one is
-        # already in flight (recording OR thinking) -- neither
-        # listener.listen() nor a second overlapping brain call is meant to
-        # run concurrently with another, and the button is disabled for the
-        # same reason, so this is a backstop for anything that can still
-        # reach here (e.g. a held Enter key) rather than the only guard.
-        if self._listen_thread is not None or self._brain_thread is not None:
+        # already in flight (recording, thinking OR speaking) -- none of
+        # listener.listen(), an overlapping brain call or speaker.speak() is
+        # meant to run concurrently with another, and the button is disabled
+        # for the same reason, so this is a backstop for anything that can
+        # still reach here (e.g. a held Enter key) rather than the only guard.
+        if (
+            self._listen_thread is not None
+            or self._brain_thread is not None
+            or self._speak_thread is not None
+        ):
             return
 
         widget(self, STATUS_LABEL).setText(_STATUS_LISTENING)
@@ -293,14 +326,31 @@ class MainWindow(QMainWindow):
     def _on_reply_finished(self, reply: str) -> None:
         # _get_reply() returns "" for the frozen backstop (see its
         # docstring) -- "say nothing at all", the same case main.py's
-        # Answer(spoke=False) exists for. Nothing to show, same as a silent
-        # recording above.
-        if reply:
-            widget(self, TRANSCRIPT_LIST).addItem(f"Jarvis: {reply}")
+        # Answer(spoke=False) exists for. Nothing to show and nothing to
+        # speak, same as a silent recording above.
+        self._brain_thread = None
 
+        if not reply:
+            widget(self, STATUS_LABEL).setText(_STATUS_IDLE)
+            widget(self, RECORD_BUTTON).setEnabled(True)
+            return
+
+        widget(self, TRANSCRIPT_LIST).addItem(f"Jarvis: {reply}")
+        # The transcript line appears now, before speech starts -- speak()
+        # can take a second or more just to synthesize, and there is no
+        # reason to make the user wait to see text that is already decided.
+        # The button and thread guard (see _start_listening) stay as they
+        # are; the turn is not over until speaking is too.
+        widget(self, STATUS_LABEL).setText(_STATUS_SPEAKING)
+
+        self._speak_thread = _SpeakWorker(reply, self)
+        self._speak_thread.finished_speaking.connect(self._on_speak_finished)
+        self._speak_thread.start()
+
+    def _on_speak_finished(self) -> None:
+        self._speak_thread = None
         widget(self, STATUS_LABEL).setText(_STATUS_IDLE)
         widget(self, RECORD_BUTTON).setEnabled(True)
-        self._brain_thread = None
 
     def _build_side_panel(self) -> QWidget:
         panel = QWidget()
@@ -372,7 +422,7 @@ class MainWindow(QMainWindow):
     def _build_status_bar(self) -> None:
         bar = QStatusBar()
         bar.showMessage(
-            "Jarvis — Phase 6, βήμα 4: μικρόφωνο + απάντηση συνδεδεμένα (χωρίς φωνή ακόμα)"
+            "Jarvis — Phase 6, βήμα 4: μικρόφωνο + απάντηση + φωνή συνδεδεμένα"
         )
         self.setStatusBar(bar)
 

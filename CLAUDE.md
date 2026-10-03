@@ -2045,8 +2045,38 @@ all). Spoken turn, real transcription, then
 terminal and a real reply appended to the transcript as `"Jarvis: …"` —
 confirming `_get_reply()`'s brain branch, `_BrainWorker`'s threading, and
 the audit row it logs all work end to end, not just against the mocks in
-`BrainWiringTests`. Step 4 part 2 is closed. Part 3 (`speaker.speak()`/TTS)
-is next: the reply still only appears in the transcript, silently.
+`BrainWiringTests`. Step 4 part 2 is closed.
+
+**Step 4, part 3 of 3: the voice.** `_SpeakWorker` runs `speaker.speak(reply)`
+on its own `QThread`, the same reasoning as the other two workers: `speak()`
+blocks for the full round trip (Edge's network call, or Piper's fallback)
+plus however long the audio takes to play, and that on the UI thread freezes
+the window for the same span. `_on_reply_finished()` now appends the
+`"Jarvis: …"` transcript line and switches the status to
+"Κατάσταση: Μιλάει..." *before* starting it — the text is already decided the
+moment the brain answers, and there is no reason to make the user wait to
+read it until the audio has also finished. The record button and the thread
+guard in `_start_listening()` now cover all three legs (listening, thinking,
+speaking): a click landing at any point in that sequence is a no-op, not
+just during the first two. `closeEvent()` waits on `_speak_thread` too, for
+the same reason it already waited on the other two. An empty reply (the
+frozen backstop's `""`) starts no `_SpeakWorker` at all — there is nothing
+to say and nothing to wait on.
+
+`tests/test_gui_shell.py`'s new `SpeechWiringTests` pins `_on_reply_finished`
+directly: a non-empty reply shows the transcript line and the "speaking"
+status before `speak()` even returns, calls `speaker.speak()` with exactly
+that text, and the button/status recover once the (mocked) worker finishes;
+an empty reply starts no thread and touches neither the transcript nor
+`speaker.speak`. `MicrophoneWiringTests` and `BrainWiringTests` are updated
+to mock `speaker.speak()` throughout (a real TTS call during either of those
+would otherwise now fire from the reply they produce) and to wait out
+`_speak_thread` where one gets started, plus a new
+`test_a_click_while_speaking_is_ignored` pinning the third leg of the
+double-click guard.
+
+Not yet hand-tested live — built and unit-tested against mocks only, same
+caveat part 2 carried until its own hand test closed it.
 
 **Built in a sandbox that cannot run it, hand-tested on the real machine
 instead.** This sandbox cannot install PySide6 at all — `pypi.org`/

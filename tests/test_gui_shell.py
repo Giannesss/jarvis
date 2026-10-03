@@ -37,6 +37,11 @@ try:
         widget,
     )
 
+    # speaker.speak() is mocked in every test below that reaches it, so
+    # nothing in this suite ever opens an audio device or a network
+    # connection for TTS -- same discipline as listener.listen()/brain.ask()
+    # being mocked throughout.
+
     _PYSIDE6_AVAILABLE = True
 except ImportError:
     _PYSIDE6_AVAILABLE = False
@@ -113,19 +118,21 @@ class MicrophoneWiringTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
 
-    def _run_one_turn(self, window: MainWindow, spoken: str | None) -> None:
+    def _run_one_turn(self, window: MainWindow, spoken: str | None) -> mock.Mock:
         # _start_listening kicks off a real QThread; .wait() blocks this
         # (test) thread until it finishes, and processEvents() is what
         # delivers the queued finished_with_text signal to the slot on this
         # thread afterwards -- without it the assertions below would read
         # pre-signal state even though the worker thread has already exited.
-        # A second wait+processEvents covers the _BrainWorker thread that
-        # start triggers whenever there was something to transcribe.
+        # Further wait+processEvents rounds cover the _BrainWorker and
+        # _SpeakWorker threads that a transcribed turn triggers in sequence.
+        # The speaker.speak mock is returned rather than kept private, so a
+        # caller that cares what Jarvis was asked to say can assert on it.
         with mock.patch(
             "jarvis.gui.main_window.listener.listen", return_value=spoken
         ), mock.patch(
             "jarvis.gui.main_window.skills.handle", return_value="Εντάξει."
-        ):
+        ), mock.patch("jarvis.gui.main_window.speaker.speak") as speak:
             window._start_listening()
             self.assertIsNotNone(window._listen_thread)
             self.assertFalse(widget(window, RECORD_BUTTON).isEnabled())
@@ -133,13 +140,18 @@ class MicrophoneWiringTests(unittest.TestCase):
             self.app.processEvents()
             if window._brain_thread is not None:
                 window._brain_thread.wait(2000)
+                self.app.processEvents()
+            if window._speak_thread is not None:
+                window._speak_thread.wait(2000)
         self.app.processEvents()
+        return speak
 
     def test_a_transcript_and_reply_are_appended_and_the_button_recovers(
         self,
     ) -> None:
         window = MainWindow()
-        self._run_one_turn(window, "Τι ώρα είναι")
+        speak = self._run_one_turn(window, "Τι ώρα είναι")
+        speak.assert_called_once_with("Εντάξει.")
 
         transcript = widget(window, TRANSCRIPT_LIST)
         self.assertEqual(transcript.count(), 2)
@@ -150,6 +162,7 @@ class MicrophoneWiringTests(unittest.TestCase):
         self.assertTrue(widget(window, RECORD_BUTTON).isEnabled())
         self.assertIsNone(window._listen_thread)
         self.assertIsNone(window._brain_thread)
+        self.assertIsNone(window._speak_thread)
 
     def test_no_speech_appends_nothing_and_never_starts_a_brain_thread(
         self,
@@ -172,7 +185,7 @@ class MicrophoneWiringTests(unittest.TestCase):
             "jarvis.gui.main_window.listener.listen", return_value="Γεια"
         ), mock.patch(
             "jarvis.gui.main_window.skills.handle", return_value="Γεια σου."
-        ):
+        ), mock.patch("jarvis.gui.main_window.speaker.speak"):
             window._start_listening()
             first_thread = window._listen_thread
             window._start_listening()  # the guard this pins
@@ -181,6 +194,9 @@ class MicrophoneWiringTests(unittest.TestCase):
             self.app.processEvents()
             if window._brain_thread is not None:
                 window._brain_thread.wait(2000)
+                self.app.processEvents()
+            if window._speak_thread is not None:
+                window._speak_thread.wait(2000)
         self.app.processEvents()
 
     def test_a_click_while_the_brain_is_thinking_is_ignored(self) -> None:
@@ -192,7 +208,7 @@ class MicrophoneWiringTests(unittest.TestCase):
             "jarvis.gui.main_window.listener.listen", return_value="Γεια"
         ), mock.patch(
             "jarvis.gui.main_window.skills.handle", return_value="Γεια σου."
-        ):
+        ), mock.patch("jarvis.gui.main_window.speaker.speak"):
             window._start_listening()
             window._listen_thread.wait(2000)
             self.app.processEvents()
@@ -203,6 +219,33 @@ class MicrophoneWiringTests(unittest.TestCase):
             self.assertIsNone(window._listen_thread)
 
             window._brain_thread.wait(2000)
+            self.app.processEvents()
+            if window._speak_thread is not None:
+                window._speak_thread.wait(2000)
+        self.app.processEvents()
+
+    def test_a_click_while_speaking_is_ignored(self) -> None:
+        # The guard's third leg: a click landing after the reply is back but
+        # while speaker.speak() is still playing it must not start a second
+        # recording either.
+        window = MainWindow()
+        with mock.patch(
+            "jarvis.gui.main_window.listener.listen", return_value="Γεια"
+        ), mock.patch(
+            "jarvis.gui.main_window.skills.handle", return_value="Γεια σου."
+        ), mock.patch("jarvis.gui.main_window.speaker.speak"):
+            window._start_listening()
+            window._listen_thread.wait(2000)
+            self.app.processEvents()
+            window._brain_thread.wait(2000)
+            self.app.processEvents()
+
+            self.assertIsNotNone(window._speak_thread)
+            self.assertFalse(widget(window, RECORD_BUTTON).isEnabled())
+            window._start_listening()  # must be a no-op while speaking
+            self.assertIsNone(window._listen_thread)
+
+            window._speak_thread.wait(2000)
         self.app.processEvents()
 
 
@@ -219,9 +262,18 @@ class BrainWiringTests(unittest.TestCase):
         cls.app = QApplication.instance() or QApplication([])
 
     def _run_brain(self, window: MainWindow, text: str) -> None:
-        window._on_listen_finished(text)  # starts the _BrainWorker
-        self.assertIsNotNone(window._brain_thread)
-        window._brain_thread.wait(2000)
+        # A non-empty reply now starts a _SpeakWorker too (see
+        # _on_reply_finished), so speaker.speak is mocked here regardless of
+        # what the caller's own `with` block patches -- otherwise a test that
+        # only cares about the brain half would end up actually
+        # synthesizing/playing audio.
+        with mock.patch("jarvis.gui.main_window.speaker.speak"):
+            window._on_listen_finished(text)  # starts the _BrainWorker
+            self.assertIsNotNone(window._brain_thread)
+            window._brain_thread.wait(2000)
+            self.app.processEvents()
+            if window._speak_thread is not None:
+                window._speak_thread.wait(2000)
         self.app.processEvents()
 
     def test_a_matching_skill_answers_without_touching_the_brain(self) -> None:
@@ -284,6 +336,56 @@ class BrainWiringTests(unittest.TestCase):
             transcript.item(1).text(),
             "Jarvis: Συγγνώμη, δεν μπορώ να απαντήσω αυτή τη στιγμή.",
         )
+
+
+@unittest.skipUnless(_PYSIDE6_AVAILABLE, "PySide6 is not installed here")
+class SpeechWiringTests(unittest.TestCase):
+    """Phase 6 step 4's third piece: _on_reply_finished()/_SpeakWorker,
+    exercised directly from a reply already in hand -- the recording and
+    brain halves are already pinned above. speaker.speak is mocked
+    throughout, so nothing here opens an audio device or reaches Edge/Piper.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_a_reply_is_spoken_and_the_button_recovers_after(self) -> None:
+        window = MainWindow()
+        with mock.patch("jarvis.gui.main_window.speaker.speak") as speak:
+            window._on_reply_finished("Καλημέρα.")
+            self.assertIsNotNone(window._speak_thread)
+            # The transcript line and the "speaking" status appear before
+            # speak() has even returned -- the point of showing text as soon
+            # as it is decided, not only once it has finished being said.
+            self.assertEqual(
+                widget(window, TRANSCRIPT_LIST).item(0).text(), "Jarvis: Καλημέρα."
+            )
+            self.assertEqual(
+                widget(window, STATUS_LABEL).text(), "Κατάσταση: Μιλάει..."
+            )
+            self.assertFalse(widget(window, RECORD_BUTTON).isEnabled())
+
+            window._speak_thread.wait(2000)
+            self.app.processEvents()
+            speak.assert_called_once_with("Καλημέρα.")
+
+        self.assertEqual(widget(window, STATUS_LABEL).text(), "Κατάσταση: Αδρανές")
+        self.assertTrue(widget(window, RECORD_BUTTON).isEnabled())
+        self.assertIsNone(window._speak_thread)
+
+    def test_an_empty_reply_never_starts_a_speak_thread(self) -> None:
+        # _get_reply()'s frozen-backstop case: "" means say nothing, and
+        # nothing here should be handed to speaker.speak either.
+        window = MainWindow()
+        with mock.patch("jarvis.gui.main_window.speaker.speak") as speak:
+            window._on_reply_finished("")
+            speak.assert_not_called()
+
+        self.assertIsNone(window._speak_thread)
+        self.assertEqual(widget(window, TRANSCRIPT_LIST).count(), 0)
+        self.assertEqual(widget(window, STATUS_LABEL).text(), "Κατάσταση: Αδρανές")
+        self.assertTrue(widget(window, RECORD_BUTTON).isEnabled())
 
 
 if __name__ == "__main__":
