@@ -2932,6 +2932,127 @@ the flat gradient it replaced; and does the Home page now feel
 proportioned and full rather than sparse, without the bigger orb or the
 narrower sidebar column looking cramped against each other.
 
+### A sixth pass: from calm to alive -- a two-tone accent and real motion
+
+The fifth pass's bubbles/background/fuller-layout round was followed by a
+fresh look at the running app, and the verdict changed direction from every
+pass since the third: "the main interface is too plain and boring, make it
+modern and exciting." The third pass's restraint -- one accent, flat
+surfaces, a near-still orb -- had been a correct answer to "looks like a
+gaming RGB dashboard"; it had become an overcorrection once the background/
+bubble passes fixed the literal flatness but left the Home page's actual
+*content* (three identical grey boxes, five slow dots, plain text rows) with
+nothing for the eye to do.
+
+**A second accent, used only for decoration.** `_SECONDARY_ACCENT = "#8b5cf6"`
+(violet) pairs with the existing `#0a84ff` (blue); `_ACCENT_TEAL = "#22c3b6"`
+is a third, used once. None of the three touch `_ORB_COLOR`/
+`_STATUS_DOT_COLOR` -- state meaning stays exactly what it was, and these are
+purely a decorative layer on top: a single accent, however correctly used,
+still reads as one note, which was a real piece of the "boring" feedback.
+
+**Each of the three Home-page cards got its own identity**, instead of
+being the same grey box repeated three times (a SaaS-card-kit tell on its
+own: identical rounded cards, one border-radius and nothing else
+differentiating them). A `box.setProperty("accentColor", "blue"/"violet"/
+"teal")` plus three new `QFrame#panel[accentColor="..."]` rules in
+`_STYLESHEET` give System Status/Quick Actions/Current Task a thin 2px top
+border in their own colour -- System Status blue, Quick Actions violet,
+Current Task teal. The Settings page's own panel sets no `accentColor` and
+falls back to the plain hairline border, deliberately: a settings form
+doesn't need the same visual energy a glanceable dashboard card does.
+
+**Panel titles are Greek now, and no longer all-caps.** `_panel_title()`
+used to upper-case its argument for a small-caps look -- correct restraint
+at the time, but tracked-out ALL-CAPS section labels are also one of the
+commonest "this was AI-generated" tells, and "System Status"/"Quick
+Actions"/"Current Task" were the one place left in English in an app that
+otherwise speaks Greek throughout (see "Language"). Now sentence case, in
+Greek (Κατάσταση Συστήματος / Γρήγορες Ενέργειες / Τρέχουσα Εργασία), with a
+small coloured dot in the panel's own accent drawn inline as rich text
+(`label.setTextFormat(Qt.TextFormat.RichText)`) rather than a separate
+widget -- a drop-in replacement at every call site, no layout changes
+needed. The sidebar nav labels had the same English-while-everything-else-
+is-Greek problem, compounded by actually *disagreeing* with the page titles
+they point at -- the "Chat" button opened a page titled "Συνομιλία". Nav
+labels are now Greek and match each page's own `_page_title()` exactly
+(Αρχική/Συνομιλία/Εργασίες/Αρχεία/Ρυθμίσεις). Neither change touches any
+object name, so none of `tests/test_gui_shell.py`'s navigation/settings
+assertions (all keyed to `NAV_*` constants, never to button text) needed
+updating.
+
+**CPU/RAM/VRAM each gained a live `QProgressBar` under their label.** A
+static, correctly-updating number is still just text that changes; a thin
+moving bar next to it is the difference between a readout and a dashboard.
+One colour per metric (`QProgressBar#cpu_bar/ram_bar/vram_bar::chunk` --
+blue/violet/teal, the same three-colour set as the panel borders) so a
+glance tells the three apart without reading the label first.
+`_poll_system()` now sets each bar's value alongside its label's text in the
+same few lines, never a separate code path that could drift out of sync.
+Network has no bar: it's a rate, not a 0-100 reading, and a bar has nothing
+honest to show for a number with no natural ceiling.
+
+**The orb gained a rotating accent arc and two more, two-toned bars.** A
+slim violet arc orbits just outside the ring continuously -- not tied to
+any state's *meaning* (that's still `_ORB_COLOR`'s job, unchanged), purely
+a "something in here is alive" motion cue, the single thing a still image
+can't show and the thing most responsible for "boring" on its own. It
+rotates slowly enough at idle to be nearly subliminal and only speeds up,
+never appears or disappears, when the state changes -- "alive, not busy" is
+still the brief from the third pass, just no longer "almost entirely
+still". The five bars became seven, alternating the state colour with the
+violet accent, for a touch more visual richness without returning to the
+first pass's nine-bar wall.
+
+**Quick-action buttons gained a small coloured icon** (`_dot_icon()`, a
+plain painted circle rendered to a `QPixmap` and wrapped in a `QIcon`) --
+blue for a site, violet for a local app, so the two kinds of action read
+apart at a glance. Drawn in code rather than a Unicode glyph specifically to
+avoid the risk of a tofu box on a font that doesn't carry the chosen
+character -- a painted circle renders identically on every machine PySide6
+runs on. `QPushButton.setIcon()` doesn't touch `.text()`, so every one of
+`QuickActionWiringTests`' lookups-by-exact-label and assertions on what gets
+clicked needed no changes.
+
+**The clock and every CPU/RAM/VRAM/Network number switched to a monospace
+face** (`"Cascadia Mono", Consolas, monospace` -- both ship with Windows),
+and the clock grew from 13px to 17px. A system-monitoring readout in the
+same proportional UI font as a button label is a small but real tell that
+nothing about the panel was designed as a readout; a monospace face is the
+one place a plain font swap earns its keep here, because it's a technical
+detail appropriate to this subject (a live system-status panel) rather than
+decoration for its own sake.
+
+**The record button is now a blue-to-violet gradient fill**, the one other
+place (besides the orb) the two-tone accent fills a whole control rather
+than tinting one -- paired together, the orb and the record button are the
+deliberately bold moment this pass adds; every other new accent (panel
+borders, bars, icons) stays a thin line or a small dot, per "spend your
+boldness in one place, keep everything around it quiet."
+
+**Nothing about turn logic, worker threads, the state machine, the tasks
+query, quick-action click handling, or the debug line changed.** Every
+change this pass touched is additive and visual: new `CPU_BAR`/`RAM_BAR`/
+`VRAM_BAR` object names and the `QProgressBar` widgets behind them, the two
+new module-level colour constants, `_panel_title()`'s signature gaining an
+optional `accent` argument (every existing call site still works, now
+passing a colour), the new `_dot_icon()` helper, `_Orb.paintEvent()`'s extra
+arc and two extra bars, and `_STYLESHEET`'s new rules. `tests/test_gui_shell.py`
+needed no edits -- its 53 assertions are all on object names, exact text and
+behaviour, none of which this pass touched, and the suite still skips
+cleanly here (no PySide6).
+
+**Not yet hand-tested live.** Verified only against `py_compile` and the
+mocked suite, same sandbox constraint as every pass before it. Needs a
+visual check specifically for: does the two-tone accent (blue + violet)
+actually read as more alive without tipping back into "gaming RGB"; does
+the orb's rotating arc show up clearly against the ring without looking
+like a glitch; do the three progress bars update smoothly and land on
+sensible colours against the dark panel background; does the monospace
+clock/metric font look intentional rather than mismatched against the rest
+of the UI's Segoe UI; and do the Greek nav labels and panel titles read
+naturally rather than cramped against the sidebar's fixed width.
+
 ## Normalization
 
 `text.normalize()` is what every phrase list, every pattern and every stored

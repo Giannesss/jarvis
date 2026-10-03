@@ -50,10 +50,14 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QAction,
+    QBrush,
     QColor,
     QFontMetrics,
+    QIcon,
     QPainter,
     QPainterPath,
+    QPen,
+    QPixmap,
     QRadialGradient,
 )
 from PySide6.QtWidgets import (
@@ -64,6 +68,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QListWidget,
     QMainWindow,
+    QProgressBar,
     QPushButton,
     QStackedWidget,
     QStyledItemDelegate,
@@ -86,6 +91,9 @@ CPU_LABEL = "cpu_label"
 RAM_LABEL = "ram_label"
 VRAM_LABEL = "vram_label"
 NETWORK_LABEL = "network_label"
+CPU_BAR = "cpu_bar"
+RAM_BAR = "ram_bar"
+VRAM_BAR = "vram_bar"
 CURRENT_TASK_LABEL = "current_task_label"
 DEBUG_ACTION = "debug_mode_action"
 RECORD_BUTTON = "record_button"
@@ -168,18 +176,45 @@ def _format_rate(bytes_per_second: float) -> str:
     return f"{kb / 1024:.1f} MB/s"
 
 
-def _panel_title(text: str) -> QLabel:
-    """A small, letter-spaced, uppercase label for a panel's own heading
-    (System Status, Quick Actions, Current Task), visually distinct from the
-    plain body labels inside the panel -- styled via the `panelTitle` object
-    name in `_STYLESHEET` rather than repeating font/colour calls at every
-    call site that builds one of these panels. Upper-cased here rather than
-    relying on a stylesheet `text-transform` -- Qt's QSS subset doesn't
-    support that CSS property, so the caller writes the label in natural
-    case and this is where it becomes the small-caps look."""
-    label = QLabel(text.upper())
+def _panel_title(text: str, accent: str = "#0a84ff") -> QLabel:
+    """A panel's own heading (Κατάσταση Συστήματος, Γρήγορες Ενέργειες,
+    Τρέχουσα Εργασία), visually distinct from the plain body labels inside
+    the panel via the `panelTitle` object name in `_STYLESHEET`, plus a small
+    coloured dot that gives each panel its own identity (see `accent` below).
+
+    No longer all-caps. The third design pass's small-caps treatment was a
+    quiet, correct choice for restraint, but it's also one of the commonest
+    "this was AI-generated" tells (tracked-out ALL-CAPS section labels), and
+    it was the one piece of English left in an otherwise all-Greek app
+    ("System Status" never had a Greek translation before this pass) --
+    sentence case in the caller's own language fixes both at once. The dot
+    is drawn as inline HTML rather than a separate widget: a QLabel can carry
+    rich text and still participate in the same layout as a plain one, so
+    this stays a drop-in replacement for every existing call site."""
+    label = QLabel(f'<span style="color:{accent};">●</span>&nbsp;&nbsp;{text}')
+    label.setTextFormat(Qt.TextFormat.RichText)
     label.setObjectName("panelTitle")
     return label
+
+
+def _dot_icon(color: str, diameter: int = 10) -> QIcon:
+    """A small solid-colour circle, used as a quick-action button's icon
+    (see `_build_quick_actions_box`). Drawn in code rather than loaded from
+    an asset file or a Unicode glyph -- a glyph risks rendering as a tofu box
+    on a font that doesn't carry it, which would look more broken than no
+    icon at all, while a plain painted circle renders identically everywhere
+    PySide6 runs. `QPushButton.setIcon()` doesn't touch `.text()`, so this
+    adds visual texture to the quick-action list without changing anything
+    `QuickActionWiringTests` already asserts on."""
+    pixmap = QPixmap(diameter, diameter)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setBrush(QColor(color))
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.drawEllipse(0, 0, diameter, diameter)
+    painter.end()
+    return QIcon(pixmap)
 
 
 def _page_title(text: str) -> QLabel:
@@ -266,6 +301,20 @@ _STATUS_DOT_COLOR = {
     State.THINKING: "#d2963c",
     State.SPEAKING: "#0a84ff",
 }
+
+# A second accent, used only for decoration -- never for state meaning (that
+# stays _ORB_COLOR/_STATUS_DOT_COLOR's job, unchanged above). Pairing the
+# existing accent blue with a violet gives the orb's ring/arc, the record
+# button and the three Home-page panels a two-tone identity instead of one
+# flat hue repeated everywhere, which was a real piece of the "plain and
+# boring" feedback -- a single accent colour, however accurately used, still
+# reads as one note. _ACCENT_TEAL is the Current Task panel's own tint, kept
+# distinct from both so the panel's "mine" colour doesn't fight the
+# blue-vs-violet pairing used for System Status vs Quick Actions. None of
+# this reuses _ORB_COLOR's SPEAKING blue for anything but SPEAKING -- the
+# panels' tints are purely decorative label colour, not state.
+_SECONDARY_ACCENT = "#8b5cf6"
+_ACCENT_TEAL = "#22c3b6"
 
 # Same text as main.py's own BRAIN_ERROR_REPLY. Duplicated rather than
 # imported -- jarvis/gui/ is never imported by main.py and the reverse is
@@ -454,11 +503,39 @@ class _Orb(QWidget):
             QRectF(cx - ring_radius, cy - ring_radius, ring_radius * 2, ring_radius * 2)
         )
 
-        # Five bars, not nine -- fewer, calmer, each a touch wider. Idle
-        # shows them as short flat dashes (a resting state, not "nothing is
-        # here"); an active state wobbles them, still gently.
-        bar_count = 5
-        bar_area_width = side * 0.32
+        # A slim rotating arc in the secondary accent, orbiting just outside
+        # the ring -- the one piece of the orb that answers "boring" on its
+        # own: a continuous, deliberate motion cue (not tied to any state's
+        # own meaning, which stays _ORB_COLOR's job above) that reads as
+        # "something is alive in here" even at idle. Idle rotates slowly
+        # enough to be almost subliminal -- "alive, not busy" is still the
+        # brief -- and only speeds up, never appears/disappears, when a
+        # state actually changes, so it never competes with the state colour
+        # itself for attention.
+        arc_radius = ring_radius + side * 0.045
+        rotate_speed = 0.5 if self._state is State.IDLE else 1.8
+        angle_deg = (self._phase * rotate_speed) % 360
+        arc_color = QColor(_SECONDARY_ACCENT)
+        arc_color.setAlpha(175)
+        arc_pen = QPen(QBrush(arc_color), max(side * 0.012, 2.0))
+        arc_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(arc_pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        arc_rect = QRectF(
+            cx - arc_radius, cy - arc_radius, arc_radius * 2, arc_radius * 2
+        )
+        # Qt's arc angles are in 1/16th of a degree, and count counter-
+        # clockwise from the 3 o'clock position -- a plain constant, not a
+        # tuned one, just Qt's own convention for QPainter.drawArc.
+        painter.drawArc(arc_rect, int(angle_deg * 16), int(46 * 16))
+
+        # Seven bars, alternating the state colour with the secondary accent
+        # -- richer than the second pass's flat five, without going back to
+        # the first pass's nine-bar, single-colour wall. Idle shows them as
+        # short flat dashes (a resting state, not "nothing is here"); an
+        # active state wobbles them, still gently.
+        bar_count = 7
+        bar_area_width = side * 0.36
         bar_gap = bar_area_width / bar_count
         base_y = cy
         for i in range(bar_count):
@@ -469,9 +546,9 @@ class _Orb(QWidget):
                 # own index -- decorative, not a real audio level (see
                 # ORB_TICK_MS above).
                 wobble = (math.sin(self._phase * 0.18 + i * 1.1) + 1) / 2
-                height = side * (0.03 + 0.08 * wobble)
+                height = side * (0.03 + 0.09 * wobble)
             x = cx - bar_area_width / 2 + i * bar_gap
-            bar_color = QColor(color)
+            bar_color = QColor(color if i % 2 == 0 else _SECONDARY_ACCENT)
             bar_color.setAlpha(210)
             painter.setBrush(bar_color)
             painter.setPen(Qt.PenStyle.NoPen)
@@ -719,12 +796,16 @@ class MainWindow(QMainWindow):
         ram = psutil.virtual_memory().percent
         widget(self, CPU_LABEL).setText(f"CPU: {cpu:.0f}%")
         widget(self, RAM_LABEL).setText(f"RAM: {ram:.0f}%")
+        widget(self, CPU_BAR).setValue(int(cpu))
+        widget(self, RAM_BAR).setValue(int(ram))
 
         vram = _read_vram_percent()
         if vram is None:
             widget(self, VRAM_LABEL).setText("VRAM: μη διαθέσιμο")
+            widget(self, VRAM_BAR).setValue(0)
         else:
             widget(self, VRAM_LABEL).setText(f"VRAM: {vram:.0f}%")
+            widget(self, VRAM_BAR).setValue(int(vram))
 
         # Network throughput isn't a single reading the way CPU/RAM/VRAM
         # are -- psutil only gives a running total of bytes moved since boot,
@@ -898,12 +979,17 @@ class MainWindow(QMainWindow):
         sidebar.setObjectName("sidebar")
         layout = QVBoxLayout(sidebar)
 
+        # Greek, matching each page's own _page_title() exactly -- these used
+        # to be English ("Chat") while the page you landed on said
+        # "Συνομιλία", a mismatch nobody asked for and nothing in the app
+        # otherwise has: Jarvis speaks Greek throughout (see "Language" in
+        # CLAUDE.md), and the sidebar was the one place still in English.
         nav_items = [
-            (NAV_HOME, "Home", 0),
-            (NAV_CHAT, "Chat", 1),
-            (NAV_TASKS, "Tasks", 2),
-            (NAV_FILES, "Files", 3),
-            (NAV_SETTINGS, "Settings", 4),
+            (NAV_HOME, "Αρχική", 0),
+            (NAV_CHAT, "Συνομιλία", 1),
+            (NAV_TASKS, "Εργασίες", 2),
+            (NAV_FILES, "Αρχεία", 3),
+            (NAV_SETTINGS, "Ρυθμίσεις", 4),
         ]
         self._nav_buttons: dict[str, QPushButton] = {}
         for object_name, label, index in nav_items:
@@ -1006,46 +1092,83 @@ class MainWindow(QMainWindow):
     def _build_monitoring_box(self) -> QWidget:
         box = QFrame()
         box.setObjectName("panel")
+        # A dynamic property, not a second object name -- `panel` still
+        # selects every card's shared shape/surface in `_STYLESHEET`, and
+        # `accentColor` layers one more rule on top for the thin top border
+        # that gives this card its own identity (blue, here) rather than
+        # being identical to Quick Actions/Current Task next to it.
+        box.setProperty("accentColor", "blue")
         layout = QVBoxLayout(box)
         layout.setContentsMargins(18, 16, 18, 16)
         layout.setSpacing(10)
-        layout.addWidget(_panel_title("System Status"))
+        layout.addWidget(_panel_title("Κατάσταση Συστήματος", accent="#0a84ff"))
 
-        for object_name, placeholder in (
-            (CPU_LABEL, "CPU: —"),
-            (RAM_LABEL, "RAM: —"),
-            (VRAM_LABEL, "VRAM: —"),
-            (NETWORK_LABEL, "Network: —"),
+        # A metric label paired with a thin progress bar under it (CPU/RAM/
+        # VRAM only -- Network is a rate, not a 0-100 reading, so a bar has
+        # nothing honest to show for it and keeps its plain label alone).
+        # The bars are the single biggest answer to "boring": a live,
+        # moving reading next to the number it describes, instead of four
+        # static lines of text that only change value, never shape.
+        for object_name, bar_name, placeholder in (
+            (CPU_LABEL, CPU_BAR, "CPU: —"),
+            (RAM_LABEL, RAM_BAR, "RAM: —"),
+            (VRAM_LABEL, VRAM_BAR, "VRAM: —"),
         ):
             label = QLabel(placeholder)
             label.setObjectName(object_name)
             label.setProperty("metric", True)
             layout.addWidget(label)
 
+            bar = QProgressBar()
+            bar.setObjectName(bar_name)
+            bar.setRange(0, 100)
+            bar.setValue(0)
+            bar.setTextVisible(False)
+            bar.setFixedHeight(4)
+            layout.addWidget(bar)
+
+        network_label = QLabel("Network: —")
+        network_label.setObjectName(NETWORK_LABEL)
+        network_label.setProperty("metric", True)
+        layout.addWidget(network_label)
+
         # "—" is the construction-time placeholder only; _poll_system()
-        # overwrites all four labels with an actual reading on the first
-        # timer tick. VRAM can still land on "μη διαθέσιμο" afterwards
-        # rather than a percentage -- that is _read_vram_percent() reporting
-        # no NVIDIA GPU found, not a stuck placeholder.
+        # overwrites all four labels (and the three bars) with an actual
+        # reading on the first timer tick. VRAM can still land on
+        # "μη διαθέσιμο" afterwards rather than a percentage -- that is
+        # _read_vram_percent() reporting no NVIDIA GPU found, not a stuck
+        # placeholder, and its bar is simply left at 0 in that case.
         return box
 
     def _build_quick_actions_box(self) -> QWidget:
         box = QFrame()
         box.setObjectName("panel")
+        box.setProperty("accentColor", "violet")
         layout = QVBoxLayout(box)
         layout.setContentsMargins(18, 16, 18, 16)
         layout.setSpacing(8)
-        layout.addWidget(_panel_title("Quick Actions"))
+        layout.addWidget(
+            _panel_title("Γρήγορες Ενέργειες", accent=_SECONDARY_ACCENT)
+        )
 
         # One button per site/app Jarvis can already open by voice
         # (config.SKILL_SITES / SKILL_APPS) -- so the panel reflects what's
         # really configured rather than a fixed, separately-maintained list
         # that drifts from it. Each one calls exactly the function the
         # voice skill itself calls (skills._open_site()/_open_app()), via
-        # _quick_action_site()/_quick_action_app() below.
+        # _quick_action_site()/_quick_action_app() below. A small solid-
+        # colour icon (see _dot_icon) is the only thing new here -- it
+        # doesn't touch button.text(), so QuickActionWiringTests' lookups
+        # by exact label and its assertions on what gets clicked are
+        # unaffected; it just gives a plain list of text rows a little
+        # visual texture, blue for a site and violet for a local app so the
+        # two kinds read apart at a glance.
+        icon_size = QSize(10, 10)
         for label, url in SKILL_SITES.items():
             button = QPushButton(label)
             button.setProperty("quickAction", True)
+            button.setIcon(_dot_icon("#0a84ff"))
+            button.setIconSize(icon_size)
             button.clicked.connect(
                 lambda _checked=False, label=label, url=url: self._quick_action_site(
                     label, url
@@ -1056,6 +1179,8 @@ class MainWindow(QMainWindow):
         for label, argv in SKILL_APPS.items():
             button = QPushButton(label)
             button.setProperty("quickAction", True)
+            button.setIcon(_dot_icon(_SECONDARY_ACCENT))
+            button.setIconSize(icon_size)
             button.clicked.connect(
                 lambda _checked=False, label=label, argv=argv: self._quick_action_app(
                     label, argv
@@ -1068,10 +1193,11 @@ class MainWindow(QMainWindow):
     def _build_current_task_box(self) -> QWidget:
         box = QFrame()
         box.setObjectName("panel")
+        box.setProperty("accentColor", "teal")
         layout = QVBoxLayout(box)
         layout.setContentsMargins(18, 16, 18, 16)
         layout.setSpacing(8)
-        layout.addWidget(_panel_title("Current Task"))
+        layout.addWidget(_panel_title("Τρέχουσα Εργασία", accent=_ACCENT_TEAL))
 
         label = QLabel("Έτοιμος — περιμένω εντολή.")
         label.setObjectName(CURRENT_TASK_LABEL)
@@ -1514,8 +1640,10 @@ QLabel#status_label {
     color: rgba(245, 245, 247, 0.55);
 }
 QLabel#clock_label {
-    font-size: 13px;
+    font-family: "Cascadia Mono", Consolas, monospace;
+    font-size: 17px;
     font-weight: 600;
+    letter-spacing: 0.5px;
     color: #f5f5f7;
 }
 QLabel#date_label {
@@ -1557,17 +1685,56 @@ QFrame#panel {
     border: 1px solid rgba(255, 255, 255, 0.08);
     border-radius: 12px;
 }
+/* A thin top accent per card -- System Status/Quick Actions/Current Task
+   each own one of the two accent colours or the teal (see _SECONDARY_ACCENT/
+   _ACCENT_TEAL), so three otherwise-identical boxes read as three distinct
+   cards instead of one card repeated three times. The Settings page's form
+   panel sets no accentColor property, so it falls back to the plain
+   hairline border above -- a settings form doesn't need the same visual
+   energy a glanceable dashboard card does. */
+QFrame#panel[accentColor="blue"] {
+    border-top: 2px solid #0a84ff;
+}
+QFrame#panel[accentColor="violet"] {
+    border-top: 2px solid #8b5cf6;
+}
+QFrame#panel[accentColor="teal"] {
+    border-top: 2px solid #22c3b6;
+}
 QLabel#panelTitle {
-    color: rgba(245, 245, 247, 0.4);
-    font-size: 11px;
+    color: rgba(245, 245, 247, 0.72);
+    font-size: 12.5px;
     font-weight: 600;
-    letter-spacing: 0.6px;
 }
 QLabel[metric="true"] {
-    font-size: 13px;
+    font-family: "Cascadia Mono", Consolas, monospace;
+    font-size: 13.5px;
     font-weight: 500;
+    letter-spacing: 0.2px;
     color: #f5f5f7;
     padding: 1px 0;
+}
+
+/* The three live meters under CPU/RAM/VRAM -- thin, flat, one colour per
+   metric so a glance tells them apart without reading the label first.
+   QProgressBar's text is hidden (setTextVisible(False)); the number still
+   lives in the QLabel[metric="true"] line above it. */
+QProgressBar {
+    background-color: rgba(255, 255, 255, 0.07);
+    border: none;
+    border-radius: 2px;
+}
+QProgressBar::chunk {
+    border-radius: 2px;
+}
+QProgressBar#cpu_bar::chunk {
+    background-color: #0a84ff;
+}
+QProgressBar#ram_bar::chunk {
+    background-color: #8b5cf6;
+}
+QProgressBar#vram_bar::chunk {
+    background-color: #22c3b6;
 }
 QLabel#pageTitle {
     font-size: 20px;
@@ -1657,11 +1824,15 @@ QPushButton[quickAction="true"]:pressed {
     background-color: rgba(255, 255, 255, 0.03);
 }
 
-/* record_button is the one place in the window the accent colour fills a
-   whole control, rather than tinting one -- the single primary action
-   earns the single accent; everything else stays neutral tone. */
+/* record_button is the one place in the window a control is filled with
+   the full blue-to-violet accent pairing, rather than tinting with one --
+   paired with the orb (same two colours, see _SECONDARY_ACCENT), it's the
+   one deliberately bold moment in the window; everything else stays
+   neutral tone or a single thin accent border. */
 QPushButton#record_button {
-    background-color: #0a84ff;
+    background-color: qlineargradient(
+        x1:0, y1:0, x2:1, y2:0, stop:0 #0a84ff, stop:1 #8b5cf6
+    );
     border: none;
     border-radius: 22px;
     padding: 12px 40px;
@@ -1670,10 +1841,14 @@ QPushButton#record_button {
     color: #ffffff;
 }
 QPushButton#record_button:hover {
-    background-color: #2894ff;
+    background-color: qlineargradient(
+        x1:0, y1:0, x2:1, y2:0, stop:0 #2894ff, stop:1 #9d6ff7
+    );
 }
 QPushButton#record_button:pressed {
-    background-color: #0870d6;
+    background-color: qlineargradient(
+        x1:0, y1:0, x2:1, y2:0, stop:0 #0870d6, stop:1 #7142d9
+    );
 }
 QPushButton#record_button:disabled {
     background-color: #1c1c1f;
