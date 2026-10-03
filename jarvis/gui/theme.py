@@ -473,14 +473,15 @@ QPushButton[quickAction="true"]:pressed {{
    signals there is. Still the one strongly-coloured control in the window
    (it's the one primary action), it just earns that by being the only
    solid-accent button, not by also being the only gradient. */
+/* A plain circle, not a text pill -- see MainWindow._build_home_page()'s
+   record_button, which carries only a microphone icon now ("Εγγραφή"
+   moved to its tooltip). The 68x68 fixed size set in Python is what makes
+   border-radius:34px a true circle rather than a rounded rectangle. */
 QPushButton#record_button {{
     background-color: {a};
     border: none;
-    border-radius: 22px;
-    padding: 12px 40px;
-    font-size: 14px;
-    font-weight: 600;
-    color: #ffffff;
+    border-radius: 34px;
+    padding: 0;
 }}
 QPushButton#record_button:hover {{
     background-color: {_shade(a, 1.12)};

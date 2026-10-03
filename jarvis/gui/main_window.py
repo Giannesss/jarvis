@@ -641,22 +641,24 @@ class _Orb(QWidget):
 
 
 class _Background(QWidget):
-    """The window's own canvas, painted by hand rather than by a QSS
-    gradient -- the only way to add the faint grid texture and the handful
-    of slow-drifting particles the redesign brief asks for ("the background
-    should feel alive, but you shouldn't immediately notice the animation"),
-    since Qt's stylesheet gradients have no notion of a repeating pattern or
-    of motion at all.
+    """The window's own canvas -- since the tenth pass, a quiet procedural
+    night-sky-over-mountains scene instead of the ninth pass's flat
+    gradient-plus-particles wash, per a reference photo the user supplied:
+    a dark, hazy mountain silhouette under a star-lit sky. Nothing here is
+    a copy of that photo, or any photo -- there is no image asset in this
+    repo and no network fetch to get one (the same discipline every other
+    original visual in this file follows, from `_Orb` to `icons.py`): the
+    sky is a plain vertical gradient, the two mountain layers are
+    deterministic silhouettes built from a handful of summed sine waves
+    (`_ridge_path()`), and the stars are a fixed set of points that only
+    ever twinkle in place, never drift. The effect is "the mood of that
+    photo", painted from scratch.
 
-    Three layers, back to front: the same soft top-centred radial wash the
-    third/fourth design passes already established (moved here from QSS,
-    in plain RGB rather than qradialgradient's percentage syntax -- QSS
-    can't animate, so a particle layer has to be code either way, and
-    keeping the static wash in the same place avoids painting two
-    backgrounds on top of each other), a very faint grid (a hint of
-    technical texture, not a pattern anyone is meant to consciously
-    register), and a handful of small, low-alpha dots drifting on
-    independent slow sine paths rather than moving in lockstep.
+    Four layers, back to front: a dark sky gradient, a soft horizon glow
+    (tinted by the active accent colour, so "Χρώμα έμφασης" in Settings
+    still has a real effect on the window's single largest surface), two
+    mountain silhouettes at different depths/darkness, and a field of
+    faint, individually twinkling stars.
 
     Every child widget (header, sidebar, pages) is still added via the
     ordinary QVBoxLayout in _build_central_widget() -- Qt paints children
@@ -665,24 +667,36 @@ class _Background(QWidget):
     is drawn.
 
     tick() is driven by MainWindow's existing _orb_timer rather than a
-    timer of its own -- one more QTimer purely to nudge a few background
-    dots doesn't earn its own object when one is already ticking at the
-    right cadence for "smooth but not attention-seeking" motion."""
+    timer of its own -- one more QTimer purely to nudge star twinkle
+    doesn't earn its own object when one is already ticking at the right
+    cadence for "smooth but not attention-seeking" motion."""
 
-    _PARTICLE_COUNT = 7
+    _STAR_COUNT = 90
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._phase = 0.0
         self._mode = "dark"
         self._accent = QColor(theme.ACCENTS["blue"])
+        # Each star is (x_frac, y_frac, size, twinkle_seed, twinkle_speed) --
+        # fixed at construction (a plain, seeded pattern, not re-rolled every
+        # resize) so the sky doesn't visibly "reshuffle" the first time the
+        # window changes size.
+        self._stars = [
+            (
+                (i * 0.6180339887 + i * i * 0.013) % 1.0,
+                ((i * 0.3312469 + 0.05) % 0.62),
+                1.0 + (i % 3) * 0.5,
+                i * 11.7,
+                0.02 + (i % 5) * 0.01,
+            )
+            for i in range(self._STAR_COUNT)
+        ]
 
     def set_theme(self, mode: str, accent_hex: str) -> None:
-        """Ties the aurora wash to the active theme/accent (eighth design
-        pass, "a subtle animated aurora/mesh glow in blue and purple") --
-        the canvas's own colour now comes from theme.py the same way every
-        QSS rule in _STYLESHEET's replacement does, rather than the four
-        literal RGB triples this used to hold regardless of theme."""
+        """Ties the horizon glow to the active theme/accent -- the canvas's
+        own colour now comes from theme.py the same way every QSS rule in
+        the stylesheet does, rather than a literal baked into this class."""
         self._mode = mode
         self._accent = QColor(accent_hex)
         self.update()
@@ -699,66 +713,87 @@ class _Background(QWidget):
         self._phase += 1.0
         self.update()
 
+    @staticmethod
+    def _ridge_path(w: int, h: int, base_y: float, amplitude: float, seed: float) -> QPainterPath:
+        """A deterministic jagged silhouette, not a real heightmap -- three
+        summed sine harmonics at different frequencies/phases (keyed off
+        `seed`, so two calls with different seeds never look like the same
+        ridge shifted sideways) give a mountain-range-like outline cheaply,
+        with no image data and nothing randomised between repaints."""
+        path = QPainterPath()
+        path.moveTo(0, h)
+        steps = 48
+        for i in range(steps + 1):
+            x = w * i / steps
+            t = i / steps
+            y = base_y + amplitude * (
+                math.sin(t * 6.1 + seed) * 0.5
+                + math.sin(t * 13.7 + seed * 2.1) * 0.3
+                + math.sin(t * 27.3 + seed * 0.6) * 0.2
+            )
+            path.lineTo(x, y)
+        path.lineTo(w, h)
+        path.closeSubpath()
+        return path
+
     def paintEvent(self, event) -> None:  # noqa: N802 -- Qt's own name
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         w, h = self.width(), self.height()
+        horizon = h * 0.62
 
         if self._mode == "light":
-            base_top, base_mid, base_edge = (
-                QColor(250, 250, 252),
-                QColor(242, 243, 247),
-                QColor(232, 233, 238),
+            sky_top, sky_mid, sky_horizon = (
+                QColor(214, 222, 232),
+                QColor(196, 206, 220),
+                QColor(222, 212, 206),
             )
-            grid_color = QColor(0, 0, 0)
-            grid_alpha = 10
-            particle_base = QColor(70, 90, 150)
+            far_ridge = QColor(150, 160, 178)
+            near_ridge = QColor(96, 104, 120)
+            star_color = QColor(90, 100, 120)
+            star_max_alpha = 30
         else:
-            base_top, base_mid, base_edge = (
-                QColor(18, 20, 27),
-                QColor(13, 14, 18),
-                QColor(8, 8, 10),
+            sky_top, sky_mid, sky_horizon = (
+                QColor(7, 9, 14),
+                QColor(11, 14, 22),
+                QColor(18, 23, 34),
             )
-            grid_color = QColor(255, 255, 255)
-            grid_alpha = 5
-            particle_base = QColor(160, 190, 255)
+            far_ridge = QColor(28, 35, 50)
+            near_ridge = QColor(11, 13, 18)
+            star_color = QColor(235, 240, 255)
+            star_max_alpha = 170
 
-        # The aurora tint: the top stop leans toward the active accent
-        # (blue or violet or teal, whichever is selected) rather than a
-        # fixed hue, so "Χρώμα έμφασης" in Settings actually changes the
-        # one thing in the window with the most visual surface area, not
-        # just a handful of borders and buttons.
-        gradient = QRadialGradient(w * 0.5, 0, max(w * 1.15, 1))
-        gradient.setColorAt(0.0, self._mix(base_top, self._accent, 0.14))
-        gradient.setColorAt(0.45, base_mid)
-        gradient.setColorAt(1.0, base_edge)
-        painter.fillRect(self.rect(), gradient)
+        # The sky: a plain vertical gradient, darkest at the top, lifting
+        # slightly toward the horizon -- then a soft accent-tinted glow
+        # sitting low in the frame, the way moonlight or a city's glow
+        # would wash the sky near a real horizon. This is the one place
+        # the chosen accent colour still shows through on the canvas.
+        sky = QRadialGradient(w * 0.5, horizon, max(w, h) * 0.9)
+        sky.setColorAt(0.0, self._mix(sky_horizon, self._accent, 0.10))
+        sky.setColorAt(0.45, sky_mid)
+        sky.setColorAt(1.0, sky_top)
+        painter.fillRect(self.rect(), sky)
 
-        # A very faint technical grid, spaced wide (64px) so it reads as
-        # depth/texture rather than graph paper -- alpha stays close to the
-        # edge of being visible at all, which is the point.
-        painter.setPen(QPen(QColor(grid_color.red(), grid_color.green(), grid_color.blue(), grid_alpha), 1))
-        step = 64
-        for x in range(0, w, step):
-            painter.drawLine(x, 0, x, h)
-        for y in range(0, h, step):
-            painter.drawLine(0, y, w, y)
-
-        # A handful of particles, each on its own slow, independent drift --
-        # deterministic (sine/cosine off the shared phase plus a per-particle
-        # seed), not random, so the same gentle motion repeats rather than
-        # jittering frame to frame. Barely visible on purpose: alpha stays
-        # under 20 and radius under 2px, "extremely restrained" per the brief.
+        # Stars: fixed positions, each twinkling independently and slowly
+        # on its own phase -- never drifting, since real stars don't.
         painter.setPen(Qt.PenStyle.NoPen)
-        for i in range(self._PARTICLE_COUNT):
-            seed = i * 37.0
-            x = (math.sin(self._phase * 0.0035 + seed) + 1) / 2 * w
-            y = (math.cos(self._phase * 0.0021 + seed * 1.7) + 1) / 2 * h
-            alpha = 10 + int(8 * (math.sin(self._phase * 0.01 + seed) + 1) / 2)
+        for x_frac, y_frac, size, seed, speed in self._stars:
+            twinkle = (math.sin(self._phase * speed + seed) + 1) / 2
+            alpha = int(star_max_alpha * (0.35 + 0.65 * twinkle))
             painter.setBrush(
-                QColor(particle_base.red(), particle_base.green(), particle_base.blue(), alpha)
+                QColor(star_color.red(), star_color.green(), star_color.blue(), alpha)
             )
-            painter.drawEllipse(QRectF(x, y, 2.2, 2.2))
+            painter.drawEllipse(QRectF(x_frac * w, y_frac * horizon, size, size))
+
+        # Two mountain layers -- a lighter, bluer far ridge and a darker,
+        # nearly-black near one, the same depth cue a real landscape photo
+        # gets from haze. Static shapes (no animation), cheap to repaint
+        # every tick since each is ~50 line segments.
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(far_ridge)
+        painter.drawPath(self._ridge_path(w, h, horizon * 0.94, h * 0.05, 1.3))
+        painter.setBrush(near_ridge)
+        painter.drawPath(self._ridge_path(w, h, horizon * 1.03, h * 0.065, 4.7))
 
 
 def _parse_rgba(value: str) -> QColor:
@@ -1839,8 +1874,18 @@ class MainWindow(QMainWindow):
         buttons_row = QHBoxLayout()
         buttons_row.setSpacing(12)
         buttons_row.addStretch(1)
-        record_button = QPushButton("Εγγραφή")
+        # An icon-only circular button, not a text pill -- "Εγγραφή" next
+        # to a microphone glyph was saying the same thing twice. The
+        # tooltip keeps the Greek word available on hover (and to a screen
+        # reader via its accessible name, which Qt derives from the
+        # tooltip when a button has no text), so nothing about what the
+        # button *means* is lost by dropping what it *says*.
+        record_button = QPushButton()
         record_button.setObjectName(RECORD_BUTTON)
+        record_button.setToolTip("Εγγραφή")
+        record_button.setIcon(icons.icon("mic", "#ffffff", size=26))
+        record_button.setIconSize(QSize(26, 26))
+        record_button.setFixedSize(68, 68)
         record_button.clicked.connect(self._start_listening)
         buttons_row.addWidget(record_button)
         # "[ Open Conversation ]" from the brief -- a real action (switches

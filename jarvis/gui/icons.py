@@ -62,6 +62,14 @@ _PATHS: dict[str, str] = {
     '<circle fill="{color}" cx="15.3" cy="11" r="1.1"/>',
     "empty-activity": '<circle {stroke} cx="12" cy="12" r="8.2"/>'
     '<path {stroke} d="M12 8v4.3l2.8 2"/>',
+    # The record button's own icon (replacing its "Εγγραφή" text label) --
+    # a plain microphone capsule plus its stand, the universal shorthand
+    # for "press to talk" that needs no caption next to it. setToolTip()
+    # on the button itself still carries "Εγγραφή" for anyone hovering or
+    # using a screen reader, so nothing about the button's accessible name
+    # is lost by dropping the visible word.
+    "mic": '<rect {stroke} x="9" y="3.5" width="6" height="11" rx="3"/>'
+    '<path {stroke} d="M6 11v1a6 6 0 0 0 12 0v-1M12 18v3M9 21h6"/>',
 }
 
 

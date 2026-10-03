@@ -3587,6 +3587,104 @@ action without the gradient; and does the window as a whole feel calmer
 and more "crafted" rather than simply less colourful -- restraint, not
 blandness, is the actual target.
 
+### A tenth pass: an icon-only record button, and a night-sky background inspired by (not copied from) a reference photo
+
+The user's next request came with a reference image attached: the same
+mockup CLAUDE.md has referenced since "The dashboard redesign" above -- a
+dark, moody mountain-and-stars photo behind a glowing Iron Man helmet
+avatar, with an 8-card explainer grid underneath. Both of those two
+elements are already, explicitly, off-limits: the helmet is a copyrighted
+Marvel character (see "The dashboard redesign"'s own reasoning for why
+`_Orb` is an original design instead), and the 8-card grid was confirmed
+by the user earlier in this project as not wanted in the running app (see
+the same section). What the user was pointing at here was the photo's
+*background* specifically -- "add a background like this" -- not a request
+to revisit either of those two settled questions, so this pass adds an
+original night-sky scene in that mood while leaving the orb and the card
+layout exactly as the ninth pass left them.
+
+**The record button lost its text label.** `"Εγγραφή"` moved to
+`setToolTip()` (so a screen reader or a hover still gets the word), and
+the button now shows a small hand-drawn microphone icon instead --
+`icons.py` gained a `"mic"` entry (a capsule plus its stand, the same
+stroke-only style as every other icon there, drawn the same way as the
+rest of `_PATHS` rather than borrowed from an icon font) and
+`theme.py`'s `QPushButton#record_button` rule changed from a padded,
+text-sized pill to a true circle (`border-radius: 34px` against a fixed
+68x68 size set in Python, `padding: 0`) -- a button that is only ever
+going to hold one small glyph doesn't need the horizontal padding a text
+label did, and a circle reads as a single, iconic, unambiguous "press
+this to talk" affordance the way a messaging app's own mic/send buttons
+do. `_build_home_page()`'s construction now reads `setIcon(icons.icon(
+"mic", "#ffffff", size=26))` / `setIconSize(QSize(26, 26))` /
+`setFixedSize(68, 68)` in place of the old `QPushButton("Εγγραφή")`.
+Nothing about `RECORD_BUTTON`'s object name, its enabled/disabled
+behaviour across the state machine, or any wiring into `_start_listening()`
+changed -- `tests/test_gui_shell.py` asserts on `RECORD_BUTTON.isEnabled()`
+throughout and never on `.text()` (checked by Grep before this edit), so
+every existing assertion still holds unchanged.
+
+**`_Background` is a new, original scene, not a photo.** The eighth/ninth
+passes' flat aurora-gradient-plus-faint-grid-plus-drifting-particles canvas
+is replaced by a procedural night sky over two mountain silhouettes --
+built the same way every other original visual in this file is built (no
+image asset in the repo, no network fetch, nothing this sandbox would
+have had to download even if it could): a plain vertical/radial sky
+gradient (darkest at the top, lifting toward the horizon, tinted toward
+the active accent colour right at the horizon line -- so "Χρώμα έμφασης"
+in Settings still visibly changes the window's single largest surface,
+the same way it already changes the orb and the accent-coloured controls);
+a fixed field of 90 stars, each at a deterministic golden-ratio-seeded
+position (`(i * 0.618... + i*i*0.013) % 1.0`-style placement, the same
+"seeded, not random" idiom the fourth pass's background particles already
+used) that only ever twinkle in place via an independent sine phase per
+star -- never drift, since real stars don't; and two mountain-silhouette
+layers from a new `_ridge_path()` static method, each a closed
+`QPainterPath` built from three summed sine harmonics at different
+frequencies and a per-call `seed`, cheap to repaint every tick (~50 line
+segments) and guaranteed never to look like a reused/offset copy of the
+other layer because the seed changes the whole waveform, not just its
+position. `set_theme()` (called from `_apply_theme()`, unchanged call
+site) now also re-tints the sky's horizon glow to match light/dark mode
+and the chosen accent, so a theme switch moves the background along with
+every panel instead of leaving it looking like a leftover from the
+previous theme.
+
+**Deliberately not done, twice over.** No bitmap, photo, or downloaded
+image of any kind backs this background -- consistent with every other
+visual asset in `jarvis/gui/` (`_Orb`, the quick-action dot/SVG icons, the
+chat bubbles) being code-drawn rather than sourced. And neither the
+reference photo's glowing helmet avatar nor its 8-card explainer grid was
+touched, revisited, or partially reintroduced anywhere in this pass --
+`_Orb` is exactly what the ninth pass left it, and the Home/Chat/Tasks/
+Files/Settings/Automations page set is unchanged.
+
+**Nothing about turn logic, the worker threads, the state machine,
+`_get_reply()`, the tasks query, the quick-action click handlers, the
+debug line, the title bar, the command palette, toasts, or the theme/
+accent toggle's own mechanism changed in this pass either.** Every edit is
+confined to `_build_home_page()`'s record-button construction, `icons.py`'s
+new `"mic"` entry, `theme.py`'s `QPushButton#record_button` rule, and a
+full rewrite of `_Background` (still driven by the same `_orb_timer` tick
+and the same `set_theme()` call site as before). `python3 -m py_compile`
+passed on every changed file
+(`jarvis/gui/main_window.py`/`jarvis/gui/icons.py`/`jarvis/gui/theme.py`);
+`tests/test_gui_shell.py`'s 53 tests still skip cleanly (no PySide6 in
+this sandbox) and needed no edits, since nothing here touches an object
+name, stored text, or behaviour any existing assertion depends on; the
+full suite's pre-existing 26-error Windows-only-module baseline is
+unchanged.
+
+**Not yet hand-tested live.** Verified only against `py_compile` and the
+mocked suite, in the same sandbox that cannot install PySide6. Needs a
+visual check specifically for: does the record button read clearly as a
+tappable microphone circle without its old label; does the night sky read
+as atmospheric and premium rather than busy or low-contrast; do the stars
+twinkle individually in place without any visible drift; does the horizon
+glow pick up the active accent colour and shift correctly on a theme/accent
+change; and does the overall Home page now feel like a cohesive, finished
+scene rather than a UI sitting on top of a separate backdrop.
+
 ## Normalization
 
 `text.normalize()` is what every phrase list, every pattern and every stored
