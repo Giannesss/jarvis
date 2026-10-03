@@ -2035,8 +2035,18 @@ to the fixed error line. `MicrophoneWiringTests` is updated alongside it —
 a spoken turn now also waits out the `_brain_thread` it triggers, and a new
 test pins the "thinking" half of the double-click guard.
 
-Not yet hand-tested live with a real brain call (Ollama or Claude) behind
-it — only against mocks, same caveat as step 3 before its own hand test.
+**Hand-tested live on 2026-10-03, with the Claude brain behind it.**
+`BRAIN_PROVIDER=claude` in this run's `.env`, so the real path exercised was
+skill-miss → `policy.is_frozen()` backstop → `brain.ask()` → the Anthropic
+API, not the Ollama fallback — a different branch from the one the
+microphone hand test above exercised (which never reached the brain at
+all). Spoken turn, real transcription, then
+`[timing] Claude response: 20.38s (in 1562 tok, out 18 tok)` on the
+terminal and a real reply appended to the transcript as `"Jarvis: …"` —
+confirming `_get_reply()`'s brain branch, `_BrainWorker`'s threading, and
+the audit row it logs all work end to end, not just against the mocks in
+`BrainWiringTests`. Step 4 part 2 is closed. Part 3 (`speaker.speak()`/TTS)
+is next: the reply still only appears in the transcript, silently.
 
 **Built in a sandbox that cannot run it, hand-tested on the real machine
 instead.** This sandbox cannot install PySide6 at all — `pypi.org`/
