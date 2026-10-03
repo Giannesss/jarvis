@@ -2822,6 +2822,116 @@ match the rest of the window instead of flashing light-themed; and does
 removing labels' background fix (or at least not visibly break) anything
 that happened to rely on it.
 
+### A fifth pass: message bubbles instead of a stacked list, and a fuller room
+
+Three more pieces of direct feedback after the fourth pass's depth fix, all
+in one message: the Chat page's transcript still read as a plain stacked
+list ("το ένα κάτω από το άλλο") when the user wanted something closer to a
+messaging app ("σαν το Instagram"); the background, while no longer flat,
+still wasn't the "aesthetic and premium" look the user's own reference photo
+suggested; and the window as a whole still felt too empty ("πάρα πολύ κενό")
+and needed to read as fuller ("γεμάτο").
+
+**Chat bubbles are painted by a delegate, not by changing what's stored.**
+`_ChatTranscriptList(QListWidget)` is a one-line subclass
+(`resizeEvent()` calls `doItemsLayout()`, since a word-wrapping delegate's
+`sizeHint()` depends on the viewport width and Qt doesn't recompute row
+sizes on its own when that width changes) and `_ChatBubbleDelegate
+(QStyledItemDelegate)` does the actual painting. The reason it's a delegate
+rather than, say, `setItemWidget()` or rewriting what gets appended to the
+list: every turn in this file still calls `transcript.addItem("Εσύ: ...")` /
+`"Jarvis: ..."` exactly as before, and `tests/test_gui_shell.py` has upwards
+of fifteen assertions across `MicrophoneWiringTests`/`BrainWiringTests`/
+`SpeechWiringTests`/`QuickActionWiringTests`/`DebugModeWiringTests` that
+check `transcript.item(n).text()` for that exact string. A delegate changes
+only how a row is *drawn*; the stored string, and therefore every one of
+those assertions, is untouched. `_bubble_kind(text)` reads the same prefix
+convention those call sites already use (`"Εσύ: "`, `"Jarvis: "`,
+`"[debug] "`) to decide which of three treatments a row gets, stripping the
+prefix for display the way a real chat app never shows you the word "Me:"
+in front of your own messages.
+
+- **User lines** are right-aligned, filled in the one accent colour
+  (`#0a84ff`) with white text — the single most saturated thing on the
+  page, same role the accent plays everywhere else in this file (sparingly,
+  on the one thing that is "yours" in the exchange).
+- **Jarvis lines** are left-aligned, filled in the `surface-raised` tone
+  with the window's ordinary light-grey text — visually quieter, the way a
+  received message sits next to a sent one.
+- **Debug lines** (`"[debug] ..."`) get no bubble at all: a small, centred,
+  italic, muted caption, because a bubble implies a turn in a conversation
+  and an audit-log line isn't one — it's a system aside, and the Instagram
+  reference itself treats those differently (a centred grey timestamp
+  between message groups, not a message).
+
+Bubble geometry (`_bubble_rect`) is shared between `paint()` and
+`sizeHint()` so the two can never disagree about how tall a wrapped row is:
+width is capped at `_MAX_BUBBLE_FRACTION` (0.68) of the viewport, same idea
+as every real messaging app leaving the other ~1/3 of the row as visual
+breathing room rather than letting a one-word reply stretch edge to edge;
+text wraps via `QFontMetrics.boundingRect()` with `Qt.TextFlag.TextWordWrap`
+(cast through `int()` on both operands before `|`-ing them — PySide6's
+`AlignmentFlag`/`TextFlag` are different enum types and a bare `|` between
+them doesn't do what it looks like it does); and the bubble itself is a
+`QPainterPath.addRoundedRect()` at `_RADIUS = 16`, close to the real
+Instagram/iMessage radius-to-bubble-height ratio rather than a generic "add
+some rounding" value.
+
+**The background gained a second, stronger layer: a top-centred radial
+wash instead of a flat linear gradient.** `QWidget#appBackground`'s rule
+changed from a two-stop top-to-bottom `qlineargradient` to a `qradialgradient`
+anchored at `cx:0.5, cy:0.0` (top-centre) with `radius:1.15`, three stops
+(`#12141b` near the top, through `#0d0e12`, down to `#08080a` at the
+corners) — the effect is a room that reads as lit from somewhere above
+centre rather than evenly flat-shaded top to bottom, which is closer to
+what a reference photo's "premium" look actually leans on: depth from an
+implied light source, not just a darker-to-lighter ramp. `QFrame#homeGlow`'s
+glow behind the orb was widened and strengthened alongside it
+(`radius: 0.75→0.85`, centre-stop alpha `0.07→0.10`, mid-stop alpha
+`0.02→0.035`) — partly because the orb itself grew (below) and the glow
+needed to cover more of the column it now dominates, partly because the
+fourth pass's glow read as too faint once sitting against the new, slightly
+richer background underneath it.
+
+**"Too empty" was answered with proportion and distribution, not with new
+widgets.** Three changes, none adding a single new element to the window:
+
+- `_Orb.setMinimumSize(240, 240)`, up from `200, 200` — the orb is the one
+  focal object on the Home page, and at 200px it left a visibly
+  disproportionate amount of dead space around itself in the center column.
+- `_build_home_page()`'s stretch ratio between the center column and the
+  sidebar column changed from `3:1` to `2:1` — the sidebar (System Status /
+  Quick Actions / Current Task) carries the only text-dense content on the
+  page, so narrowing the mostly-empty orb column in its favour makes both
+  halves feel intentionally sized rather than one cramped and one vast.
+- `_build_home_sidebar()`'s layout used to be three panels followed by one
+  trailing `addStretch(1)`, which pushed every bit of slack to the bottom
+  of the column and left the three panels bunched at the top with a long
+  empty run underneath them. It's now `addStretch(1)` before, between, and
+  after all three panels — the same total slack, spread evenly instead of
+  pooled in one place, so the column reads as deliberately spaced rather
+  than "filled from the top, empty at the bottom."
+
+**Nothing about turn logic, worker threads, the state machine, system
+monitoring, the tasks query, quick-action wiring, or the debug line changed
+in this pass** — same discipline as every pass before it: only
+`_build_chat_page()`, the two new classes it now uses, `_STYLESHEET`'s
+`#appBackground`/`#homeGlow` rules, `_Orb`'s minimum size, and the two
+`_build_home_*()` layout methods changed. `tests/test_gui_shell.py` needed
+no new tests and no edits — the delegate approach was chosen specifically
+so every existing `.item(n).text()` assertion keeps passing unchanged, and
+the suite still skips cleanly here (no PySide6 in this sandbox).
+
+**Not yet hand-tested live.** Verified only against `py_compile` and the
+mocked suite, same sandbox constraint as every pass before it. Needs a
+visual check specifically for: do the chat bubbles actually align left/right
+the way a messaging app's do, and does text wrap cleanly inside them at a
+few different window widths; does the new radial background read as
+premium ambient lighting rather than a visible ring or a muddier version of
+the flat gradient it replaced; and does the Home page now feel
+proportioned and full rather than sparse, without the bigger orb or the
+narrower sidebar column looking cramped against each other.
+
 ## Normalization
 
 `text.normalize()` is what every phrase list, every pattern and every stored

@@ -39,14 +39,23 @@ from enum import Enum, auto
 import psutil
 from PySide6.QtCore import (
     QEasingCurve,
+    QRect,
     QRectF,
+    QSize,
     QThread,
     QTimer,
     Qt,
     QVariantAnimation,
     Signal,
 )
-from PySide6.QtGui import QAction, QColor, QPainter, QRadialGradient
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QFontMetrics,
+    QPainter,
+    QPainterPath,
+    QRadialGradient,
+)
 from PySide6.QtWidgets import (
     QCheckBox,
     QFormLayout,
@@ -57,6 +66,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QPushButton,
     QStackedWidget,
+    QStyledItemDelegate,
     QVBoxLayout,
     QWidget,
 )
@@ -372,7 +382,7 @@ class _Orb(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setMinimumSize(200, 200)
+        self.setMinimumSize(240, 240)
         self._state = State.IDLE
         self._phase = 0.0
         self._color = QColor(_ORB_COLOR[State.IDLE])
@@ -468,6 +478,144 @@ class _Orb(QWidget):
             painter.drawRoundedRect(
                 QRectF(x, base_y - height / 2, bar_gap * 0.45, height), 2, 2
             )
+
+
+# Which sender a transcript line belongs to, and the text to actually show
+# inside its bubble -- every line still starts with the fixed "Εσύ: "/
+# "Jarvis: "/"[debug] " prefix every call site already writes (unchanged, on
+# purpose: tests/test_gui_shell.py asserts on QListWidgetItem.text() exactly,
+# and nothing here touches what's stored in the item -- only how
+# _ChatBubbleDelegate paints it). Kept as a free function so the delegate's
+# paint() and sizeHint() read the same classification rather than each
+# re-deriving it.
+def _bubble_kind(text: str) -> tuple[str, str]:
+    if text.startswith("Εσύ: "):
+        return "user", text[len("Εσύ: ") :]
+    if text.startswith("Jarvis: "):
+        return "jarvis", text[len("Jarvis: ") :]
+    if text.startswith("[debug] "):
+        return "debug", text
+    return "jarvis", text
+
+
+class _ChatBubbleDelegate(QStyledItemDelegate):
+    """Paints TRANSCRIPT_LIST's rows as chat bubbles -- the user's turns
+    right-aligned in the accent colour, Jarvis's left-aligned in a neutral
+    surface tone, the way every messaging app (Instagram DMs included) tells
+    two speakers apart, instead of one flat list of "Εσύ: .../Jarvis: ..."
+    rows stacked on top of each other.
+
+    Deliberately a delegate, not a per-row custom QWidget via
+    `QListWidget.setItemWidget()`: a delegate paints against
+    `QListWidgetItem.text()` and leaves the item's actual text untouched, so
+    every existing `transcript.item(n).text()` assertion in
+    `tests/test_gui_shell.py` keeps working unchanged -- this changes how a
+    line is drawn, never what is stored for it. A debug line ("[debug] ...")
+    gets neither alignment: it's metadata about the turn, not a turn in the
+    conversation, so it renders as a small muted centred caption with no
+    bubble at all, visually subordinate to the two speakers' bubbles."""
+
+    _MAX_BUBBLE_FRACTION = 0.68
+    _H_PADDING = 14
+    _V_PADDING = 10
+    _ROW_GAP = 10
+    _RADIUS = 16
+    _SIDE_MARGIN = 6
+
+    _COLORS = {
+        "user": (QColor("#0a84ff"), QColor("#ffffff")),
+        "jarvis": (QColor("#1c1c1f"), QColor("#f5f5f7")),
+    }
+
+    def _wrap_flags(self) -> int:
+        return int(Qt.AlignmentFlag.AlignLeft) | int(Qt.TextFlag.TextWordWrap)
+
+    def _bubble_rect(self, option, text: str) -> tuple[QRectF, str, str]:
+        """Returns the bubble's rect plus which side/kind it belongs to --
+        shared by paint() and sizeHint() so the two can never disagree about
+        how tall a row is."""
+        kind, content = _bubble_kind(text)
+        available = max(option.rect.width(), 1)
+        max_width = max(int(available * self._MAX_BUBBLE_FRACTION) - 2 * self._H_PADDING, 40)
+        fm = QFontMetrics(option.font)
+        bounds = fm.boundingRect(
+            QRect(0, 0, max_width, 0), self._wrap_flags(), content
+        )
+        bubble_w = min(bounds.width() + 2 * self._H_PADDING, available - 2 * self._SIDE_MARGIN)
+        bubble_h = bounds.height() + 2 * self._V_PADDING
+        if kind == "user":
+            x = option.rect.right() - bubble_w - self._SIDE_MARGIN
+        else:
+            x = option.rect.left() + self._SIDE_MARGIN
+        y = option.rect.top() + self._ROW_GAP / 2
+        return QRectF(x, y, bubble_w, bubble_h), kind, content
+
+    def sizeHint(self, option, index) -> QSize:  # noqa: N802 -- Qt's own name
+        text = index.data(Qt.ItemDataRole.DisplayRole) or ""
+        kind, content = _bubble_kind(text)
+        available = max(option.rect.width(), 1)
+        if kind == "debug":
+            fm = QFontMetrics(option.font)
+            bounds = fm.boundingRect(
+                QRect(0, 0, available - 2 * self._H_PADDING, 0),
+                self._wrap_flags(),
+                content,
+            )
+            return QSize(available, bounds.height() + self._ROW_GAP)
+        bubble_rect, _, _ = self._bubble_rect(option, text)
+        return QSize(available, int(bubble_rect.height() + self._ROW_GAP))
+
+    def paint(self, painter: QPainter, option, index) -> None:  # noqa: N802
+        text = index.data(Qt.ItemDataRole.DisplayRole) or ""
+        kind, content = _bubble_kind(text)
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        if kind == "debug":
+            painter.setPen(QColor(245, 245, 247, 110))
+            font = option.font
+            font.setPointSizeF(max(font.pointSizeF() - 1, 8))
+            font.setItalic(True)
+            painter.setFont(font)
+            text_rect = option.rect.adjusted(
+                self._H_PADDING, 2, -self._H_PADDING, -2
+            )
+            painter.drawText(
+                text_rect,
+                int(Qt.AlignmentFlag.AlignHCenter) | int(Qt.TextFlag.TextWordWrap),
+                content,
+            )
+            painter.restore()
+            return
+
+        bubble_rect, kind, content = self._bubble_rect(option, text)
+        fill, text_color = self._COLORS[kind]
+        path = QPainterPath()
+        path.addRoundedRect(bubble_rect, self._RADIUS, self._RADIUS)
+        painter.fillPath(path, fill)
+
+        painter.setPen(text_color)
+        painter.setFont(option.font)
+        text_rect = bubble_rect.adjusted(
+            self._H_PADDING, self._V_PADDING, -self._H_PADDING, -self._V_PADDING
+        )
+        painter.drawText(text_rect, self._wrap_flags(), content)
+        painter.restore()
+
+
+class _ChatTranscriptList(QListWidget):
+    """TRANSCRIPT_LIST's own class -- identical to a plain QListWidget
+    except that resizing it re-lays-out its rows. A word-wrapping delegate's
+    `sizeHint()` depends on the viewport's current width (how wide a bubble
+    is allowed to be before it wraps), but `QListView` doesn't recompute row
+    heights on its own just because the widget was resized -- without this,
+    resizing the window would leave old rows wrapped for the old width while
+    new rows use the new one. `doItemsLayout()` is the public method Qt
+    itself documents for forcing exactly that recomputation."""
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 -- Qt's own name
+        super().resizeEvent(event)
+        self.doItemsLayout()
 
 
 class MainWindow(QMainWindow):
@@ -823,7 +971,13 @@ class MainWindow(QMainWindow):
         center.addWidget(record_button, alignment=Qt.AlignmentFlag.AlignCenter)
         center.addStretch(1)
 
-        layout.addWidget(center_frame, stretch=3)
+        # 2:1 rather than the first pass's 3:1 -- that ratio left the side
+        # column narrow and the centre column mostly bare floor around a
+        # small orb, which is a lot of the "too empty" feedback. Widening the
+        # side panels gives the three cards real room instead of a cramped
+        # strip, and the orb itself grew (see _Orb.__init__) to fill more of
+        # what's left of the centre column.
+        layout.addWidget(center_frame, stretch=2)
         layout.addWidget(self._build_home_sidebar(), stretch=1)
 
         return page
@@ -834,8 +988,16 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 24, 24, 24)
         layout.setSpacing(16)
 
+        # A stretch before, between and after each panel -- not one lump at
+        # the bottom -- so the column's empty space is spread evenly across
+        # its full height instead of bunching the three cards at the top and
+        # leaving one dead zone below Current Task. The panels still size to
+        # their own content; only the leftover space moves.
+        layout.addStretch(1)
         layout.addWidget(self._build_monitoring_box())
+        layout.addStretch(1)
         layout.addWidget(self._build_quick_actions_box())
+        layout.addStretch(1)
         layout.addWidget(self._build_current_task_box())
         layout.addStretch(1)
 
@@ -953,8 +1115,23 @@ class MainWindow(QMainWindow):
         layout.setSpacing(12)
         layout.addWidget(_page_title("Συνομιλία"))
 
-        transcript_list = QListWidget()
+        # _ChatTranscriptList + _ChatBubbleDelegate turn the plain stacked
+        # list into left/right message bubbles (the user's turns in the
+        # accent colour on the right, Jarvis's in a neutral tone on the
+        # left) -- the delegate paints against each item's own text, so
+        # nothing about what gets stored in a row (see _on_listen_finished(),
+        # _on_reply_finished(), _append_debug_line(), the quick-action
+        # handlers) changes at all; only how it's drawn does.
+        transcript_list = _ChatTranscriptList()
         transcript_list.setObjectName(TRANSCRIPT_LIST)
+        transcript_list.setItemDelegate(_ChatBubbleDelegate(transcript_list))
+        transcript_list.setSelectionMode(
+            QListWidget.SelectionMode.NoSelection
+        )
+        transcript_list.setVerticalScrollMode(
+            QListWidget.ScrollMode.ScrollPerPixel
+        )
+        transcript_list.setSpacing(0)
         # Starts empty; a real turn appends to it (see _on_listen_finished).
         # Still nothing invented here -- every line it ever holds came back
         # from listener.listen(), not a placeholder this file wrote.
@@ -1244,21 +1421,25 @@ QWidget {
     font-size: 13px;
 }
 
-/* The window's own background -- a faint vertical gradient rather than one
-   flat fill, so the room has depth before any widget is even drawn. Applied
-   to one widget spanning the whole window (see _build_central_widget(),
-   which sets WA_StyledBackground -- a plain QWidget otherwise ignores a
+/* The window's own background -- a soft radial wash from upper-centre
+   rather than one flat fill or a plain top-to-bottom gradient, so the room
+   reads as lit from somewhere rather than just shaded. Applied to one
+   widget spanning the whole window (see _build_central_widget(), which
+   sets WA_StyledBackground -- a plain QWidget otherwise ignores a
    stylesheet background entirely), not to the blanket QWidget rule above:
    a gradient applied per-widget to every label and button in the window
    would tile independently behind each one rather than reading as one
    continuous surface. Everything above QWidget here is deliberately left
-   without its own background-color, so this gradient actually shows through
+   without its own background-color, so this wash actually shows through
    wherever nothing more specific (header/sidebar/panel/list/button) paints
-   over it. */
+   over it. A faint accent tint in the centre stop (not pure grey) ties the
+   whole canvas back to the one accent colour everything else spends so
+   sparingly, instead of the room and the UI feeling like two different
+   palettes. */
 QWidget#appBackground {
-    background-color: qlineargradient(
-        x1:0, y1:0, x2:0, y2:1,
-        stop:0 #0e0f13, stop:1 #09090b
+    background-color: qradialgradient(
+        cx:0.5, cy:0.0, radius:1.15, fx:0.5, fy:0.0,
+        stop:0 #12141b, stop:0.45 #0d0e12, stop:1 #08080a
     );
 }
 
@@ -1268,12 +1449,16 @@ QWidget#appBackground {
    roughly where the orb sits within its own column (cy a little above
    dead-centre, since the record button below it pulls the visual centre
    up); fades to fully transparent well before the panel below, so it never
-   collides with the System Status/Quick Actions boxes on the right. */
+   collides with the System Status/Quick Actions boxes on the right. Wider
+   and a touch stronger than the first version of this glow -- the orb grew
+   (see _Orb.__init__) and the centre column got more width to fill (see
+   _build_home_page's 2:1 split), so the glow needed more reach to still
+   read as the light source behind it rather than a halo tight to the ring. */
 QFrame#homeGlow {
     background-color: qradialgradient(
-        cx:0.5, cy:0.42, radius:0.75, fx:0.5, fy:0.42,
-        stop:0 rgba(10, 132, 255, 0.07),
-        stop:0.55 rgba(10, 132, 255, 0.02),
+        cx:0.5, cy:0.42, radius:0.85, fx:0.5, fy:0.42,
+        stop:0 rgba(10, 132, 255, 0.10),
+        stop:0.5 rgba(10, 132, 255, 0.035),
         stop:1 rgba(10, 132, 255, 0.0)
     );
 }
