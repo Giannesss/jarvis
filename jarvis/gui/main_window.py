@@ -150,6 +150,27 @@ def _format_rate(bytes_per_second: float) -> str:
     return f"{kb / 1024:.1f} MB/s"
 
 
+def _panel_title(text: str) -> QLabel:
+    """A small-caps, letter-spaced label for a panel's own heading (System
+    Status, Quick Actions, Current Task), visually distinct from the plain
+    body labels inside the panel -- styled via the `panelTitle` object name
+    in `_STYLESHEET` rather than repeating font/color calls at every call
+    site that builds one of these panels."""
+    label = QLabel(text)
+    label.setObjectName("panelTitle")
+    return label
+
+
+def _page_title(text: str) -> QLabel:
+    """A page's own headline label (Συνομιλία, Εργασίες, ...), styled via
+    the `pageTitle` object name -- larger and underlined with the accent
+    colour, so a page reads as having a real header rather than the same
+    plain QLabel every other piece of text on it uses."""
+    label = QLabel(text)
+    label.setObjectName("pageTitle")
+    return label
+
+
 def _render_agenda_item(kind: str, text: str) -> str:
     """Same phrasing `skills._handle_agenda` already speaks for «τι έχω
     σήμερα» -- an exam prefixed "εξέταση", a class "μάθημα", a reminder
@@ -716,7 +737,9 @@ class MainWindow(QMainWindow):
         box = QFrame()
         box.setObjectName("panel")
         layout = QVBoxLayout(box)
-        layout.addWidget(QLabel("System Status"))
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(8)
+        layout.addWidget(_panel_title("SYSTEM STATUS"))
 
         for object_name, placeholder in (
             (CPU_LABEL, "CPU: —"),
@@ -726,6 +749,7 @@ class MainWindow(QMainWindow):
         ):
             label = QLabel(placeholder)
             label.setObjectName(object_name)
+            label.setProperty("metric", True)
             layout.addWidget(label)
 
         # "—" is the construction-time placeholder only; _poll_system()
@@ -739,7 +763,9 @@ class MainWindow(QMainWindow):
         box = QFrame()
         box.setObjectName("panel")
         layout = QVBoxLayout(box)
-        layout.addWidget(QLabel("Quick Actions"))
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(8)
+        layout.addWidget(_panel_title("QUICK ACTIONS"))
 
         # One button per site/app Jarvis can already open by voice
         # (config.SKILL_SITES / SKILL_APPS) -- so the panel reflects what's
@@ -749,6 +775,7 @@ class MainWindow(QMainWindow):
         # _quick_action_site()/_quick_action_app() below.
         for label, url in SKILL_SITES.items():
             button = QPushButton(label)
+            button.setProperty("quickAction", True)
             button.clicked.connect(
                 lambda _checked=False, label=label, url=url: self._quick_action_site(
                     label, url
@@ -758,6 +785,7 @@ class MainWindow(QMainWindow):
 
         for label, argv in SKILL_APPS.items():
             button = QPushButton(label)
+            button.setProperty("quickAction", True)
             button.clicked.connect(
                 lambda _checked=False, label=label, argv=argv: self._quick_action_app(
                     label, argv
@@ -771,7 +799,9 @@ class MainWindow(QMainWindow):
         box = QFrame()
         box.setObjectName("panel")
         layout = QVBoxLayout(box)
-        layout.addWidget(QLabel("Current Task"))
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(8)
+        layout.addWidget(_panel_title("CURRENT TASK"))
 
         label = QLabel("Έτοιμος — περιμένω εντολή.")
         label.setObjectName(CURRENT_TASK_LABEL)
@@ -811,7 +841,9 @@ class MainWindow(QMainWindow):
     def _build_chat_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.addWidget(QLabel("Συνομιλία"))
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(12)
+        layout.addWidget(_page_title("Συνομιλία"))
 
         transcript_list = QListWidget()
         transcript_list.setObjectName(TRANSCRIPT_LIST)
@@ -827,7 +859,9 @@ class MainWindow(QMainWindow):
     def _build_tasks_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.addWidget(QLabel("Εργασίες"))
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(12)
+        layout.addWidget(_page_title("Εργασίες"))
 
         tasks_list = QListWidget()
         tasks_list.setObjectName(TASKS_LIST)
@@ -844,11 +878,14 @@ class MainWindow(QMainWindow):
     def _build_files_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.addWidget(QLabel("Αρχεία"))
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(12)
+        layout.addWidget(_page_title("Αρχεία"))
         placeholder = QLabel(
             "Η διαχείριση αρχείων (αναζήτηση, άνοιγμα, οργάνωση) είναι το "
             "Phase 7 του roadmap -- δεν έχει χτιστεί ακόμα."
         )
+        placeholder.setObjectName("mutedText")
         placeholder.setWordWrap(True)
         layout.addWidget(placeholder)
         layout.addStretch(1)
@@ -867,9 +904,18 @@ class MainWindow(QMainWindow):
         over a config that's only ever read at startup."""
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.addWidget(QLabel("Ρυθμίσεις"))
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(12)
+        layout.addWidget(_page_title("Ρυθμίσεις"))
+
+        form_box = QFrame()
+        form_box.setObjectName("panel")
+        form_box_layout = QVBoxLayout(form_box)
+        form_box_layout.setContentsMargins(18, 16, 18, 16)
 
         form = QFormLayout()
+        form.setHorizontalSpacing(24)
+        form.setVerticalSpacing(10)
         # Grouped the same way CLAUDE.md's own "Config"/"Providers" sections
         # are: brain, voice, wake word/conversation, logging -- a developer
         # reading this page and reading those docs sees the same shape.
@@ -891,8 +937,13 @@ class MainWindow(QMainWindow):
             ("Diagnostic log", "on" if config.LOG_ENABLED else "off"),
         ]
         for label, value in rows:
-            form.addRow(f"{label}:", QLabel(str(value)))
-        layout.addLayout(form)
+            key_label = QLabel(label)
+            key_label.setObjectName("settingKey")
+            value_label = QLabel(str(value))
+            value_label.setObjectName("settingValue")
+            form.addRow(key_label, value_label)
+        form_box_layout.addLayout(form)
+        layout.addWidget(form_box)
 
         # Checkable, and wired to something real: when checked, every
         # completed turn appends one extra transcript line showing the audit
@@ -1044,84 +1095,240 @@ def widget(window: MainWindow, object_name: str) -> QWidget:
 # it's one block rather than split across every _build_*() method.
 _STYLESHEET = """
 QMainWindow, QWidget {
-    background-color: #0b0f1a;
+    background-color: #090d16;
     color: #e6edf7;
     font-family: "Segoe UI", sans-serif;
+    font-size: 13px;
 }
+
+/* --- Header ----------------------------------------------------------- */
 QFrame#header {
-    background-color: #0f1524;
-    border-bottom: 1px solid #1e2740;
+    background-color: qlineargradient(
+        x1:0, y1:0, x2:1, y2:0,
+        stop:0 #0d1322, stop:1 #111a30
+    );
+    border-bottom: 1px solid #202c4a;
+    min-height: 64px;
+    max-height: 64px;
 }
 QLabel#brandTitle {
-    font-size: 20px;
-    font-weight: bold;
-    letter-spacing: 2px;
+    font-size: 21px;
+    font-weight: 700;
+    letter-spacing: 4px;
+    color: #ffffff;
 }
 QLabel#tagline {
-    color: #7a8aa8;
+    color: #5d7099;
     font-size: 11px;
+    letter-spacing: 1px;
+}
+QLabel#status_label {
+    font-size: 12px;
+    font-weight: 600;
+    color: #8fd6ff;
+    background-color: rgba(70, 170, 255, 0.12);
+    border: 1px solid rgba(70, 170, 255, 0.35);
+    border-radius: 11px;
+    padding: 4px 14px;
 }
 QLabel#clock_label {
-    font-size: 16px;
-    font-weight: bold;
+    font-size: 17px;
+    font-weight: 700;
+    color: #ffffff;
 }
 QLabel#date_label {
-    color: #7a8aa8;
+    color: #5d7099;
     font-size: 11px;
 }
+
+/* --- Sidebar ------------------------------------------------------------ */
 QFrame#sidebar {
-    background-color: #0f1524;
-    border-right: 1px solid #1e2740;
-    min-width: 160px;
-    max-width: 160px;
+    background-color: #0c1120;
+    border-right: 1px solid #1c2740;
+    min-width: 176px;
+    max-width: 176px;
 }
 QPushButton[navButton="true"] {
     text-align: left;
-    padding: 10px 14px;
+    padding: 11px 16px;
+    margin: 2px 10px;
     border: none;
-    border-radius: 6px;
+    border-radius: 8px;
     background-color: transparent;
-    color: #a9b6cc;
+    color: #8695b3;
+    font-weight: 600;
 }
 QPushButton[navButton="true"]:checked {
+    background-color: qlineargradient(
+        x1:0, y1:0, x2:1, y2:0,
+        stop:0 #1b4ed8, stop:1 #2f6fff
+    );
+    color: #ffffff;
+}
+QPushButton[navButton="true"]:hover:!checked {
+    background-color: #161f38;
+    color: #d6e2f7;
+}
+
+/* --- Panels (System Status / Quick Actions / Current Task / Settings) -- */
+QFrame#panel {
+    background-color: qlineargradient(
+        x1:0, y1:0, x2:0, y2:1,
+        stop:0 #141c30, stop:1 #101726
+    );
+    border: 1px solid #22304f;
+    border-left: 3px solid #3773ff;
+    border-radius: 12px;
+    margin: 7px;
+}
+QLabel#panelTitle {
+    color: #6f86b8;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 2px;
+    padding-bottom: 4px;
+    border-bottom: 1px solid #22304f;
+    margin-bottom: 4px;
+}
+QLabel[metric="true"] {
+    font-size: 13px;
+    font-weight: 600;
+    color: #d6e2f7;
+    padding: 2px 0;
+}
+QLabel#pageTitle {
+    font-size: 19px;
+    font-weight: 700;
+    color: #ffffff;
+    padding-bottom: 8px;
+    border-bottom: 2px solid #3773ff;
+}
+QLabel#mutedText {
+    color: #6f86b8;
+}
+QLabel#quote {
+    color: #5d7099;
+    font-style: italic;
+    font-size: 12px;
+    padding: 10px;
+}
+QLabel#current_task_label {
+    color: #e6edf7;
+    font-size: 13px;
+}
+QLabel#settingKey {
+    color: #6f86b8;
+    font-weight: 600;
+}
+QLabel#settingValue {
+    color: #e6edf7;
+    font-weight: 600;
+}
+
+/* --- Lists -------------------------------------------------------------- */
+QListWidget {
+    background-color: #0d1322;
+    border: 1px solid #1c2740;
+    border-radius: 10px;
+    padding: 6px;
+    outline: none;
+}
+QListWidget::item {
+    padding: 7px 8px;
+    border-radius: 6px;
+}
+QListWidget::item:selected {
     background-color: #1b2440;
     color: #ffffff;
 }
-QPushButton[navButton="true"]:hover {
-    background-color: #161e34;
+QScrollBar:vertical {
+    background: transparent;
+    width: 10px;
+    margin: 0;
 }
-QFrame#panel {
-    background-color: #111828;
-    border: 1px solid #1e2740;
-    border-radius: 10px;
-    padding: 6px;
-    margin: 6px;
+QScrollBar::handle:vertical {
+    background: #2a3658;
+    border-radius: 5px;
+    min-height: 24px;
 }
-QLabel#quote {
-    color: #7a8aa8;
-    font-style: italic;
-    padding: 8px;
+QScrollBar::handle:vertical:hover {
+    background: #3a4a78;
 }
-QListWidget {
-    background-color: #111828;
-    border: 1px solid #1e2740;
-    border-radius: 8px;
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    height: 0;
 }
+
+/* --- Buttons -------------------------------------------------------------- */
 QPushButton {
     background-color: #1b2440;
     border: 1px solid #2a3658;
-    border-radius: 6px;
-    padding: 6px 10px;
+    border-radius: 8px;
+    padding: 8px 14px;
     color: #e6edf7;
+    font-weight: 600;
 }
 QPushButton:hover {
     background-color: #243058;
+    border: 1px solid #3773ff;
+}
+QPushButton:pressed {
+    background-color: #182036;
 }
 QPushButton:disabled {
+    color: #475070;
+    border: 1px solid #1c2740;
+    background-color: #111728;
+}
+QPushButton[quickAction="true"] {
+    text-align: left;
+    padding: 9px 12px;
+}
+QPushButton#record_button {
+    background-color: qlineargradient(
+        x1:0, y1:0, x2:1, y2:0,
+        stop:0 #1b4ed8, stop:1 #3773ff
+    );
+    border: none;
+    border-radius: 22px;
+    padding: 12px 36px;
+    font-size: 14px;
+    font-weight: 700;
+    letter-spacing: 1px;
+    color: #ffffff;
+}
+QPushButton#record_button:hover {
+    background-color: qlineargradient(
+        x1:0, y1:0, x2:1, y2:0,
+        stop:0 #2457e0, stop:1 #4a82ff
+    );
+}
+QPushButton#record_button:disabled {
+    background-color: #182036;
     color: #566180;
 }
+
+/* --- Form (Settings page) ------------------------------------------------- */
+QCheckBox {
+    font-weight: 600;
+    spacing: 8px;
+    padding: 4px 0;
+}
+QCheckBox::indicator {
+    width: 16px;
+    height: 16px;
+    border: 1px solid #3a4a78;
+    border-radius: 4px;
+    background-color: #0d1322;
+}
+QCheckBox::indicator:checked {
+    background-color: #3773ff;
+    border: 1px solid #3773ff;
+}
+
+/* --- Status bar ------------------------------------------------------------ */
 QStatusBar {
-    background-color: #0f1524;
-    color: #7a8aa8;
+    background-color: #0c1120;
+    color: #5d7099;
+    border-top: 1px solid #1c2740;
 }
 """

@@ -2536,6 +2536,99 @@ Network reading alongside CPU/RAM/VRAM, the Current Task panel, and the
 Settings page's checkbox and values all need a visual hand test before this
 is closed out the way every other piece in this file has been.
 
+### A second pass: the panels and page headers weren't actually styled
+
+The first hand test on the user's machine came back with direct feedback:
+the dashboard still didn't look premium — specifically "the boxes." Reading
+the redesign's own first-pass stylesheet explains why: `_build_monitoring_box()`/
+`_build_quick_actions_box()`/`_build_current_task_box()` each put a plain,
+unstyled `QLabel("System Status")`-style heading inside a `QFrame#panel`, and
+`_STYLESHEET`'s `QFrame#panel` rule was a single flat background colour, one
+thin border and a fixed radius — competent, but exactly the "γραφικό" (plain)
+look the whole redesign was meant to replace, just in a darker palette. A
+panel with no visual weight on its own title and no accent of any kind reads
+as a grey box with text in it, premium or not.
+
+**Two helper functions, `_panel_title()` and `_page_title()`, replace the
+bare `QLabel(...)` calls** every panel and every page header used —
+`object_name="panelTitle"`/`"pageTitle"` respectively, so the stylesheet can
+target them without every call site repeating font/colour rules by hand.
+`_panel_title()` is small-caps-style (uppercase text supplied by the caller),
+letter-spaced, dim, and sits above a 1px divider — the same "section label"
+treatment a real dashboard widget library gives a card's own heading, instead
+of a heading that is visually identical to the data below it. `_page_title()`
+is the opposite register: large, white, bold, underlined in the accent blue —
+making Συνομιλία/Εργασίες/Αρχεία/Ρυθμίσεις read as actual page headers
+instead of the first line of body text.
+
+**`QFrame#panel` itself gained three things a flat box didn't have**: a
+top-to-bottom gradient background (`#141c30` → `#101726`) rather than one
+flat colour, a 3px accent-blue left border standing in for a card's "this is
+a distinct, important block" cue, and consistent internal margins
+(`setContentsMargins(16, 14, 16, 14)`, `setSpacing(8)` — previously these
+three `_build_*_box()` methods built a `QVBoxLayout()` with Qt's default
+margins and no explicit spacing at all, which is part of why they looked
+cramped rather than composed).
+
+**The CPU/RAM/VRAM/Network labels got a `metric` dynamic property**
+(`label.setProperty("metric", True)`) so `QLabel[metric="true"]` can give
+them real weight (bold, a brighter text colour) distinct from a plain label
+— those four numbers are the one thing a glance at the System Status panel
+is actually for, and they looked exactly as important as everything else
+around them before this.
+
+**Quick-action buttons got a `quickAction` property** too
+(`button.setProperty("quickAction", True)`), left-aligned and tighter-padded
+via `QPushButton[quickAction="true"]` — a row of buttons stacked in a narrow
+side panel reads better left-aligned than centred, which the generic
+`QPushButton` rule (centre-aligned by Qt's own default) didn't give them.
+
+**The record button is no longer just "a QPushButton that happens to say
+Εγγραφή."** `QPushButton#record_button` is its own rule: a blue gradient
+fill, a fully rounded pill shape (`border-radius: 22px` against its own
+padding), bigger text, letter-spacing — the one button on the whole app that
+actually starts a turn is now the one button that looks like the primary
+action, instead of matching every secondary button's flat grey.
+
+**The Settings page's rows gained their own identity too.** Previously each
+row was `form.addRow("Brain provider:", QLabel("claude"))` — a plain string
+label and a plain value label, both defaulting to the same colour and
+weight as literally every other piece of text in the window. `settingKey`/
+`settingValue` object names (and the whole form now sits inside its own
+`QFrame#panel`, not loose in the page layout) separate "what this setting is
+called" (dim, in the panel-title colour family) from "what it's currently
+set to" (bright, bold) — the same key/value visual hierarchy an actual
+settings screen has.
+
+**Lists, the status pill, the nav buttons and the scrollbar all got a second
+pass too**, each for the same reason: `QListWidget::item` now has its own
+padding and rounded selection highlight instead of Qt's flat default row
+style; `QLabel#status_label` (the header's "Κατάσταση: ..." text) is now a
+pill — a translucent blue background and border around the text, not bare
+text sitting in the header; the checked nav button is a blue gradient
+instead of a flat single-colour fill, matching the record button's register;
+and `QScrollBar` got a thin, rounded, dark-on-dark style, since Qt's
+platform-default scrollbar (a grey Windows-95-style slab) is the fastest way
+to make an otherwise-dark window look unfinished the moment a list grows
+past its visible height. None of this touched layout structure, object
+names anything else already depended on, or behaviour — `_set_state()`,
+the worker threads, `_poll_system()`, `_load_tasks()`, the quick-action
+click handlers and the debug line are all byte-for-byte what they were
+before this pass; only `_STYLESHEET` and the handful of `_build_*()` methods
+that build the panels/pages changed, which is why no test needed updating —
+`tests/test_gui_shell.py`'s 53 tests still assert on object names and
+behaviour, none of which moved, and all still skip cleanly in this sandbox
+(no PySide6).
+
+**Still not hand-tested live.** Built and verified the same way as the
+first pass — `py_compile` plus the mocked suite — in the same sandbox that
+cannot install PySide6. Needs the same kind of visual hand test as before,
+this time specifically on the panels: do the System Status/Quick Actions/
+Current Task boxes actually read as distinct cards now, does the left
+accent border show up against the dark background, does the record button
+read as the obvious primary action, and does the Settings page's key/value
+layout look like a settings screen rather than a column of identical labels.
+
 ## Normalization
 
 `text.normalize()` is what every phrase list, every pattern and every stored
