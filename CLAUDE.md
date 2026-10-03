@@ -2200,12 +2200,9 @@ split in two and a third added, mocking `_read_vram_percent()` wholesale
 rather than `pynvml` — the right level for pinning what `_poll_system()`
 does with a reading, as distinct from how that reading is produced.
 
-**Hand-tested live on 2026-10-03.** Not yet — built and unit-tested only in
-this round; the CPU/RAM reading above was confirmed live before this
-addition, but VRAM itself is new enough today that it hasn't had its own
-hand test yet. Worth a quick look once it's running: confirm the VRAM label
-shows a real percentage (not "μη διαθέσιμο", given the NVIDIA GPU present)
-and that it moves the way CPU/RAM already do.
+**Hand-tested live on 2026-10-03.** Confirmed on the real machine: the VRAM
+label read a real percentage, not "μη διαθέσιμο", against the user's NVIDIA
+GPU. Step 5 piece 2 (CPU, RAM and VRAM, all three live) is closed.
 
 **Built in a sandbox that cannot run it, hand-tested on the real machine
 instead.** This sandbox cannot install PySide6 at all — `pypi.org`/
