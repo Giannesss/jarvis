@@ -2319,11 +2319,12 @@ transcript line; an app button is enabled and calls `_open_app` with the
 configured argv; and a raised exception from either is caught and reported
 rather than propagating.
 
-Not yet hand-tested live — say which button opens which label is expected
-to open on the real machine next: click each quick-action button (YouTube,
-Gmail, Google, υπολογιστή, Notepad) and confirm the right site opens in the
-default browser / the right app launches, and that the transcript list
-shows the matching "Άνοιξα το …" line after each click.
+**Hand-tested live on 2026-10-03.** Confirmed on the real machine: every
+quick-action button (YouTube, Gmail, Google, υπολογιστή, Notepad) opens the
+right site or launches the right app, with the matching "Jarvis: Άνοιξα
+το …" line appearing in the transcript. Step 5 piece 4 (quick actions) is
+closed. Only piece 5 — settings/debug mode — remains before Phase 6 step 5
+as a whole is done.
 
 ## Normalization
 
