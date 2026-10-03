@@ -47,7 +47,7 @@ logic; the microphone/brain/TTS wired in one at a time, testing after each;
 then the state machine, real system monitoring, tasks, quick actions and
 settings/debug mode, in that order, never all at once.
 
-**Steps 1-3 are done.** The audit: everything under `jarvis/` outside
+**Steps 1-4 are done; step 5 is next.** The audit: everything under `jarvis/` outside
 `main.py` itself — `listener.py`, `brain.py`, `speaker.py`/`player.py`,
 `skills.py`, `policy.py`, `memory.py`, `scheduler.py`, `db.py`, `diag.py` —
 is already decoupled from the CLI (no `print()`s baked into the logic, no
@@ -2075,8 +2075,21 @@ would otherwise now fire from the reply they produce) and to wait out
 `test_a_click_while_speaking_is_ignored` pinning the third leg of the
 double-click guard.
 
-Not yet hand-tested live — built and unit-tested against mocks only, same
-caveat part 2 carried until its own hand test closed it.
+**Hand-tested live on 2026-10-03, voice and grounding both confirmed in one
+conversation.** Three turns through the real GUI, heard out loud and read in
+the transcript: a wake-style greeting answered naturally; asked what stage of
+its own construction it was in, it said it doesn't know much about its own
+technical details or how it's built — a flat refusal rather than an invented
+answer, exactly the subject-not-confidence line "Grounding" draws, now
+confirmed through the GUI's `_SpeakWorker` path and not just the CLI's; asked
+how old the user is, it said it doesn't know that either — nothing in the
+recalled memory block to answer from, and no guess offered in its place.
+Confirms `_SpeakWorker` actually plays Edge/Piper audio end to end (not just
+calling `speaker.speak()` without error, which the mocks already covered),
+and that a GUI turn behaves the same as a CLI one on the one thing that
+matters most for a voice assistant: refusing to make things up. Step 4 part 3
+is closed, and Phase 6 step 4 as a whole — microphone, brain, voice, all
+three wired in and hand-tested one at a time — is done.
 
 **Built in a sandbox that cannot run it, hand-tested on the real machine
 instead.** This sandbox cannot install PySide6 at all — `pypi.org`/
