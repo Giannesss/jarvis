@@ -59,6 +59,7 @@ from PySide6.QtGui import (
     QFontMetrics,
     QIcon,
     QKeySequence,
+    QLinearGradient,
     QPainter,
     QPainterPath,
     QPen,
@@ -641,62 +642,135 @@ class _Orb(QWidget):
 
 
 class _Background(QWidget):
-    """The window's own canvas -- since the tenth pass, a quiet procedural
-    night-sky-over-mountains scene instead of the ninth pass's flat
-    gradient-plus-particles wash, per a reference photo the user supplied:
-    a dark, hazy mountain silhouette under a star-lit sky. Nothing here is
-    a copy of that photo, or any photo -- there is no image asset in this
-    repo and no network fetch to get one (the same discipline every other
-    original visual in this file follows, from `_Orb` to `icons.py`): the
-    sky is a plain vertical gradient, the two mountain layers are
-    deterministic silhouettes built from a handful of summed sine waves
-    (`_ridge_path()`), and the stars are a fixed set of points that only
-    ever twinkle in place, never drift. The effect is "the mood of that
-    photo", painted from scratch.
+    """The window's own canvas -- an eleventh-pass rewrite of the tenth
+    pass's night-sky-over-mountains scene, after direct feedback that the
+    first version ("too childish") read as a flat cartoon rather than the
+    moody, photographic mountain landscape the user's reference photo
+    actually shows. Nothing here is a copy of that photo, or any photo --
+    there is still no image asset in this repo and no network fetch to get
+    one (the same discipline every other original visual in this file
+    follows, from `_Orb` to `icons.py`); what changed is how convincingly
+    the procedural shapes read as a real place rather than a vector
+    illustration of one.
 
-    Four layers, back to front: a dark sky gradient, a soft horizon glow
-    (tinted by the active accent colour, so "Χρώμα έμφασης" in Settings
-    still has a real effect on the window's single largest surface), two
-    mountain silhouettes at different depths/darkness, and a field of
-    faint, individually twinkling stars.
+    Three things make the difference, in order of how much they matter:
+
+    1. **The ridgelines are no longer clean sine waves.** A pure sum of 2-3
+       sine harmonics (the tenth pass's `_ridge_path`) repeats with visible
+       periodicity and has no fine detail -- it reads as a wavy line, not a
+       mountain. `_hash_noise()` is a deterministic "sin-hash" (classic
+       shader trick: `frac(sin(x) * big_number)`) layered on top of the
+       broad sine shape at a much finer scale, breaking the silhouette into
+       small, irregular, non-repeating jags the way a real skyline never
+       lines up into a clean period. No `random` module is used anywhere --
+       the jaggedness is exactly as reproducible as the tenth pass's sine
+       waves were, just no longer visibly made of them.
+    2. **Three depth layers with real atmospheric perspective, not two flat
+       silhouettes.** A real hazy mountain photo's far ridge is desaturated
+       and blued toward the sky colour (haze scatters blue light), and gets
+       almost no fine detail (haze smooths out texture at a distance); the
+       near ridge is darkest, most saturated toward black, and carries the
+       most jagged detail. `_LAYERS` encodes exactly that gradient -- each
+       layer's own colour is already most of the way mixed toward the sky,
+       and `jaggedness` shrinks with distance -- rather than three ridges
+       that only differ in how dark they are.
+    3. **A soft haze band sits across the lower third of the frame**,
+       painted after the mountains, blending their silhouettes into the
+       sky right at the horizon the way real atmospheric haze does --
+       without it, even a well-shaped mountain silhouette reads as a flat
+       cutout pasted in front of a gradient, because real air is never
+       perfectly transparent down to a hard horizon line.
+
+    A small, soft moon (or a pale sun-disc in light mode) replaces the
+    tenth pass's accent-tinted glow sitting centred in the sky for no
+    reason -- a single real light source the rest of the scene can be read
+    as being lit by, rather than an ambient wash. The accent colour still
+    shows through, now as a faint warm/cool tint low in the haze band
+    (the way a city's light pollution or a coloured accent wash would
+    actually tint a horizon), so "Χρώμα έμφασης" in Settings still visibly
+    affects this canvas.
+
+    Stars are more numerous and far less uniform: a wide spread of sizes
+    weighted toward many small, dim points and a few brighter ones (a real
+    sky has far more faint stars than bright ones), and each twinkles on
+    its own independent phase exactly as the tenth pass's did -- stars
+    still never drift, since real ones don't.
+
+    **The ridge paths are cached, not recomputed every 60ms tick.** The
+    tenth pass rebuilt its (simpler) ridge paths from scratch on every
+    `paintEvent`, which was cheap enough at that detail level to not
+    matter; multi-octave noise at the detail level this pass needs is not
+    free to recompute 16+ times a second for shapes that never move once
+    the window is a given size. `_rebuild_ridges()` runs once per actual
+    size change (tracked by `_ridge_size`, checked at the top of
+    `paintEvent`) and the three cached `QPainterPath`s are reused on every
+    other tick -- the terrain is static; only the stars' twinkle and the
+    moon's faint shimmer actually need to redraw each frame.
 
     Every child widget (header, sidebar, pages) is still added via the
     ordinary QVBoxLayout in _build_central_widget() -- Qt paints children
     after their parent in the same cycle, so nothing about how the rest of
-    the window is built changes; this replaces only how the canvas itself
-    is drawn.
+    the window is built changes; this still replaces only how the canvas
+    itself is drawn.
 
-    tick() is driven by MainWindow's existing _orb_timer rather than a
-    timer of its own -- one more QTimer purely to nudge star twinkle
-    doesn't earn its own object when one is already ticking at the right
-    cadence for "smooth but not attention-seeking" motion."""
+    tick() is still driven by MainWindow's existing _orb_timer rather than
+    a timer of its own, for the same reason the tenth pass gave: one more
+    QTimer purely to nudge star twinkle doesn't earn its own object when
+    one is already ticking at the right cadence."""
 
-    _STAR_COUNT = 90
+    _STAR_COUNT = 160
+
+    # (base_y_frac relative to the horizon, amplitude_frac of height,
+    # seed, jaggedness 0-1, haze_mix 0-1 toward the sky colour) -- far to
+    # near. haze_mix is what gives atmospheric perspective: the far layer
+    # is mixed heavily toward the sky colour (desaturated, bluish), the
+    # near layer almost not at all (reads as near-black, full contrast).
+    _LAYERS = (
+        (0.90, 0.075, 1.3, 0.15, 0.55),
+        (0.97, 0.095, 3.6, 0.45, 0.28),
+        (1.05, 0.11, 6.4, 1.0, 0.0),
+    )
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._phase = 0.0
         self._mode = "dark"
         self._accent = QColor(theme.ACCENTS["blue"])
-        # Each star is (x_frac, y_frac, size, twinkle_seed, twinkle_speed) --
-        # fixed at construction (a plain, seeded pattern, not re-rolled every
-        # resize) so the sky doesn't visibly "reshuffle" the first time the
-        # window changes size.
-        self._stars = [
-            (
-                (i * 0.6180339887 + i * i * 0.013) % 1.0,
-                ((i * 0.3312469 + 0.05) % 0.62),
-                1.0 + (i % 3) * 0.5,
-                i * 11.7,
-                0.02 + (i % 5) * 0.01,
+        # Each star is (x_frac, y_frac, size, twinkle_seed, twinkle_speed,
+        # brightness_tier) -- fixed at construction (a plain, seeded
+        # pattern, not re-rolled every resize) so the sky doesn't visibly
+        # "reshuffle" the first time the window changes size. The sixth
+        # element skews the field toward many small, dim stars and only a
+        # few bright ones, the way a real sky actually looks -- the tenth
+        # pass gave every star the same handful of sizes with no such
+        # weighting, which is part of why it read as a flat pattern.
+        self._stars = []
+        for i in range(self._STAR_COUNT):
+            tier_roll = (i * 0.1546 + i * i * 0.0021) % 1.0
+            if tier_roll > 0.93:
+                size, brightness = 2.0, 1.0
+            elif tier_roll > 0.72:
+                size, brightness = 1.4, 0.7
+            else:
+                size, brightness = 0.9, 0.4
+            self._stars.append(
+                (
+                    (i * 0.6180339887 + i * i * 0.013) % 1.0,
+                    ((i * 0.3312469 + 0.05) % 0.60),
+                    size,
+                    i * 11.7,
+                    0.015 + (i % 5) * 0.008,
+                    brightness,
+                )
             )
-            for i in range(self._STAR_COUNT)
-        ]
+        self._ridge_size: tuple[int, int] | None = None
+        self._ridge_paths: list[QPainterPath] = []
 
     def set_theme(self, mode: str, accent_hex: str) -> None:
-        """Ties the horizon glow to the active theme/accent -- the canvas's
-        own colour now comes from theme.py the same way every QSS rule in
-        the stylesheet does, rather than a literal baked into this class."""
+        """Ties the horizon haze tint to the active theme/accent -- the
+        canvas's own colour now comes from theme.py the same way every QSS
+        rule in the stylesheet does, rather than a literal baked into this
+        class."""
         self._mode = mode
         self._accent = QColor(accent_hex)
         self.update()
@@ -713,28 +787,58 @@ class _Background(QWidget):
         self._phase += 1.0
         self.update()
 
+    def resizeEvent(self, event) -> None:  # noqa: N802 -- Qt's own name
+        super().resizeEvent(event)
+        # Invalidate the cached ridge paths rather than rebuild them here --
+        # a resize can fire several times in a row while a window is being
+        # dragged, and paintEvent only needs the final size, not every
+        # intermediate one.
+        self._ridge_size = None
+
     @staticmethod
-    def _ridge_path(w: int, h: int, base_y: float, amplitude: float, seed: float) -> QPainterPath:
-        """A deterministic jagged silhouette, not a real heightmap -- three
-        summed sine harmonics at different frequencies/phases (keyed off
-        `seed`, so two calls with different seeds never look like the same
-        ridge shifted sideways) give a mountain-range-like outline cheaply,
-        with no image data and nothing randomised between repaints."""
+    def _hash_noise(x: float, seed: float) -> float:
+        """A deterministic pseudo-random value in [-1, 1] from `x` and
+        `seed` -- the classic shader "sin-hash" (`frac(sin(x) * k)`), with
+        no `random` module and no state: the same `x`/`seed` always
+        produces the same value, so a layer's fine jagged detail is exactly
+        as reproducible as the tenth pass's clean sine waves were, just no
+        longer visibly periodic the way a plain sine sum is."""
+        v = math.sin(x * 127.1 + seed * 311.7) * 43758.5453
+        return 2.0 * (v - math.floor(v)) - 1.0
+
+    def _ridge_path(
+        self, w: int, h: int, base_y: float, amplitude: float, seed: float, jaggedness: float
+    ) -> QPainterPath:
+        """A broad, slow silhouette (three summed sine harmonics, same idea
+        as the tenth pass) with a finer, non-periodic jagged layer added on
+        top via `_hash_noise()`, scaled by `jaggedness` -- 0 gives back
+        something close to the tenth pass's smooth wave (used for the
+        haziest, farthest layer), 1 gives the near layer its full jagged,
+        rocky-skyline detail."""
         path = QPainterPath()
         path.moveTo(0, h)
-        steps = 48
+        steps = 96
         for i in range(steps + 1):
             x = w * i / steps
             t = i / steps
             y = base_y + amplitude * (
-                math.sin(t * 6.1 + seed) * 0.5
-                + math.sin(t * 13.7 + seed * 2.1) * 0.3
-                + math.sin(t * 27.3 + seed * 0.6) * 0.2
+                math.sin(t * 4.3 + seed) * 0.46
+                + math.sin(t * 9.1 + seed * 1.7) * 0.26
+                + math.sin(t * 17.3 + seed * 2.9) * 0.14
             )
+            y += amplitude * jaggedness * 0.16 * self._hash_noise(t * 26.0, seed)
+            y += amplitude * jaggedness * 0.07 * self._hash_noise(t * 71.0, seed * 1.9)
             path.lineTo(x, y)
         path.lineTo(w, h)
         path.closeSubpath()
         return path
+
+    def _rebuild_ridges(self, w: int, h: int, horizon: float) -> None:
+        self._ridge_paths = [
+            self._ridge_path(w, h, horizon * base_y, h * amp, seed, jag)
+            for base_y, amp, seed, jag, _haze in self._LAYERS
+        ]
+        self._ridge_size = (w, h)
 
     def paintEvent(self, event) -> None:  # noqa: N802 -- Qt's own name
         painter = QPainter(self)
@@ -744,56 +848,92 @@ class _Background(QWidget):
 
         if self._mode == "light":
             sky_top, sky_mid, sky_horizon = (
-                QColor(214, 222, 232),
-                QColor(196, 206, 220),
-                QColor(222, 212, 206),
+                QColor(198, 210, 224),
+                QColor(188, 200, 216),
+                QColor(224, 214, 206),
             )
-            far_ridge = QColor(150, 160, 178)
-            near_ridge = QColor(96, 104, 120)
+            ridge_base = QColor(58, 64, 76)
+            haze_color = QColor(210, 206, 204)
+            moon_color = QColor(255, 250, 240)
             star_color = QColor(90, 100, 120)
-            star_max_alpha = 30
+            star_max_alpha = 26
         else:
             sky_top, sky_mid, sky_horizon = (
-                QColor(7, 9, 14),
-                QColor(11, 14, 22),
-                QColor(18, 23, 34),
+                QColor(5, 6, 10),
+                QColor(9, 12, 19),
+                QColor(16, 20, 30),
             )
-            far_ridge = QColor(28, 35, 50)
-            near_ridge = QColor(11, 13, 18)
+            ridge_base = QColor(7, 8, 11)
+            haze_color = QColor(32, 38, 52)
+            moon_color = QColor(232, 236, 245)
             star_color = QColor(235, 240, 255)
-            star_max_alpha = 170
+            star_max_alpha = 190
 
-        # The sky: a plain vertical gradient, darkest at the top, lifting
-        # slightly toward the horizon -- then a soft accent-tinted glow
-        # sitting low in the frame, the way moonlight or a city's glow
-        # would wash the sky near a real horizon. This is the one place
-        # the chosen accent colour still shows through on the canvas.
-        sky = QRadialGradient(w * 0.5, horizon, max(w, h) * 0.9)
-        sky.setColorAt(0.0, self._mix(sky_horizon, self._accent, 0.10))
-        sky.setColorAt(0.45, sky_mid)
-        sky.setColorAt(1.0, sky_top)
-        painter.fillRect(self.rect(), sky)
+        if self._ridge_size != (w, h):
+            self._rebuild_ridges(w, h, horizon)
+
+        # The sky: a vertical gradient, darkest at the zenith, lifting
+        # toward the horizon -- no accent tint here anymore (the tenth
+        # pass's centred accent-coloured glow read as a stage light, not a
+        # sky); the accent now only tints the haze band low in the frame,
+        # the way a real light source would actually colour the air near
+        # it rather than the whole dome of sky.
+        sky = QLinearGradient(0, 0, 0, horizon * 1.08)
+        sky.setColorAt(0.0, sky_top)
+        sky.setColorAt(0.55, sky_mid)
+        sky.setColorAt(1.0, sky_horizon)
+        painter.fillRect(QRectF(0, 0, w, horizon * 1.08), sky)
+        painter.fillRect(QRectF(0, horizon * 1.08, w, h - horizon * 1.08), sky_horizon)
+
+        # A small, soft moon -- one real light source the rest of the
+        # scene reads as lit by, rather than the tenth pass's ambient
+        # centred glow. Off-centre and high, the way a moon actually sits
+        # rather than hovering dead-centre over the horizon.
+        moon_x, moon_y, moon_r = w * 0.74, horizon * 0.22, min(w, h) * 0.028
+        moon_glow = QRadialGradient(moon_x, moon_y, moon_r * 7)
+        moon_glow.setColorAt(0.0, QColor(moon_color.red(), moon_color.green(), moon_color.blue(), 46))
+        moon_glow.setColorAt(1.0, QColor(moon_color.red(), moon_color.green(), moon_color.blue(), 0))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(moon_glow)
+        painter.drawEllipse(QRectF(moon_x - moon_r * 7, moon_y - moon_r * 7, moon_r * 14, moon_r * 14))
+        painter.setBrush(moon_color)
+        painter.drawEllipse(QRectF(moon_x - moon_r, moon_y - moon_r, moon_r * 2, moon_r * 2))
 
         # Stars: fixed positions, each twinkling independently and slowly
-        # on its own phase -- never drifting, since real stars don't.
+        # on its own phase -- never drifting, since real stars don't. Most
+        # are small and dim; a few are brighter, per the brightness tier
+        # baked in at construction.
         painter.setPen(Qt.PenStyle.NoPen)
-        for x_frac, y_frac, size, seed, speed in self._stars:
+        for x_frac, y_frac, size, seed, speed, brightness in self._stars:
             twinkle = (math.sin(self._phase * speed + seed) + 1) / 2
-            alpha = int(star_max_alpha * (0.35 + 0.65 * twinkle))
+            alpha = int(star_max_alpha * brightness * (0.35 + 0.65 * twinkle))
             painter.setBrush(
                 QColor(star_color.red(), star_color.green(), star_color.blue(), alpha)
             )
             painter.drawEllipse(QRectF(x_frac * w, y_frac * horizon, size, size))
 
-        # Two mountain layers -- a lighter, bluer far ridge and a darker,
-        # nearly-black near one, the same depth cue a real landscape photo
-        # gets from haze. Static shapes (no animation), cheap to repaint
-        # every tick since each is ~50 line segments.
+        # The mountain layers, far to near -- each already mixed toward the
+        # sky colour per its own haze_mix, which is what gives atmospheric
+        # perspective instead of three ridges that only differ in flat
+        # darkness.
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(far_ridge)
-        painter.drawPath(self._ridge_path(w, h, horizon * 0.94, h * 0.05, 1.3))
-        painter.setBrush(near_ridge)
-        painter.drawPath(self._ridge_path(w, h, horizon * 1.03, h * 0.065, 4.7))
+        for (_, _, _, _, haze_mix), path in zip(self._LAYERS, self._ridge_paths):
+            painter.setBrush(self._mix(ridge_base, sky_mid, haze_mix))
+            painter.drawPath(path)
+
+        # A soft haze band across the lower frame, blending the nearest
+        # ridge's base into the sky colour the way real atmospheric haze
+        # softens a horizon rather than cutting it with a hard edge --
+        # tinted faintly by the active accent low in the band, which is
+        # this canvas's one remaining nod to "Χρώμα έμφασης" actually
+        # doing something visible.
+        haze_top = horizon * 0.80
+        haze = QLinearGradient(0, haze_top, 0, h)
+        tinted_haze = self._mix(haze_color, self._accent, 0.22)
+        haze.setColorAt(0.0, QColor(tinted_haze.red(), tinted_haze.green(), tinted_haze.blue(), 0))
+        haze.setColorAt(0.65, QColor(tinted_haze.red(), tinted_haze.green(), tinted_haze.blue(), 60))
+        haze.setColorAt(1.0, QColor(tinted_haze.red(), tinted_haze.green(), tinted_haze.blue(), 95))
+        painter.fillRect(QRectF(0, haze_top, w, h - haze_top), haze)
 
 
 def _parse_rgba(value: str) -> QColor:

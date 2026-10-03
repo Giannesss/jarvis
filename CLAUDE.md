@@ -3685,6 +3685,95 @@ glow pick up the active accent colour and shift correctly on a theme/accent
 change; and does the overall Home page now feel like a cohesive, finished
 scene rather than a UI sitting on top of a separate backdrop.
 
+### An eleventh pass: from a flat cartoon to atmospheric perspective
+
+The tenth pass's night sky shipped, and the very next word back was "too
+childish" -- a fair read of what it actually was: two clean-sine-wave
+silhouettes of the same flat darkness, a centred glow sitting over the
+horizon like a stage light, and a uniform scatter of same-sized stars. That
+reads as a vector illustration of mountains, not a photograph of them, and
+closing that gap needed more than tuning the existing shapes -- it needed
+the few specific tricks that make a procedural landscape read as real.
+
+**The ridgelines are no longer made of visible sine waves.** A pure sum of
+2-3 harmonics repeats with an obvious period and has no fine detail at any
+zoom level -- the tell that gave away "this is a formula, not a mountain."
+`_Background._hash_noise(x, seed)` is the classic shader "sin-hash"
+(`frac(sin(x) * big_constant)`), a deterministic pseudo-random value with
+no `random` module and no state, layered on top of the broad sine shape at
+two finer scales inside `_ridge_path()`. The result is irregular and
+non-repeating, the way a real skyline is, while staying exactly as
+reproducible as the tenth pass's clean waves were -- the same `x`/`seed`
+always gives the same jag.
+
+**Three depth layers with real atmospheric perspective, not two layers
+that only differ in flatness.** `_LAYERS` is now a table of (position,
+amplitude, seed, jaggedness, haze_mix) tuples: the far layer is heavily
+mixed toward the sky's own colour (`haze_mix=0.55`) and almost smooth
+(`jaggedness=0.15`) -- real haze scatters light and erases fine detail at a
+distance -- while the near layer is barely mixed at all (`haze_mix=0.0`,
+reading as near-black) and fully jagged (`jaggedness=1.0`). A mid layer
+sits between both. This single `haze_mix` number is what a real hazy
+mountain photo's depth cue actually is, and the tenth pass had no
+equivalent of it at all.
+
+**A soft haze band across the lower third of the frame**, painted after
+the mountains, blends their bases into the sky rather than cutting them
+off at a hard horizon line -- the single biggest reason a procedural
+landscape reads as "pasted in front of a gradient" is a mountain silhouette
+with a perfectly crisp edge, which real air never produces. The band is
+also where the active accent colour now shows up (`self._mix(haze_color,
+self._accent, 0.22)`, applied only to the band's own tint) -- a specific,
+physically-motivated place for the accent to tint the scene (light
+pollution or a coloured source tinting the air near the ground), replacing
+the tenth pass's centred glow that tinted the whole sky dome for no
+reason tied to how real light actually behaves.
+
+**A small, soft moon replaces the centred ambient glow.** One real light
+source, off-centre and high in the frame the way a moon or sun actually
+sits (`moon_x = w * 0.74`, `moon_y = horizon * 0.22`), rather than a
+radial wash centred on the horizon -- the rest of the scene now reads as
+lit by something specific instead of uniformly glowing.
+
+**Stars are weighted toward many dim points and a few bright ones**,
+instead of the tenth pass's few uniform sizes -- a deterministic tier roll
+at construction (`tier_roll = (i * 0.1546 + i*i*0.0021) % 1.0`) assigns
+each of the (now 160, up from 90) stars one of three size/brightness
+pairs, skewed so only ~7% are the brightest tier. A real sky has far more
+faint stars than bright ones; a uniform field is itself part of what reads
+as artificial.
+
+**Ridge paths are cached, not rebuilt on every 60ms tick.** Multi-octave
+noise at this detail level (96 steps x 3 layers x 2 noise octaves each) is
+not free to recompute 16+ times a second for a shape that never actually
+moves once the window has a given size -- `_rebuild_ridges()` now runs
+once per real size change (`resizeEvent()` clears `self._ridge_size`,
+`paintEvent()` rebuilds only when it doesn't match the current `(w, h)`),
+and the three cached `QPainterPath`s are reused on every other tick, which
+is also what keeps this pass inside the project's standing "keep CPU low"
+discipline despite the extra detail.
+
+**Nothing about layout, object names, or any other widget's behaviour
+changed.** Every edit is confined to `_Background` itself (fully rewritten)
+and one added import (`QLinearGradient`, alongside the `QRadialGradient`
+already there for the moon's glow and the orb). `python3 -m py_compile`
+passed; `tests/test_gui_shell.py`'s 53 tests still skip cleanly (no
+PySide6 in this sandbox) and needed no edits, since nothing here touches an
+object name or any assertion the suite makes; the full suite's pre-existing
+26-error baseline is unchanged.
+
+**Not yet hand-tested live.** Verified only against `py_compile` and the
+mocked suite, in the same sandbox that cannot install PySide6. Needs a
+visual check specifically for: do the mountain silhouettes now read as
+jagged, natural terrain rather than a smooth wavy line; does the far ridge
+actually look hazier/bluer/softer than the near one, giving a real sense
+of depth; does the haze band blend the mountains into the sky without a
+visible hard seam; does the moon read as a believable soft light source
+rather than another glowing orb; do the stars' mixed sizes read as a more
+natural sky than the previous uniform scatter; and does the whole scene
+now feel like "the mood of that photo" rather than a flat cartoon version
+of it.
+
 ## Normalization
 
 `text.normalize()` is what every phrase list, every pattern and every stored
