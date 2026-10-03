@@ -17,6 +17,7 @@ at import time, not inside a test method.
 from __future__ import annotations
 
 import os
+import sys
 import unittest
 from unittest import mock
 
@@ -25,6 +26,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 try:
     from PySide6.QtWidgets import QApplication
 
+    from jarvis.gui import main_window as _main_window_module
     from jarvis.gui.main_window import (
         CPU_LABEL,
         DEBUG_ACTION,
@@ -34,6 +36,7 @@ try:
         STATUS_LABEL,
         TASKS_LIST,
         TRANSCRIPT_LIST,
+        VRAM_LABEL,
         MainWindow,
         State,
         widget,
@@ -455,7 +458,7 @@ class MonitoringTests(unittest.TestCase):
         self.assertTrue(window._monitor_timer.isActive())
         self.assertEqual(window._monitor_timer.interval(), MONITOR_POLL_MS)
 
-    def test_poll_system_fills_in_both_labels_from_psutil(self) -> None:
+    def test_poll_system_fills_in_cpu_and_ram_from_psutil(self) -> None:
         window = MainWindow()
         memory_reading = mock.Mock(percent=42.0)
         with mock.patch(
@@ -463,16 +466,141 @@ class MonitoringTests(unittest.TestCase):
         ), mock.patch(
             "jarvis.gui.main_window.psutil.virtual_memory",
             return_value=memory_reading,
+        ), mock.patch(
+            "jarvis.gui.main_window._read_vram_percent", return_value=None
         ):
             window._poll_system()
 
         self.assertEqual(widget(window, CPU_LABEL).text(), "CPU: 17%")
         self.assertEqual(widget(window, RAM_LABEL).text(), "RAM: 42%")
 
+    def test_poll_system_fills_in_vram_when_an_nvidia_gpu_is_present(
+        self,
+    ) -> None:
+        # _read_vram_percent() itself is mocked here rather than pynvml --
+        # this pins _poll_system()'s own behaviour (what it does with a
+        # reading it's handed), while GpuMonitoringTests below pins
+        # _read_vram_percent()'s own fallback logic against a faked pynvml.
+        window = MainWindow()
+        with mock.patch(
+            "jarvis.gui.main_window.psutil.cpu_percent", return_value=17.0
+        ), mock.patch(
+            "jarvis.gui.main_window.psutil.virtual_memory",
+            return_value=mock.Mock(percent=42.0),
+        ), mock.patch(
+            "jarvis.gui.main_window._read_vram_percent", return_value=63.0
+        ):
+            window._poll_system()
+
+        self.assertEqual(widget(window, VRAM_LABEL).text(), "VRAM: 63%")
+
+    def test_poll_system_reports_vram_unavailable_with_no_nvidia_gpu(
+        self,
+    ) -> None:
+        window = MainWindow()
+        with mock.patch(
+            "jarvis.gui.main_window.psutil.cpu_percent", return_value=17.0
+        ), mock.patch(
+            "jarvis.gui.main_window.psutil.virtual_memory",
+            return_value=mock.Mock(percent=42.0),
+        ), mock.patch(
+            "jarvis.gui.main_window._read_vram_percent", return_value=None
+        ):
+            window._poll_system()
+
+        self.assertEqual(widget(window, VRAM_LABEL).text(), "VRAM: μη διαθέσιμο")
+
     def test_closing_the_window_stops_the_monitor_timer(self) -> None:
         window = MainWindow()
         window.close()
         self.assertFalse(window._monitor_timer.isActive())
+
+
+@unittest.skipUnless(_PYSIDE6_AVAILABLE, "PySide6 is not installed here")
+class GpuMonitoringTests(unittest.TestCase):
+    """_read_vram_percent() itself, exercised against a faked `pynvml`
+    module in sys.modules -- the same idiom test_player.py uses for
+    `sounddevice`, since this sandbox has no NVIDIA driver (and no real one
+    should be required to run the suite). MonitoringTests above mocks
+    _read_vram_percent() wholesale instead, which is right for pinning
+    _poll_system()'s own behaviour; this class pins the function those
+    mocks stand in for.
+
+    `_nvml_handle`/`_nvml_unavailable` are module-level and cached across
+    calls by design (see _read_vram_percent()'s docstring), which means
+    they persist across tests unless reset -- setUp()/tearDown() do that
+    here so one test's result can never leak into the next."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        _main_window_module._nvml_handle = None
+        _main_window_module._nvml_unavailable = False
+
+    def tearDown(self) -> None:
+        _main_window_module._nvml_handle = None
+        _main_window_module._nvml_unavailable = False
+        sys.modules.pop("pynvml", None)
+
+    def test_reads_a_percentage_from_a_present_nvidia_gpu(self) -> None:
+        fake_pynvml = mock.Mock()
+        fake_pynvml.nvmlDeviceGetHandleByIndex.return_value = "handle-0"
+        fake_pynvml.nvmlDeviceGetMemoryInfo.return_value = mock.Mock(
+            used=2_000, total=8_000
+        )
+        sys.modules["pynvml"] = fake_pynvml
+
+        result = _main_window_module._read_vram_percent()
+
+        self.assertEqual(result, 25.0)
+        fake_pynvml.nvmlInit.assert_called_once()
+
+    def test_a_missing_pynvml_package_reports_unavailable(self) -> None:
+        # No fake installed at all -- "import pynvml" raises ImportError
+        # exactly as it does on a machine that never installed
+        # nvidia-ml-py, which is every environment this suite runs in.
+        sys.modules.pop("pynvml", None)
+
+        self.assertIsNone(_main_window_module._read_vram_percent())
+
+    def test_a_present_package_with_no_gpu_also_reports_unavailable(self) -> None:
+        fake_pynvml = mock.Mock()
+        fake_pynvml.nvmlInit.side_effect = RuntimeError("NVML Shared Library Not Found")
+        sys.modules["pynvml"] = fake_pynvml
+
+        self.assertIsNone(_main_window_module._read_vram_percent())
+
+    def test_failure_is_cached_and_never_retried(self) -> None:
+        fake_pynvml = mock.Mock()
+        fake_pynvml.nvmlInit.side_effect = RuntimeError("no driver")
+        sys.modules["pynvml"] = fake_pynvml
+
+        self.assertIsNone(_main_window_module._read_vram_percent())
+        self.assertTrue(_main_window_module._nvml_unavailable)
+
+        # Even if a driver now existed, _read_vram_percent() short-circuits
+        # on the cached flag rather than trying nvmlInit() again.
+        fake_pynvml.nvmlInit.side_effect = None
+        fake_pynvml.nvmlInit.return_value = None
+        self.assertIsNone(_main_window_module._read_vram_percent())
+        fake_pynvml.nvmlInit.assert_called_once()
+
+    def test_the_handle_is_only_fetched_once_across_calls(self) -> None:
+        fake_pynvml = mock.Mock()
+        fake_pynvml.nvmlDeviceGetHandleByIndex.return_value = "handle-0"
+        fake_pynvml.nvmlDeviceGetMemoryInfo.return_value = mock.Mock(
+            used=1_000, total=4_000
+        )
+        sys.modules["pynvml"] = fake_pynvml
+
+        _main_window_module._read_vram_percent()
+        _main_window_module._read_vram_percent()
+
+        fake_pynvml.nvmlInit.assert_called_once()
+        fake_pynvml.nvmlDeviceGetHandleByIndex.assert_called_once()
+        self.assertEqual(fake_pynvml.nvmlDeviceGetMemoryInfo.call_count, 2)
 
 
 if __name__ == "__main__":

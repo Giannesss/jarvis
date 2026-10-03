@@ -2163,6 +2163,50 @@ that piece was. Flagged for a quick visual hand test: open the GUI, confirm
 the CPU/RAM labels show real numbers that change over a few seconds rather
 than sitting at "—" or a frozen value.
 
+**Hand-tested live on 2026-10-03.** CPU/RAM read 12% and 82% respectively on
+the real machine, confirming `_poll_system()`'s psutil path end to end.
+
+**VRAM, added the same day on request.** `psutil` has no concept of GPU
+memory at all — that needs a GPU-specific library, and which one depends on
+the vendor. The user's machine has an NVIDIA GPU, so `_read_vram_percent()`
+uses `pynvml` (the `nvidia-ml-py` package) — `nvmlInit()` once, then
+`nvmlDeviceGetMemoryInfo()` on every poll. Imported lazily, inside the
+function, same idiom as `speaker._get_voice()`'s Piper import: a machine
+with no NVIDIA GPU — every environment this project's test suite runs in,
+included — never needs the module loaded at all.
+
+**The whole function is one `try`/`except`, and the first failure latches.**
+No card, no driver, or the package not installed are all the same outcome
+here: `None`, which `_poll_system()` renders as "VRAM: μη διαθέσιμο" rather
+than leaving the label on its construction-time "—" forever (a frozen "—"
+would read as "not measured yet", when the true state is "measured, and
+there's nothing there"). `_nvml_unavailable` is a module-level flag that,
+once set, skips straight to `None` on every later call rather than retrying
+a failing `nvmlInit()` on every `MONITOR_POLL_MS` tick — same discipline as
+`diag.py`'s write-failure flag: a missing GPU costs one failed call per
+process, not one per poll. The device handle itself is also cached
+module-level once fetched, for the same reason.
+
+`GpuMonitoringTests` fakes `pynvml` in `sys.modules` (same idiom
+`tests/test_player.py` uses for `sounddevice`) to pin `_read_vram_percent()`
+directly: a present GPU reads a real percentage from the faked memory info;
+a missing package (no fake installed, so the lazy `import pynvml` raises
+`ImportError` exactly as it does on a machine without `nvidia-ml-py`)
+reports unavailable; a present package with no usable device (`nvmlInit()`
+raising) reports unavailable the same way; a failure is never retried
+within the process; and the device handle is fetched once across repeated
+calls, not once per call. `MonitoringTests`' own `_poll_system()` test is
+split in two and a third added, mocking `_read_vram_percent()` wholesale
+rather than `pynvml` — the right level for pinning what `_poll_system()`
+does with a reading, as distinct from how that reading is produced.
+
+**Hand-tested live on 2026-10-03.** Not yet — built and unit-tested only in
+this round; the CPU/RAM reading above was confirmed live before this
+addition, but VRAM itself is new enough today that it hasn't had its own
+hand test yet. Worth a quick look once it's running: confirm the VRAM label
+shows a real percentage (not "μη διαθέσιμο", given the NVIDIA GPU present)
+and that it moves the way CPU/RAM already do.
+
 **Built in a sandbox that cannot run it, hand-tested on the real machine
 instead.** This sandbox cannot install PySide6 at all — `pypi.org`/
 `files.pythonhosted.org` sit in the proxy's `noProxy` list, so requests go

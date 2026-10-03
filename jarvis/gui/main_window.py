@@ -5,8 +5,9 @@ shell first"); step 4 wired in the microphone, the brain's reply and
 settings/debug mode" -- is now underway: the state machine (`State`, below)
 is one explicit value for what Jarvis is doing right now, read by everything
 that used to ask three different thread attributes whether they were
-`None`; real system monitoring (`_poll_system()`, below) fills the CPU/RAM
-labels from `psutil` on a timer instead of leaving them at "—" forever.
+`None`; real system monitoring (`_poll_system()`, below) fills the CPU/RAM/
+VRAM labels from `psutil`/`pynvml` on a timer instead of leaving them at "—"
+forever.
 
 Every widget that something will eventually read or write from outside this
 file has a stable `objectName()` set on it (see `_NAMED_WIDGETS` and the
@@ -60,16 +61,56 @@ TRANSCRIPT_LIST = "transcript_list"
 TASKS_LIST = "tasks_list"
 CPU_LABEL = "cpu_label"
 RAM_LABEL = "ram_label"
+VRAM_LABEL = "vram_label"
 DEBUG_ACTION = "debug_mode_action"
 RECORD_BUTTON = "record_button"
 
-# How often _poll_system() refreshes the CPU/RAM labels. 2s is frequent
+# How often _poll_system() refreshes the CPU/RAM/VRAM labels. 2s is frequent
 # enough to look live without polling psutil hard enough to show up in its
 # own reading -- cpu_percent(interval=None) is a near-free syscall-level
 # read, not a busy-wait, so this could be much shorter, but a system monitor
 # updating faster than a person reads it has nothing to show for the extra
 # polling.
 MONITOR_POLL_MS = 2000
+
+# Cached across calls to _read_vram_percent() -- nvmlInit() and the device
+# handle only need doing once per process, and a machine with no NVIDIA
+# driver should only pay for one failed attempt, not one every
+# MONITOR_POLL_MS. Module-level rather than an attribute on MainWindow for
+# the same reason speaker._get_voice()'s lazy singleton is module-level: the
+# GPU is a property of the machine, not of any one window.
+_nvml_handle = None
+_nvml_unavailable = False
+
+
+def _read_vram_percent() -> float | None:
+    """Returns VRAM used as a percentage of total on the first NVIDIA GPU,
+    or None if there isn't one -- no card, no driver, or the `pynvml`
+    bindings (package `nvidia-ml-py`) aren't installed. Imported lazily,
+    inside the function, the same idiom as speaker._get_voice()'s Piper
+    import: a machine with no NVIDIA GPU (every environment this project's
+    test suite runs in, included) never needs this module loaded at all.
+
+    Only ever tried past the first failure if that failure hasn't been seen
+    yet -- `_nvml_unavailable` latches to True on the first exception
+    (ImportError, no driver, no device) and every later call then skips
+    straight to None instead of repeating a failing nvmlInit() on every
+    timer tick. Same discipline as diag.py's write-failure flag: a missing
+    GPU costs one failed call per process, not one per poll."""
+    global _nvml_handle, _nvml_unavailable
+    if _nvml_unavailable:
+        return None
+    try:
+        import pynvml
+
+        if _nvml_handle is None:
+            pynvml.nvmlInit()
+            _nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        info = pynvml.nvmlDeviceGetMemoryInfo(_nvml_handle)
+        return info.used / info.total * 100
+    except Exception:
+        _nvml_unavailable = True
+        return None
 
 
 class State(Enum):
@@ -258,17 +299,26 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     def _poll_system(self) -> None:
-        """Fills in the CPU/RAM labels with a real reading. Called on
+        """Fills in the CPU/RAM/VRAM labels with a real reading. Called on
         `_monitor_timer` (every `MONITOR_POLL_MS`) and directly by the test
         suite -- both calls happen on the UI thread, since psutil's reads
         here are a near-instant syscall-level read with no disk or network
         I/O behind them, unlike `listener.listen()`/`brain.ask()`/
         `speaker.speak()` above, which is exactly why this doesn't need a
-        worker thread the way those three do."""
+        worker thread the way those three do. The VRAM read
+        (`_read_vram_percent()`) is the same kind of near-instant call when
+        an NVIDIA GPU is present, and a cached, already-failed no-op
+        otherwise -- never a reason to move this to a worker thread either."""
         cpu = psutil.cpu_percent(interval=None)
         ram = psutil.virtual_memory().percent
         widget(self, CPU_LABEL).setText(f"CPU: {cpu:.0f}%")
         widget(self, RAM_LABEL).setText(f"RAM: {ram:.0f}%")
+
+        vram = _read_vram_percent()
+        if vram is None:
+            widget(self, VRAM_LABEL).setText("VRAM: μη διαθέσιμο")
+        else:
+            widget(self, VRAM_LABEL).setText(f"VRAM: {vram:.0f}%")
 
     def _set_state(self, state: State) -> None:
         """The one place that updates the status label and the record
@@ -486,14 +536,20 @@ class MainWindow(QMainWindow):
         cpu_label.setObjectName(CPU_LABEL)
         ram_label = QLabel("RAM: —")
         ram_label.setObjectName(RAM_LABEL)
+        vram_label = QLabel("VRAM: —")
+        vram_label.setObjectName(VRAM_LABEL)
         row.addWidget(cpu_label)
         row.addWidget(ram_label)
+        row.addWidget(vram_label)
         layout.addLayout(row)
 
         # "—" is the construction-time placeholder only; _poll_system()
-        # (the real-system-monitoring piece of step 5) overwrites both
-        # labels with an actual percentage on the first timer tick, so "—"
-        # is only ever seen for one MONITOR_POLL_MS at startup.
+        # (the real-system-monitoring piece of step 5) overwrites all three
+        # labels with an actual reading on the first timer tick, so "—" is
+        # only ever seen for one MONITOR_POLL_MS at startup. VRAM's own
+        # reading can still land on "μη διαθέσιμο" afterwards rather than a
+        # percentage -- that is _read_vram_percent() reporting no NVIDIA GPU
+        # found, not a stuck placeholder.
         return box
 
     # --- Status bar -----------------------------------------------------------

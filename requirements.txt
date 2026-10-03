@@ -11,3 +11,4 @@ scipy
 scikit-learn
 PySide6
 psutil
+nvidia-ml-py
