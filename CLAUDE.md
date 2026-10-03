@@ -2256,11 +2256,9 @@ further mocking needed — which is exactly what the pre-existing
 "tasks list starts empty" assertion in `ShellConstructionTests` still
 relies on.
 
-Not yet hand-tested live — built and unit-tested only in this round.
-Worth a quick look once it's running: say something through the GUI that
-saves an exam, reminder or class for today (the same phrasing «τι έχω
-σήμερα» already answers out loud), and confirm the tasks list shows it
-after the reply finishes, without needing to close and reopen the window.
+**Hand-tested live on 2026-10-03.** Confirmed on the real machine: the
+tasks list shows today's agenda in the side panel. Step 5 piece 3 (the
+tasks list) is closed.
 
 **Built in a sandbox that cannot run it, hand-tested on the real machine
 instead.** This sandbox cannot install PySide6 at all — `pypi.org`/
