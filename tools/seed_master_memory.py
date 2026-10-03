@@ -20,9 +20,12 @@ Three tables end up holding this, and none of them hold all of it:
     birthday, starting the next one). Fine for now, worth knowing.
   - "πολη" (city) is a single value, but the document gives two cities --
     Kifisia/Athens (home base) and Xanthi (university base) -- that the
-    schema cannot hold at once. Seeding one would silently bury the other,
-    so this script leaves "πολη" alone; say whichever one you want
-    "Θυμήσου ότι μένω στο/στη ..." to answer with.
+    schema cannot hold at once. The user picked Xanthi explicitly, but
+    said so as a temporary call (he's there for university most of the
+    year; Kifisia/Athens is still home base), not a permanent answer --
+    so it's seeded as a normal profile value (same as any other save),
+    but flagged here and in the printed output as temporary, and left
+    easy to override later with "Θυμήσου ότι μένω στο/στη ...".
   - "ονομα" is left alone too if a row already exists (checked below) --
     "Σε λένε Γιάννη" already worked in the Phase 2 hand test, and
     overwriting a working verbatim capture with a different spelling for
@@ -77,6 +80,11 @@ PROFILE: dict[str, str] = {
     "σπουδεσ": "Μηχανικός Περιβάλλοντος στο Δημοκρίτειο Πανεπιστήμιο Θράκης",
     "σχολη": "το Δημοκρίτειο Πανεπιστήμιο Θράκης (ΔΠΘ), Ξάνθη",
     "ηλικια": str(_age_now()),
+    # Temporary call, per the user -- he splits time between Kifisia/
+    # Athens (home base) and Xanthi (university base); Xanthi for now
+    # since that's where he actually is for most of the year. Overwrite
+    # with "Θυμήσου ότι μένω στο/στη ..." whenever this should change.
+    "πολη": "Ξάνθη",
 }
 
 
@@ -110,12 +118,6 @@ def _seed_profile(conn) -> None:
         print("  + ονομα = Γιάννης Ροντόπουλος")
     else:
         print(f"  (ήδη υπάρχει) ονομα = {existing_name['value']} -- δεν αλλάζει")
-
-    print(
-        "  (παραλείπεται) πολη -- το έγγραφο δίνει δύο πόλεις (Κηφισιά/Αθήνα"
-        " και Ξάνθη) και το πεδίο χωράει μόνο μία· πες ποια θες με 'Θυμήσου"
-        " ότι μένω στο/στη ...'"
-    )
 
 
 # --- businesses: one row, the note carries the whole plan -------------------
