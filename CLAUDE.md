@@ -3053,6 +3053,191 @@ clock/metric font look intentional rather than mismatched against the rest
 of the UI's Segoe UI; and do the Greek nav labels and panel titles read
 naturally rather than cramped against the sidebar's fixed width.
 
+### A seventh pass: the center becomes a command center, per a detailed brief
+
+The sixth pass answered "too plain and boring" with more colour and motion.
+The very next piece of feedback was a long, numbered redesign brief (six
+sections plus two drafted prompts) asking for something more specific and,
+in places, in real tension with the sixth pass's own instinct: Apple-style
+restraint and purposeful whitespace, explicitly *against* "a cyberpunk
+dashboard: lots of panels + lots of glowing elements." The brief's own
+words were the brief for this pass -- six numbered asks, worked through in
+order below, plus one hard constraint repeated twice: "do not break
+existing Jarvis functionality" and "inspect the existing UI architecture
+... before implementing." Nothing about the worker threads, the state
+machine, `_get_reply()`, the tasks query, the quick-action click handlers
+or the debug line changed in this pass -- every change below is additive,
+in `jarvis/gui/main_window.py` and (one small addition) `jarvis/memory.py`.
+
+**1 & 2 -- the center is the actual interface now, not an empty page
+around a small circle.** The orb grew again (240px -> 320px minimum): the
+brief's own words, "significantly more sophisticated than the current
+small circle" and "the primary focus of the dashboard", are a size change
+as much as a content one, and the centre column (still 2:1 against the
+side panel) has the room to give it. Around it, in order: a time-of-day
+greeting ("Καλησπέρα, Γιάννη." or, with nothing saved to a name yet, just
+"Καλησπέρα." -- never a guessed name, per "Grounding" below), the orb
+itself, a large status word under it (ΕΤΟΙΜΟ/ΑΚΟΥΩ/ΣΚΕΦΤΟΜΑΙ/ΜΙΛΑΩ --
+`_HOME_STATE_TEXT`, a second, bigger rendering of the same state the
+header's status row already names, never a second source of truth for
+it), a static prompt line ("«Πώς μπορώ να βοηθήσω;»", hidden outside IDLE
+by `_set_state()` since inviting a question stops being useful mid-turn),
+the record button paired with a new "Άνοιξε Συνομιλία" button that
+switches to the Chat page (the brief's "[ Open Conversation ]"), a small
+keyboard hint, and a Recent Activity panel underneath a divider.
+
+**"[ Hold Space to Talk ]" is answered honestly, not literally.** This
+pipeline's recording stops on `ffmpeg`'s own silence detection
+(`listener.listen()`), not on a key being released -- there is no
+press/start, release/stop gesture this architecture can actually perform
+without changing how recording itself works, which is well outside what a
+UI pass should touch. `MainWindow.keyPressEvent()` instead wires the Space
+bar to exactly what clicking "Εγγραφή" already does: a keyboard shortcut
+for *starting* a turn (guarded by `self._state is State.IDLE`, same as the
+button, and ignoring key auto-repeat), with the hint label worded
+accordingly ("Πάτησε Space ή κάνε κλικ στην Εγγραφή") rather than claiming
+a hold-to-talk gesture that isn't real.
+
+**Recent Activity is a new, small, session-only log -- grounded in real
+actions, never invented.** The brief's own mockup example ("22:42 Opened
+YouTube") is more specific than what the `audit` table actually records:
+`policy.py`'s audit log holds *which skill matched and why* (a fixed
+decision/reason vocabulary, see "Policy"/"Audit log" above), never which
+site opened or what was actually said -- so reaching into audit for this
+would mean inventing detail it was never built to hold. `_log_activity()`
+is its own small log instead (`self._recent_activity`, newest first,
+capped at five), fed from the two places real actions actually happen:
+`_quick_action_site()`/`_quick_action_app()` log "Άνοιξε {label}" on
+success (never on a failed launch), and `_on_reply_finished()` logs the
+reply itself (truncated to 40 characters) once a turn completes. Cleared
+on restart, which is honest -- it only ever claims "this happened in this
+session," never a history beyond that, unlike the Tasks page's
+`memory.agenda()` data, which is real persisted state.
+
+**The orb's four states now read apart from each other, not just by
+colour.** `_PULSE_SPEED` replaces the old binary idle/not-idle pulse speed
+with one real value per state (idle slowest, listening/speaking close to
+each other since both are "audio is happening right now", thinking in
+between). THINKING drops the rotating arc and the seven bars entirely in
+favour of three small dots orbiting the ring 120° apart -- literally the
+brief's own words, "rotating/flowing particles" -- so it reads as a
+different *kind* of motion, not the same animation recoloured amber.
+SPEAKING keeps the bars but wobbles them with nearly double the amplitude
+of LISTENING's, so the one state the brief explicitly calls a "waveform"
+actually looks the most like one.
+
+**3 -- the right panel is calmer and denser.** The three cards' accent
+top-border went from a flat 2px hex to a 1px `rgba(...)` at ~50% alpha --
+"subtle borders instead of heavy card outlines" and "less saturated
+colors" are the brief's own phrasing, and the second-pass-era heavy
+version was neither. Quick Actions changed from a column of full-width
+buttons to a two-column `QGridLayout` of compact tiles
+(`quickActionTile` property, smaller padding and font) -- closer to the
+brief's own "YouTube Gmail / Google Calculator" pairing, and what lets
+every configured site/app (currently five: YouTube, Gmail, Google,
+υπολογιστή, Notepad -- `config.SKILL_SITES`/`SKILL_APPS`, read fresh
+rather than assumed) fit without scrolling a tall narrow column. Current
+Task became a small "Σήμερα" (Today) summary -- a count plus the nearest
+item ("3 εκκρεμότητες σήμερα — επόμενο: ...") rather than just the nearest
+item alone, closer to the brief's own "3 tasks completed" line without
+inventing a completed/active distinction `memory.agenda()`'s rows don't
+actually carry.
+
+**4 -- the background is now code, not CSS, because CSS can't animate or
+tile.** `_Background(QWidget)` replaces the old `QWidget#appBackground` +
+QSS-gradient canvas with a real `paintEvent()`: the same soft top-centred
+radial wash the third/fourth passes established (unchanged in shape, just
+moved from `qradialgradient()` syntax into `QRadialGradient` calls), a
+very faint 64px grid (alpha 5/255 -- "you shouldn't immediately notice the
+animation" is the brief's own line, and this is barely visible on
+purpose), and seven small particles drifting on independent deterministic
+sine/cosine paths (seeded per-particle, not random, so the same gentle
+motion repeats rather than jittering frame to frame) at alpha 10-18. Ticked
+from the same `_orb_timer` the orb's own animation already uses
+(`ORB_TICK_MS` = 60ms) rather than a timer of its own -- one more QTimer
+purely to nudge a few background dots doesn't earn the extra object. Every
+child widget is still added via the same `QVBoxLayout` as before; Qt
+paints children after their parent in the same cycle, so nothing about how
+the rest of the window is built changed, only how the canvas itself is
+drawn.
+
+**5 -- the sidebar gained icons, a brand caption and a grouped
+hierarchy.** `_build_sidebar()`'s four plain pages (Αρχική/Συνομιλία/
+Εργασίες/Αρχεία) now each carry a small leading glyph (⌂/◉/✓/▣) instead of
+relying on text alone -- drawn as a plain character prefix on the button's
+own label, the same reasoning as `_dot_icon()`: a plain character renders
+identically everywhere PySide6 runs, with no tofu-box risk a loaded icon
+asset would carry. A "JARVIS" brand caption sits at the top, and a muted
+"ΑΥΤΟΜΑΤΟΠΟΙΗΣΕΙΣ" section groups two new buttons (⚡ Ενεργές, ◌ Ιστορικό)
+below the four main pages, with Ρυθμίσεις moved below a stretch at the
+very bottom -- the brief's own ordering. `_build_nav_button()` and
+`_build_sidebar_divider()` are small helpers factored out of what used to
+be one inline loop, since the sidebar now has more than one kind of row to
+build.
+
+**"Automations" doesn't exist in Jarvis yet, so its page says so rather
+than inventing data for it.** Both new sidebar buttons route to one new
+stub page (`_build_automations_page()`, stack index 5) -- the same honest
+shape as the existing Files stub: Jarvis has no concept today of a
+schedulable, start/stoppable "automation" as its own object (a skill match
+is one audit row, not a thing with a lifecycle), so rather than fabricate
+an "Active"/"History" view to match the mockup, the page names what's
+missing and points at the closest real thing that exists today -- the
+scheduler's reminders and timers, already visible on the Tasks page. No
+test needed updating for two buttons sharing one page: `NAV_HOME`/
+`NAV_CHAT`/`NAV_TASKS`/`NAV_FILES`/`NAV_SETTINGS` keep their exact existing
+object names and stack indices (0-4), so every assertion that iterates
+those five is untouched; `NAV_AUTOMATIONS_ACTIVE`/`_HISTORY` are new names
+nothing existing asserted against.
+
+**6 -- the top bar was already minimal** (a 56px header: wordmark, status
+dot/text, clock/date -- see "The dashboard redesign" above), so this pass
+left it alone rather than changing something that already matched the
+brief's own ask; the new greeting line lives on the Home page instead,
+where "Good evening, Giannis." sits in the mockup anyway.
+
+**One new `jarvis/memory.py` function, added for the greeting alone.**
+`profile_name(conn)` reads the stored name's bare value from the `profile`
+table (key `"ονομα"`, PROFILE_PATTERNS' own key) -- neither
+`_profile_digest()` (a key=value digest for the brain's prompt) nor
+`spoken_profile()` (a full Greek sentence covering every stored fact)
+returns a value in a shape a greeting template can drop straight into, so
+this is a third, minimal reader of the same table rather than reusing
+either. `MainWindow._read_profile_name()` calls it once at construction
+(not on every clock tick, since a name only ever changes from a voice save
+mid-session, which a restart -- not a tick -- would pick up), swallows
+every error the same way `_load_tasks()` does, and also guards against a
+non-string result: the test suite's module-wide `db.connect()` mock
+returns a `MagicMock` for every call including this one, and a bare
+`isinstance(name, str)` check is what keeps a stray mock object from
+leaking into a real greeting string rather than reading as "no name
+saved".
+
+**Nothing here was asked for and left undone without a reason stated in
+code.** The one deliberate, explicit gap is Automations, covered above. The
+record button, state machine, tasks query, quick-action wiring and debug
+line are all byte-for-byte what step 4/5 and the dashboard redesign built;
+`tests/test_gui_shell.py` needed no edits at all -- every one of its 53
+assertions is on an object name, exact text or behaviour this pass left
+alone, and the suite still skips cleanly here (no PySide6 in this sandbox).
+
+**Not yet hand-tested live.** Verified only against `py_compile` and the
+mocked suite, in the same sandboxed container that cannot install PySide6
+(`pypi.org`/`files.pythonhosted.org` sit outside the proxy's allowlist).
+Needs a visual pass on the real machine for: does the bigger orb actually
+read as the page's primary focus rather than just "a bigger circle in the
+same amount of empty space"; does the greeting show the real stored name
+(or fall back cleanly with none saved); does pressing Space start a
+recording the same way clicking Εγγραφή does; does Recent Activity fill in
+with real entries after a quick action and after a spoken turn; does
+THINKING's orbiting-particle look actually read as different in kind from
+LISTENING/SPEAKING's bars, not just a different colour; does the
+background's grid and particles stay at "you shouldn't immediately notice
+it" rather than becoming a visible texture; and does the restructured
+sidebar (brand caption, icons, the Automations group, Settings pinned to
+the bottom) look like a refined navigation hierarchy rather than a cramped
+version of the old flat list.
+
 ## Normalization
 
 `text.normalize()` is what every phrase list, every pattern and every stored

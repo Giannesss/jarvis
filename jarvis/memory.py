@@ -1259,6 +1259,21 @@ def _profile_digest(conn: sqlite3.Connection) -> str:
     return f"Προφίλ: {pairs}"
 
 
+def profile_name(conn: sqlite3.Connection) -> str | None:
+    """Just the stored name, or None if nothing has been saved under it --
+    for a plain "Καλησπέρα, {name}." greeting (the GUI's Home page) that
+    needs a bare value to drop into a template, which neither
+    _profile_digest() (a key=value digest for the brain's prompt) nor
+    spoken_profile() (a full Greek sentence covering every stored fact)
+    returns. Reads the same `profile` table those two already read; "ονομα"
+    is PROFILE_PATTERNS' own key for a name, already normalized (accents
+    stripped) the way every profile key is stored."""
+    row = conn.execute(
+        "SELECT value FROM profile WHERE key = 'ονομα'"
+    ).fetchone()
+    return row["value"] if row else None
+
+
 # How each key PROFILE_PATTERNS writes is spoken, with its stored value.
 #
 # These used to name the key alone ("το όνομά σου") and deliberately withhold

@@ -64,6 +64,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QFormLayout,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QListWidget,
@@ -106,6 +107,13 @@ NAV_SETTINGS = "nav_settings"
 CLOCK_LABEL = "clock_label"
 DATE_LABEL = "date_label"
 STATUS_DOT = "status_dot"
+HOME_GREETING_LABEL = "home_greeting_label"
+HOME_STATE_LABEL = "home_state_label"
+HOME_PROMPT_LABEL = "home_prompt_label"
+OPEN_CONVERSATION_BUTTON = "open_conversation_button"
+RECENT_ACTIVITY_LIST = "recent_activity_list"
+NAV_AUTOMATIONS_ACTIVE = "nav_automations_active"
+NAV_AUTOMATIONS_HISTORY = "nav_automations_history"
 
 # How often _poll_system() refreshes the CPU/RAM/VRAM/network labels. 2s is
 # frequent enough to look live without polling psutil hard enough to show up
@@ -316,6 +324,48 @@ _STATUS_DOT_COLOR = {
 _SECONDARY_ACCENT = "#8b5cf6"
 _ACCENT_TEAL = "#22c3b6"
 
+# The big word under the orb on the Home page -- a second, larger rendering
+# of the same state _STATUS_TEXT already names in the header, because the
+# redesign brief asks for the centre of the window to carry its own status
+# rather than making the user look up at the header to know what Jarvis is
+# doing. Deliberately short, all-caps single words (ΕΤΟΙΜΟ/ΑΚΟΥΩ/ΣΚΕΦΤΟΜΑΙ/
+# ΜΙΛΑΩ) rather than the header's full sentence -- this is a glanceable
+# headline, not a second copy of the same sentence.
+_HOME_STATE_TEXT = {
+    State.IDLE: "ΕΤΟΙΜΟ",
+    State.LISTENING: "ΑΚΟΥΩ",
+    State.THINKING: "ΣΚΕΦΤΟΜΑΙ",
+    State.SPEAKING: "ΜΙΛΑΩ",
+}
+
+# How fast the orb's glow pulses, per state -- idle breathes slowly and
+# barely; listening/speaking breathe faster, close to each other since both
+# are "something audible is happening right now"; thinking sits between the
+# two since it's active but not tied to a live audio stream the way the
+# other two are. Replaces the old binary idle/not-idle split with one real
+# distinction per state, which is also what lets the four states actually
+# read apart from each other rather than "idle" vs. "everything else".
+_PULSE_SPEED = {
+    State.IDLE: 0.02,
+    State.LISTENING: 0.07,
+    State.THINKING: 0.05,
+    State.SPEAKING: 0.06,
+}
+
+
+def _time_of_day_greeting(hour: int) -> str:
+    """A plain Greek time-of-day greeting -- no profile data involved, just
+    the clock. Paired with the stored name (if any) by the caller
+    (MainWindow._update_clock) into "Καλησπέρα, Γιάννη." or, with nothing
+    saved yet, the bare greeting alone -- never a guessed or placeholder
+    name, per the project's own rule against presenting invented data as
+    real (see "Grounding" in CLAUDE.md)."""
+    if hour < 12:
+        return "Καλημέρα"
+    if hour < 20:
+        return "Καλησπέρα"
+    return "Καλό βράδυ"
+
 # Same text as main.py's own BRAIN_ERROR_REPLY. Duplicated rather than
 # imported -- jarvis/gui/ is never imported by main.py and the reverse is
 # true here too (see "The GUI shell" in CLAUDE.md), so the two entry points
@@ -431,7 +481,12 @@ class _Orb(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setMinimumSize(240, 240)
+        # Up from 240 -- the redesign brief's own ask ("significantly more
+        # sophisticated than the current small circle", "the primary focus
+        # of the dashboard") is a size change as much as a content one, and
+        # the centre column (see _build_home_page, now 2:1 against the side
+        # panel) has the room to give it.
+        self.setMinimumSize(320, 320)
         self._state = State.IDLE
         self._phase = 0.0
         self._color = QColor(_ORB_COLOR[State.IDLE])
@@ -475,7 +530,7 @@ class _Orb(QWidget):
         # here is meant to be eye-catching on its own. "Almost still when
         # idle, alive only when something is actually happening" is the
         # brief, so even an active state's pulse stays subtle.
-        speed = 0.02 if self._state is State.IDLE else 0.045
+        speed = _PULSE_SPEED[self._state]
         pulse = (math.sin(self._phase * speed) + 1) / 2  # 0..1
 
         glow_radius = side * (0.40 + 0.03 * pulse)
@@ -512,49 +567,145 @@ class _Orb(QWidget):
         # brief -- and only speeds up, never appears/disappears, when a
         # state actually changes, so it never competes with the state colour
         # itself for attention.
-        arc_radius = ring_radius + side * 0.045
-        rotate_speed = 0.5 if self._state is State.IDLE else 1.8
-        angle_deg = (self._phase * rotate_speed) % 360
-        arc_color = QColor(_SECONDARY_ACCENT)
-        arc_color.setAlpha(175)
-        arc_pen = QPen(QBrush(arc_color), max(side * 0.012, 2.0))
-        arc_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-        painter.setPen(arc_pen)
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        arc_rect = QRectF(
-            cx - arc_radius, cy - arc_radius, arc_radius * 2, arc_radius * 2
-        )
-        # Qt's arc angles are in 1/16th of a degree, and count counter-
-        # clockwise from the 3 o'clock position -- a plain constant, not a
-        # tuned one, just Qt's own convention for QPainter.drawArc.
-        painter.drawArc(arc_rect, int(angle_deg * 16), int(46 * 16))
-
-        # Seven bars, alternating the state colour with the secondary accent
-        # -- richer than the second pass's flat five, without going back to
-        # the first pass's nine-bar, single-colour wall. Idle shows them as
-        # short flat dashes (a resting state, not "nothing is here"); an
-        # active state wobbles them, still gently.
-        bar_count = 7
-        bar_area_width = side * 0.36
-        bar_gap = bar_area_width / bar_count
-        base_y = cy
-        for i in range(bar_count):
-            if self._state is State.IDLE:
-                height = side * 0.025
-            else:
-                # A deterministic pseudo-wave from the phase and the bar's
-                # own index -- decorative, not a real audio level (see
-                # ORB_TICK_MS above).
-                wobble = (math.sin(self._phase * 0.18 + i * 1.1) + 1) / 2
-                height = side * (0.03 + 0.09 * wobble)
-            x = cx - bar_area_width / 2 + i * bar_gap
-            bar_color = QColor(color if i % 2 == 0 else _SECONDARY_ACCENT)
-            bar_color.setAlpha(210)
-            painter.setBrush(bar_color)
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.drawRoundedRect(
-                QRectF(x, base_y - height / 2, bar_gap * 0.45, height), 2, 2
+        if self._state is not State.THINKING:
+            arc_radius = ring_radius + side * 0.045
+            rotate_speed = 0.5 if self._state is State.IDLE else 1.8
+            angle_deg = (self._phase * rotate_speed) % 360
+            arc_color = QColor(_SECONDARY_ACCENT)
+            arc_color.setAlpha(175)
+            arc_pen = QPen(QBrush(arc_color), max(side * 0.012, 2.0))
+            arc_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            painter.setPen(arc_pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            arc_rect = QRectF(
+                cx - arc_radius, cy - arc_radius, arc_radius * 2, arc_radius * 2
             )
+            # Qt's arc angles are in 1/16th of a degree, and count counter-
+            # clockwise from the 3 o'clock position -- a plain constant, not
+            # a tuned one, just Qt's own convention for QPainter.drawArc.
+            painter.drawArc(arc_rect, int(angle_deg * 16), int(46 * 16))
+
+        if self._state is State.THINKING:
+            # "Rotating/flowing particles" (the brief's own words) instead
+            # of the bars below -- three dots orbiting the ring, 120° apart,
+            # so THINKING reads as a visibly different *kind* of motion from
+            # LISTENING/SPEAKING's waveform rather than the same animation
+            # recoloured amber.
+            orbit_radius = ring_radius * 0.55
+            for i in range(3):
+                angle = math.radians(self._phase * 2.2 + i * 120)
+                px = cx + orbit_radius * math.cos(angle)
+                py = cy + orbit_radius * math.sin(angle)
+                particle_color = QColor(color if i % 2 == 0 else _SECONDARY_ACCENT)
+                particle_color.setAlpha(220)
+                painter.setBrush(particle_color)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.drawEllipse(QRectF(px - 4, py - 4, 8, 8))
+        else:
+            # Seven bars, alternating the state colour with the secondary
+            # accent -- richer than the second pass's flat five, without
+            # going back to the first pass's nine-bar, single-colour wall.
+            # Idle shows them as short flat dashes (a resting state, not
+            # "nothing is here"); SPEAKING wobbles them with more amplitude
+            # than LISTENING, so the one state the brief explicitly calls
+            # a "waveform" actually looks the most like one.
+            bar_count = 7
+            bar_area_width = side * 0.36
+            bar_gap = bar_area_width / bar_count
+            base_y = cy
+            amplitude = 0.09 if self._state is State.SPEAKING else 0.05
+            for i in range(bar_count):
+                if self._state is State.IDLE:
+                    height = side * 0.025
+                else:
+                    # A deterministic pseudo-wave from the phase and the
+                    # bar's own index -- decorative, not a real audio level
+                    # (see ORB_TICK_MS above).
+                    wobble = (math.sin(self._phase * 0.18 + i * 1.1) + 1) / 2
+                    height = side * (0.03 + amplitude * wobble)
+                x = cx - bar_area_width / 2 + i * bar_gap
+                bar_color = QColor(color if i % 2 == 0 else _SECONDARY_ACCENT)
+                bar_color.setAlpha(210)
+                painter.setBrush(bar_color)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.drawRoundedRect(
+                    QRectF(x, base_y - height / 2, bar_gap * 0.45, height), 2, 2
+                )
+
+
+class _Background(QWidget):
+    """The window's own canvas, painted by hand rather than by a QSS
+    gradient -- the only way to add the faint grid texture and the handful
+    of slow-drifting particles the redesign brief asks for ("the background
+    should feel alive, but you shouldn't immediately notice the animation"),
+    since Qt's stylesheet gradients have no notion of a repeating pattern or
+    of motion at all.
+
+    Three layers, back to front: the same soft top-centred radial wash the
+    third/fourth design passes already established (moved here from QSS,
+    in plain RGB rather than qradialgradient's percentage syntax -- QSS
+    can't animate, so a particle layer has to be code either way, and
+    keeping the static wash in the same place avoids painting two
+    backgrounds on top of each other), a very faint grid (a hint of
+    technical texture, not a pattern anyone is meant to consciously
+    register), and a handful of small, low-alpha dots drifting on
+    independent slow sine paths rather than moving in lockstep.
+
+    Every child widget (header, sidebar, pages) is still added via the
+    ordinary QVBoxLayout in _build_central_widget() -- Qt paints children
+    after their parent in the same cycle, so nothing about how the rest of
+    the window is built changes; this replaces only how the canvas itself
+    is drawn.
+
+    tick() is driven by MainWindow's existing _orb_timer rather than a
+    timer of its own -- one more QTimer purely to nudge a few background
+    dots doesn't earn its own object when one is already ticking at the
+    right cadence for "smooth but not attention-seeking" motion."""
+
+    _PARTICLE_COUNT = 7
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._phase = 0.0
+
+    def tick(self) -> None:
+        self._phase += 1.0
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802 -- Qt's own name
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+
+        gradient = QRadialGradient(w * 0.5, 0, max(w * 1.15, 1))
+        gradient.setColorAt(0.0, QColor(18, 20, 27))
+        gradient.setColorAt(0.45, QColor(13, 14, 18))
+        gradient.setColorAt(1.0, QColor(8, 8, 10))
+        painter.fillRect(self.rect(), gradient)
+
+        # A very faint technical grid, spaced wide (64px) so it reads as
+        # depth/texture rather than graph paper -- alpha 5/255 is close to
+        # the edge of being visible at all, which is the point.
+        painter.setPen(QPen(QColor(255, 255, 255, 5), 1))
+        step = 64
+        for x in range(0, w, step):
+            painter.drawLine(x, 0, x, h)
+        for y in range(0, h, step):
+            painter.drawLine(0, y, w, y)
+
+        # A handful of particles, each on its own slow, independent drift --
+        # deterministic (sine/cosine off the shared phase plus a per-particle
+        # seed), not random, so the same gentle motion repeats rather than
+        # jittering frame to frame. Barely visible on purpose: alpha stays
+        # under 20 and radius under 2px, "extremely restrained" per the brief.
+        painter.setPen(Qt.PenStyle.NoPen)
+        for i in range(self._PARTICLE_COUNT):
+            seed = i * 37.0
+            x = (math.sin(self._phase * 0.0035 + seed) + 1) / 2 * w
+            y = (math.cos(self._phase * 0.0021 + seed * 1.7) + 1) / 2 * h
+            alpha = 10 + int(8 * (math.sin(self._phase * 0.01 + seed) + 1) / 2)
+            painter.setBrush(QColor(160, 190, 255, alpha))
+            painter.drawEllipse(QRectF(x, y, 2.2, 2.2))
 
 
 # Which sender a transcript line belongs to, and the text to actually show
@@ -726,8 +877,25 @@ class MainWindow(QMainWindow):
         self._last_net_bytes: int | None = None
         self._last_net_time: float | None = None
 
+        # The Home page's Recent Activity panel -- a small, session-only log
+        # of real actions this GUI just took (a quick action opened, a turn
+        # answered), newest first, capped at a handful. Not read from the
+        # audit table: that log records which skill matched and why, not
+        # which site opened or what was said, so this is its own log rather
+        # than a reach into audit for detail it was never built to hold. See
+        # _log_activity().
+        self._recent_activity: list[tuple[str, str]] = []
+
         self._build_menu_bar()
         self._build_central_widget()
+
+        # The stored name, if any -- read once at construction rather than
+        # on every clock tick, since it only ever changes from a voice save
+        # ("θυμήσου ότι με λένε...") mid-session, which a restart (not a
+        # tick) is what would pick up. None when nothing is saved yet, which
+        # _update_clock() below renders as a bare greeting with no name --
+        # never a guessed one, per "Grounding" in CLAUDE.md.
+        self._profile_name = self._read_profile_name()
 
         # psutil.cpu_percent()'s first-ever call in a process measures usage
         # since the process started, which is not a meaningful snapshot --
@@ -742,6 +910,7 @@ class MainWindow(QMainWindow):
 
         self._orb_timer = QTimer(self)
         self._orb_timer.timeout.connect(self._orb.tick)
+        self._orb_timer.timeout.connect(self._background.tick)
         self._orb_timer.start(ORB_TICK_MS)
 
         self._clock_timer = QTimer(self)
@@ -776,10 +945,61 @@ class MainWindow(QMainWindow):
         self._clock_timer.stop()
         super().closeEvent(event)
 
+    def keyPressEvent(self, event) -> None:  # noqa: N802 -- Qt's own name
+        """"Hold Space to Talk" from the redesign brief, answered honestly
+        rather than literally: listener.listen() blocks until ffmpeg's own
+        silence detection decides the recording is over, with no notion of
+        "stop when a key is released" -- there is no press/release gesture
+        this pipeline can actually implement without changing how recording
+        itself works, which is well outside this pass. Pressing Space is
+        instead wired to exactly what clicking "Εγγραφή" already does,
+        which is the honest version of the same idea: a keyboard shortcut
+        for starting a turn, not a hold-to-talk control. Guarded the same
+        way the record button already guards a second click -- only when
+        idle, so it never queues a conflicting turn -- and ignores key
+        auto-repeat so holding Space down doesn't fire it over and over."""
+        if (
+            event.key() == Qt.Key.Key_Space
+            and not event.isAutoRepeat()
+            and self._state is State.IDLE
+        ):
+            self._start_listening()
+            return
+        super().keyPressEvent(event)
+
     def _update_clock(self) -> None:
         now = datetime.now()
         widget(self, CLOCK_LABEL).setText(now.strftime("%H:%M"))
         widget(self, DATE_LABEL).setText(now.strftime("%a %d %b %Y"))
+
+        # Recomputed every tick (the greeting word, not the name, which is
+        # read once at construction -- see __init__) so a session left open
+        # across, say, the afternoon/evening boundary doesn't keep saying
+        # "Καλημέρα" forever. Cheap: no DB read, just an hour comparison.
+        greeting = _time_of_day_greeting(now.hour)
+        if self._profile_name:
+            text = f"{greeting}, {self._profile_name}."
+        else:
+            text = f"{greeting}."
+        widget(self, HOME_GREETING_LABEL).setText(text)
+
+    def _read_profile_name(self) -> str | None:
+        """The stored name, or None -- swallows every error, same discipline
+        as _load_tasks()/memory.recall_safe(): a locked or broken database
+        means the greeting falls back to the bare time-of-day phrase, never
+        a crashed GUI. Also guards against a non-string result (a bare
+        MagicMock stands in for a real sqlite3.Row in the mocked test suite,
+        and would otherwise read as a truthy "name" with no sensible text),
+        so this is always exactly a real saved name or nothing."""
+        try:
+            conn = db.connect()
+            try:
+                name = memory.profile_name(conn)
+            finally:
+                conn.close()
+        except Exception:
+            return None
+        return name if isinstance(name, str) and name else None
 
     def _poll_system(self) -> None:
         """Fills in the CPU/RAM/VRAM/network labels with a real reading.
@@ -851,11 +1071,21 @@ class MainWindow(QMainWindow):
         for kind, text in items:
             tasks_list.addItem(_render_agenda_item(kind, text))
 
+        # A count plus the nearest item, not just the nearest item alone --
+        # closer to the brief's own "TODAY: 3 tasks completed" summary than
+        # a single bare line, without inventing a "completed" count this
+        # table doesn't actually distinguish (a fired/missed reminder still
+        # carries its own suffix from _render_agenda_item(), so nothing here
+        # claims a status the row doesn't already carry).
         current_task = widget(self, CURRENT_TASK_LABEL)
         if items:
-            current_task.setText(_render_agenda_item(*items[0]))
+            count = len(items)
+            noun = "εκκρεμότητα" if count == 1 else "εκκρεμότητες"
+            current_task.setText(
+                f"{count} {noun} σήμερα — επόμενο: {_render_agenda_item(*items[0])}"
+            )
         else:
-            current_task.setText("Έτοιμος — περιμένω εντολή.")
+            current_task.setText("Τίποτα εκκρεμές σήμερα.")
 
     def _set_state(self, state: State) -> None:
         """The one place that updates the status label, the orb and the
@@ -868,6 +1098,14 @@ class MainWindow(QMainWindow):
         widget(self, STATUS_LABEL).setText(_STATUS_TEXT[state])
         widget(self, RECORD_BUTTON).setEnabled(state is State.IDLE)
         self._orb.set_state(state)
+        # The Home page's own, larger status word -- a second rendering of
+        # the same state, not a second source of truth for it (see
+        # _HOME_STATE_TEXT above). The prompt line ("«Πώς μπορώ να
+        # βοηθήσω;»") is hidden outside IDLE: it's an invitation to speak,
+        # which stops being the useful thing to say the moment a turn is
+        # already under way.
+        widget(self, HOME_STATE_LABEL).setText(_HOME_STATE_TEXT[state])
+        widget(self, HOME_PROMPT_LABEL).setVisible(state is State.IDLE)
         # The dot's colour is per-instance, not per-class, so it's set here
         # directly rather than through _STYLESHEET -- a plain object-name or
         # property selector can't express "whichever colour this state maps
@@ -894,14 +1132,15 @@ class MainWindow(QMainWindow):
     # --- Central widget: header + sidebar + pages ----------------------------
 
     def _build_central_widget(self) -> None:
-        central = QWidget(self)
+        # _Background (see its own docstring) replaces the old plain
+        # QWidget + QSS-gradient canvas -- it's what lets the faint grid and
+        # the drifting particles exist at all, since QSS has no way to
+        # express either. Kept as self._background so __init__ can connect
+        # its tick() to the same timer the orb's animation already uses.
+        central = _Background(self)
         central.setObjectName("appBackground")
-        # A plain QWidget subclass doesn't paint a stylesheet background on
-        # its own -- unlike QFrame/QLabel/QPushButton, which do -- so without
-        # this attribute the #appBackground gradient rule below would be
-        # silently ignored and the window would fall back to flat black.
-        central.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setCentralWidget(central)
+        self._background = central
 
         outer = QVBoxLayout(central)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -921,6 +1160,7 @@ class MainWindow(QMainWindow):
         self._stack.addWidget(self._build_tasks_page())
         self._stack.addWidget(self._build_files_page())
         self._stack.addWidget(self._build_settings_page())
+        self._stack.addWidget(self._build_automations_page())
         body.addWidget(self._stack, stretch=1)
 
     def _build_header(self) -> QWidget:
@@ -975,39 +1215,89 @@ class MainWindow(QMainWindow):
         return header
 
     def _build_sidebar(self) -> QWidget:
+        """A refined navigation hierarchy per the redesign brief: a brand
+        caption, four plain pages, a grouped "ΑΥΤΟΜΑΤΟΠΟΙΗΣΕΙΣ" section, and
+        Settings on its own below a stretch -- rather than five flat,
+        identical buttons. Each label carries a small glyph instead of
+        relying on text alone (the brief's own "use icons rather than
+        relying on text alone"), drawn as a plain leading character rather
+        than a loaded icon asset -- same reasoning as _dot_icon(): a plain
+        character renders identically everywhere PySide6 runs, with no
+        tofu-box risk. None of this touches button.text() in a way that
+        would collide with another test's exact-label lookup -- nothing
+        asserts on a *nav* button's text, only on its object name (see
+        SidebarNavigationTests), and QuickActionWiringTests looks up quick-
+        action buttons specifically, which these aren't."""
         sidebar = QFrame()
         sidebar.setObjectName("sidebar")
         layout = QVBoxLayout(sidebar)
+        layout.setContentsMargins(12, 20, 12, 16)
+        layout.setSpacing(2)
+
+        self._nav_buttons: dict[str, QPushButton] = {}
+
+        brand = QLabel("JARVIS")
+        brand.setObjectName("sidebarBrand")
+        layout.addWidget(brand)
+        layout.addWidget(self._build_sidebar_divider())
 
         # Greek, matching each page's own _page_title() exactly -- these used
         # to be English ("Chat") while the page you landed on said
         # "Συνομιλία", a mismatch nobody asked for and nothing in the app
         # otherwise has: Jarvis speaks Greek throughout (see "Language" in
         # CLAUDE.md), and the sidebar was the one place still in English.
-        nav_items = [
-            (NAV_HOME, "Αρχική", 0),
-            (NAV_CHAT, "Συνομιλία", 1),
-            (NAV_TASKS, "Εργασίες", 2),
-            (NAV_FILES, "Αρχεία", 3),
-            (NAV_SETTINGS, "Ρυθμίσεις", 4),
-        ]
-        self._nav_buttons: dict[str, QPushButton] = {}
-        for object_name, label, index in nav_items:
-            button = QPushButton(label)
-            button.setObjectName(object_name)
-            button.setCheckable(True)
-            button.setProperty("navButton", True)
-            button.clicked.connect(
-                lambda _checked=False, i=index, name=object_name: self._go_to_page(
-                    name, index=i
-                )
-            )
-            layout.addWidget(button)
-            self._nav_buttons[object_name] = button
-        self._nav_buttons[NAV_HOME].setChecked(True)
+        for object_name, label, index in (
+            (NAV_HOME, "⌂  Αρχική", 0),
+            (NAV_CHAT, "◉  Συνομιλία", 1),
+            (NAV_TASKS, "✓  Εργασίες", 2),
+            (NAV_FILES, "▣  Αρχεία", 3),
+        ):
+            layout.addWidget(self._build_nav_button(object_name, label, index))
+
+        layout.addWidget(self._build_sidebar_divider())
+        automations_label = QLabel("ΑΥΤΟΜΑΤΟΠΟΙΗΣΕΙΣ")
+        automations_label.setObjectName("sidebarSection")
+        layout.addWidget(automations_label)
+        # Both route to the same stub page (index 5, see
+        # _build_automations_page) -- Jarvis has no concept of a
+        # schedulable "automation" distinct from an ordinary skill match
+        # today, so "Active"/"History" can't honestly show two different
+        # real views yet. Two buttons rather than one is still the right
+        # call: it's what the brief's own navigation hierarchy asks for,
+        # and the stub page says plainly why there's only one view behind
+        # them, rather than silently collapsing the ask down to nothing.
+        layout.addWidget(
+            self._build_nav_button(NAV_AUTOMATIONS_ACTIVE, "⚡  Ενεργές", 5)
+        )
+        layout.addWidget(
+            self._build_nav_button(NAV_AUTOMATIONS_HISTORY, "◌  Ιστορικό", 5)
+        )
 
         layout.addStretch(1)
+        layout.addWidget(self._build_sidebar_divider())
+        layout.addWidget(self._build_nav_button(NAV_SETTINGS, "⚙  Ρυθμίσεις", 4))
+
+        self._nav_buttons[NAV_HOME].setChecked(True)
         return sidebar
+
+    def _build_nav_button(self, object_name: str, label: str, index: int) -> QPushButton:
+        button = QPushButton(label)
+        button.setObjectName(object_name)
+        button.setCheckable(True)
+        button.setProperty("navButton", True)
+        button.clicked.connect(
+            lambda _checked=False, i=index, name=object_name: self._go_to_page(
+                name, index=i
+            )
+        )
+        self._nav_buttons[object_name] = button
+        return button
+
+    def _build_sidebar_divider(self) -> QFrame:
+        divider = QFrame()
+        divider.setObjectName("sidebarDivider")
+        divider.setFrameShape(QFrame.Shape.HLine)
+        return divider
 
     def _go_to_page(self, object_name: str, index: int | None = None) -> None:
         """Switches the stacked widget to the named page and keeps exactly
@@ -1023,6 +1313,16 @@ class MainWindow(QMainWindow):
     # --- Home page: the orb, quick actions, system status, current task -----
 
     def _build_home_page(self) -> QWidget:
+        """The redesign brief's central complaint was that this page was too
+        much empty floor around a small circle -- "replace the empty center
+        with useful information". This version keeps the orb as the page's
+        one focal object (bigger now, see _Orb.__init__) but surrounds it
+        with real content instead of just a record button: a time-of-day
+        greeting at the top, a status word and an idle-only invitation to
+        speak directly under the orb, a second "open the full conversation"
+        action beside the record button, and a grounded Recent Activity
+        panel underneath -- never invented text, only what this session's
+        own turns and quick actions actually did (see _log_activity())."""
         page = QWidget()
         layout = QHBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -1038,24 +1338,77 @@ class MainWindow(QMainWindow):
         center_frame = QFrame()
         center_frame.setObjectName("homeGlow")
         center = QVBoxLayout(center_frame)
-        center.setSpacing(28)
+        center.setContentsMargins(32, 20, 32, 24)
+        center.setSpacing(6)
+
+        greeting = QLabel("")
+        greeting.setObjectName(HOME_GREETING_LABEL)
+        greeting.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        center.addWidget(greeting)
+
         center.addStretch(1)
 
         self._orb = _Orb()
         center.addWidget(self._orb, alignment=Qt.AlignmentFlag.AlignCenter)
-        # No caption or quote under the orb -- the first pass had a
-        # decorative quote here that named nothing and did nothing; the
-        # second pass's brief is explicit that an element earns its place by
-        # communicating information, enabling interaction, or giving
-        # feedback, not by filling empty space. The orb's own state (colour,
-        # motion) and the status row in the header already say what Jarvis
-        # is doing; a quote said nothing further.
 
+        state_label = QLabel(_HOME_STATE_TEXT[State.IDLE])
+        state_label.setObjectName(HOME_STATE_LABEL)
+        state_label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        center.addWidget(state_label)
+
+        # The brief's own example line ("How can I help you?") -- a static
+        # invitation, not data, so it carries no risk of inventing anything;
+        # hidden outside IDLE by _set_state(), since "how can I help" stops
+        # being the useful thing to say once a turn is already under way.
+        prompt_label = QLabel("«Πώς μπορώ να βοηθήσω;»")
+        prompt_label.setObjectName(HOME_PROMPT_LABEL)
+        prompt_label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        center.addWidget(prompt_label)
+
+        center.addSpacing(10)
+
+        buttons_row = QHBoxLayout()
+        buttons_row.setSpacing(12)
+        buttons_row.addStretch(1)
         record_button = QPushButton("Εγγραφή")
         record_button.setObjectName(RECORD_BUTTON)
         record_button.clicked.connect(self._start_listening)
-        center.addWidget(record_button, alignment=Qt.AlignmentFlag.AlignCenter)
+        buttons_row.addWidget(record_button)
+        # "[ Open Conversation ]" from the brief -- a real action (switches
+        # to the already-built Chat page), not a second recording control:
+        # this app's architecture has no notion of press-to-start/release-
+        # to-stop (listener.listen() blocks until silence is detected, not
+        # until a key is released), so "Hold Space to Talk" is answered
+        # below as a press-to-start shortcut instead (see keyPressEvent)
+        # rather than claimed literally for a gesture this pipeline can't
+        # actually do.
+        open_chat_button = QPushButton("Άνοιξε Συνομιλία")
+        open_chat_button.setObjectName(OPEN_CONVERSATION_BUTTON)
+        open_chat_button.setProperty("secondaryAction", True)
+        open_chat_button.clicked.connect(
+            lambda: self._go_to_page(NAV_CHAT, index=1)
+        )
+        buttons_row.addWidget(open_chat_button)
+        buttons_row.addStretch(1)
+        center.addLayout(buttons_row)
+
+        hint_label = QLabel("Πάτησε Space ή κάνε κλικ στην Εγγραφή.")
+        hint_label.setObjectName("mutedText")
+        hint_label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        center.addWidget(hint_label)
+
         center.addStretch(1)
+
+        center.addWidget(self._build_home_divider())
+        center.addWidget(
+            _panel_title("Πρόσφατη Δραστηριότητα", accent="#0a84ff")
+        )
+        activity_list = QListWidget()
+        activity_list.setObjectName(RECENT_ACTIVITY_LIST)
+        activity_list.setMaximumHeight(120)
+        activity_list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        activity_list.setSelectionMode(QListWidget.SelectionMode.NoSelection)
+        center.addWidget(activity_list)
 
         # 2:1 rather than the first pass's 3:1 -- that ratio left the side
         # column narrow and the centre column mostly bare floor around a
@@ -1067,6 +1420,12 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._build_home_sidebar(), stretch=1)
 
         return page
+
+    def _build_home_divider(self) -> QFrame:
+        divider = QFrame()
+        divider.setObjectName("divider")
+        divider.setFrameShape(QFrame.Shape.HLine)
+        return divider
 
     def _build_home_sidebar(self) -> QWidget:
         panel = QWidget()
@@ -1144,49 +1503,55 @@ class MainWindow(QMainWindow):
         box = QFrame()
         box.setObjectName("panel")
         box.setProperty("accentColor", "violet")
-        layout = QVBoxLayout(box)
-        layout.setContentsMargins(18, 16, 18, 16)
-        layout.setSpacing(8)
-        layout.addWidget(
+        outer = QVBoxLayout(box)
+        outer.setContentsMargins(18, 16, 18, 16)
+        outer.setSpacing(10)
+        outer.addWidget(
             _panel_title("Γρήγορες Ενέργειες", accent=_SECONDARY_ACCENT)
         )
 
-        # One button per site/app Jarvis can already open by voice
-        # (config.SKILL_SITES / SKILL_APPS) -- so the panel reflects what's
+        # A two-column grid of compact tiles, not a column of full-width
+        # buttons -- the brief's own example lays these out as "YouTube
+        # Gmail / Google Calculator" pairs, and a grid is what lets a short
+        # panel hold every configured site/app without scrolling. One
+        # button per site/app Jarvis can already open by voice
+        # (config.SKILL_SITES / SKILL_APPS), so the panel reflects what's
         # really configured rather than a fixed, separately-maintained list
-        # that drifts from it. Each one calls exactly the function the
-        # voice skill itself calls (skills._open_site()/_open_app()), via
-        # _quick_action_site()/_quick_action_app() below. A small solid-
-        # colour icon (see _dot_icon) is the only thing new here -- it
-        # doesn't touch button.text(), so QuickActionWiringTests' lookups
-        # by exact label and its assertions on what gets clicked are
-        # unaffected; it just gives a plain list of text rows a little
-        # visual texture, blue for a site and violet for a local app so the
-        # two kinds read apart at a glance.
+        # that drifts from it -- sites first, then apps, each calling
+        # exactly the function the voice skill itself calls
+        # (skills._open_site()/_open_app()) via _quick_action_site()/
+        # _quick_action_app() below. Neither the grid nor the icon touches
+        # button.text(), so QuickActionWiringTests' lookups by exact label
+        # and its assertions on what gets clicked are unaffected.
+        grid = QGridLayout()
+        grid.setSpacing(6)
         icon_size = QSize(10, 10)
-        for label, url in SKILL_SITES.items():
+        columns = 2
+        entries: list[tuple[str, str, object]] = [
+            (label, "site", url) for label, url in SKILL_SITES.items()
+        ] + [(label, "app", argv) for label, argv in SKILL_APPS.items()]
+        for position, (label, kind, payload) in enumerate(entries):
             button = QPushButton(label)
             button.setProperty("quickAction", True)
-            button.setIcon(_dot_icon("#0a84ff"))
+            button.setProperty("quickActionTile", True)
             button.setIconSize(icon_size)
-            button.clicked.connect(
-                lambda _checked=False, label=label, url=url: self._quick_action_site(
-                    label, url
+            if kind == "site":
+                button.setIcon(_dot_icon("#0a84ff"))
+                button.clicked.connect(
+                    lambda _checked=False, label=label, url=payload: (
+                        self._quick_action_site(label, url)
+                    )
                 )
-            )
-            layout.addWidget(button)
-
-        for label, argv in SKILL_APPS.items():
-            button = QPushButton(label)
-            button.setProperty("quickAction", True)
-            button.setIcon(_dot_icon(_SECONDARY_ACCENT))
-            button.setIconSize(icon_size)
-            button.clicked.connect(
-                lambda _checked=False, label=label, argv=argv: self._quick_action_app(
-                    label, argv
+            else:
+                button.setIcon(_dot_icon(_SECONDARY_ACCENT))
+                button.clicked.connect(
+                    lambda _checked=False, label=label, argv=payload: (
+                        self._quick_action_app(label, argv)
+                    )
                 )
-            )
-            layout.addWidget(button)
+            row, col = divmod(position, columns)
+            grid.addWidget(button, row, col)
+        outer.addLayout(grid)
 
         return box
 
@@ -1197,7 +1562,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(box)
         layout.setContentsMargins(18, 16, 18, 16)
         layout.setSpacing(8)
-        layout.addWidget(_panel_title("Τρέχουσα Εργασία", accent=_ACCENT_TEAL))
+        layout.addWidget(_panel_title("Σήμερα", accent=_ACCENT_TEAL))
 
         label = QLabel("Έτοιμος — περιμένω εντολή.")
         label.setObjectName(CURRENT_TASK_LABEL)
@@ -1220,6 +1585,7 @@ class MainWindow(QMainWindow):
             )
             return
         widget(self, TRANSCRIPT_LIST).addItem(f"Jarvis: Άνοιξα το {label}.")
+        self._log_activity(f"Άνοιξε {label}")
 
     def _quick_action_app(self, label: str, argv: list) -> None:
         """Same as _quick_action_site(), for a configured local app."""
@@ -1231,6 +1597,23 @@ class MainWindow(QMainWindow):
             )
             return
         widget(self, TRANSCRIPT_LIST).addItem(f"Jarvis: Άνοιξα το {label}.")
+        self._log_activity(f"Άνοιξε {label}")
+
+    def _log_activity(self, label: str) -> None:
+        """Appends one line (timestamped) to the Home page's Recent Activity
+        panel -- grounded in real actions this GUI just took, never
+        invented: the audit log already records which skill matched and
+        why, but not which site/app or what was actually said, so this is
+        its own small, session-only log rather than a reach into audit for
+        detail it was never built to hold. Cleared on restart, which is
+        honest -- it only ever claims "this happened in this session",
+        never a history beyond that."""
+        self._recent_activity.insert(0, (datetime.now().strftime("%H:%M"), label))
+        del self._recent_activity[5:]
+        activity_list = widget(self, RECENT_ACTIVITY_LIST)
+        activity_list.clear()
+        for stamp, text in self._recent_activity:
+            activity_list.addItem(f"{stamp}   {text}")
 
     # --- Chat page ------------------------------------------------------------
 
@@ -1295,6 +1678,37 @@ class MainWindow(QMainWindow):
         placeholder = QLabel(
             "Η διαχείριση αρχείων (αναζήτηση, άνοιγμα, οργάνωση) είναι το "
             "Phase 7 του roadmap -- δεν έχει χτιστεί ακόμα."
+        )
+        placeholder.setObjectName("mutedText")
+        placeholder.setWordWrap(True)
+        layout.addWidget(placeholder)
+        layout.addStretch(1)
+        return page
+
+    # --- Automations page (stub -- see _build_sidebar) -------------------------
+
+    def _build_automations_page(self) -> QWidget:
+        """A stub, the same honest shape as _build_files_page() above: the
+        redesign brief's own sidebar hierarchy asks for an "Automations"
+        section (Active/History), but Jarvis has no concept today of a
+        schedulable, start/stoppable "automation" as its own object -- a
+        skill match is one audit row, not a thing with a lifecycle. Rather
+        than invent fake automation data to match the mockup, this names
+        what's missing and points at what already exists that's closest to
+        it: the scheduler's reminders and timers, visible today on the
+        Tasks page and in the spoken agenda (see "Scheduler" in CLAUDE.md).
+        Both sidebar buttons (Ενεργές/Ιστορικό) route here, since there is
+        only one honest view to show either way."""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(12)
+        layout.addWidget(_page_title("Αυτοματοποιήσεις"))
+        placeholder = QLabel(
+            "Δεν υπάρχει ακόμα μια ξεχωριστή έννοια \"αυτοματοποίησης\" στο "
+            "Jarvis -- οι υπενθυμίσεις και τα χρονόμετρα του scheduler "
+            "(ορατά στη σελίδα Εργασίες) είναι το πιο κοντινό σημερινό "
+            "αντίστοιχο."
         )
         placeholder.setObjectName("mutedText")
         placeholder.setWordWrap(True)
@@ -1459,6 +1873,8 @@ class MainWindow(QMainWindow):
             return
 
         widget(self, TRANSCRIPT_LIST).addItem(f"Jarvis: {reply}")
+        summary = reply if len(reply) <= 40 else reply[:37] + "…"
+        self._log_activity(summary)
         if self._debug_mode_enabled():
             self._append_debug_line()
         # The transcript line appears now, before speech starts -- speak()
@@ -1514,11 +1930,13 @@ def widget(window: MainWindow, object_name: str) -> QWidget:
 # Tokens (hand-kept here rather than computed, since Qt's own QSS subset has
 # no variables):
 #   background        #0a0a0c   the window's own canvas -- near-black, not
-#                                 navy -- painted as a faint top-to-bottom
-#                                 gradient (#appBackground) rather than flat,
-#                                 which is the one deliberate exception to
-#                                 "no gradients" below: it reads as depth in
-#                                 the room, not as decoration on a control.
+#                                 navy -- painted as a gradient by code, not
+#                                 QSS, now that it also carries a faint grid
+#                                 and a few drifting particles (_Background,
+#                                 object name #appBackground); the one
+#                                 deliberate exception to "no gradients"
+#                                 below, since it reads as depth in the
+#                                 room, not as decoration on a control.
 #   chrome             #0d0d10   header/sidebar -- one notch above background,
 #                                 enough to read as a distinct band of UI
 #                                 chrome without competing with panels
@@ -1547,27 +1965,18 @@ QWidget {
     font-size: 13px;
 }
 
-/* The window's own background -- a soft radial wash from upper-centre
-   rather than one flat fill or a plain top-to-bottom gradient, so the room
-   reads as lit from somewhere rather than just shaded. Applied to one
-   widget spanning the whole window (see _build_central_widget(), which
-   sets WA_StyledBackground -- a plain QWidget otherwise ignores a
-   stylesheet background entirely), not to the blanket QWidget rule above:
-   a gradient applied per-widget to every label and button in the window
-   would tile independently behind each one rather than reading as one
-   continuous surface. Everything above QWidget here is deliberately left
-   without its own background-color, so this wash actually shows through
+/* The window's own background used to be painted here, as a QSS
+   qradialgradient on #appBackground -- it no longer is. QSS has no notion
+   of a repeating grid texture or of motion, and the redesign brief asks
+   for both (a faint technical texture, a few extremely restrained drifting
+   particles), so the canvas is now a real custom-painted widget instead
+   (_Background, see its own docstring and _build_central_widget()) and
+   paints the same soft radial wash itself, in code, alongside the texture
+   and particles QSS could never express. No rule for #appBackground
+   remains here on purpose -- everything above QWidget stays without its
+   own background-color so the custom paint actually shows through
    wherever nothing more specific (header/sidebar/panel/list/button) paints
-   over it. A faint accent tint in the centre stop (not pure grey) ties the
-   whole canvas back to the one accent colour everything else spends so
-   sparingly, instead of the room and the UI feeling like two different
-   palettes. */
-QWidget#appBackground {
-    background-color: qradialgradient(
-        cx:0.5, cy:0.0, radius:1.15, fx:0.5, fy:0.0,
-        stop:0 #12141b, stop:0.45 #0d0e12, stop:1 #08080a
-    );
-}
+   over it, exactly as before. */
 
 /* A soft, low-alpha radial glow behind the orb on the Home page -- ambient
    light in the room, not a second ring glued to the avatar (the orb's own
@@ -1655,8 +2064,29 @@ QLabel#date_label {
 QFrame#sidebar {
     background-color: #0d0d10;
     border-right: 1px solid rgba(255, 255, 255, 0.08);
-    min-width: 168px;
-    max-width: 168px;
+    min-width: 188px;
+    max-width: 188px;
+}
+QLabel#sidebarBrand {
+    color: rgba(245, 245, 247, 0.85);
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 2px;
+    padding: 4px 10px 10px 10px;
+}
+QLabel#sidebarSection {
+    color: rgba(245, 245, 247, 0.32);
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: 1.2px;
+    padding: 10px 10px 2px 10px;
+}
+QFrame#sidebarDivider {
+    background-color: rgba(255, 255, 255, 0.08);
+    max-height: 1px;
+    min-height: 1px;
+    border: none;
+    margin: 6px 4px;
 }
 QPushButton[navButton="true"] {
     text-align: left;
@@ -1685,21 +2115,24 @@ QFrame#panel {
     border: 1px solid rgba(255, 255, 255, 0.08);
     border-radius: 12px;
 }
-/* A thin top accent per card -- System Status/Quick Actions/Current Task
-   each own one of the two accent colours or the teal (see _SECONDARY_ACCENT/
-   _ACCENT_TEAL), so three otherwise-identical boxes read as three distinct
-   cards instead of one card repeated three times. The Settings page's form
-   panel sets no accentColor property, so it falls back to the plain
+/* A thin, low-saturation top accent per card -- System Status/Quick
+   Actions/Current Task each own one of the two accent colours or the teal
+   (see _SECONDARY_ACCENT/_ACCENT_TEAL), so three otherwise-identical boxes
+   read as three distinct cards instead of one card repeated three times.
+   1px and rgba rather than the heavier 2px solid hex this used to be --
+   "subtle borders instead of heavy card outlines" and "less saturated
+   colors" are both the redesign brief's own words. The Settings page's
+   form panel sets no accentColor property, so it falls back to the plain
    hairline border above -- a settings form doesn't need the same visual
    energy a glanceable dashboard card does. */
 QFrame#panel[accentColor="blue"] {
-    border-top: 2px solid #0a84ff;
+    border-top: 1px solid rgba(10, 132, 255, 0.55);
 }
 QFrame#panel[accentColor="violet"] {
-    border-top: 2px solid #8b5cf6;
+    border-top: 1px solid rgba(139, 92, 246, 0.5);
 }
 QFrame#panel[accentColor="teal"] {
-    border-top: 2px solid #22c3b6;
+    border-top: 1px solid rgba(34, 195, 182, 0.5);
 }
 QLabel#panelTitle {
     color: rgba(245, 245, 247, 0.72);
@@ -1748,6 +2181,53 @@ QLabel#current_task_label {
     color: #f5f5f7;
     font-size: 13px;
 }
+
+/* --- Home page: greeting / state word / prompt / divider / activity ---- */
+QLabel#home_greeting_label {
+    font-size: 15px;
+    font-weight: 500;
+    color: rgba(245, 245, 247, 0.6);
+}
+QLabel#home_state_label {
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: 2px;
+    color: rgba(245, 245, 247, 0.55);
+}
+QLabel#home_prompt_label {
+    font-size: 13px;
+    font-style: italic;
+    color: rgba(245, 245, 247, 0.4);
+}
+QFrame#divider {
+    background-color: rgba(255, 255, 255, 0.08);
+    max-height: 1px;
+    min-height: 1px;
+    border: none;
+    margin: 10px 0;
+}
+QPushButton[secondaryAction="true"] {
+    background-color: transparent;
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    color: rgba(245, 245, 247, 0.75);
+    padding: 12px 28px;
+    border-radius: 22px;
+    font-weight: 500;
+}
+QPushButton[secondaryAction="true"]:hover {
+    background-color: rgba(255, 255, 255, 0.05);
+}
+QListWidget#recent_activity_list {
+    background-color: transparent;
+    border: none;
+    padding: 0;
+}
+QListWidget#recent_activity_list::item {
+    color: rgba(245, 245, 247, 0.6);
+    font-size: 12px;
+    padding: 3px 4px;
+}
+
 QLabel#settingKey {
     color: rgba(245, 245, 247, 0.45);
     font-weight: 500;
@@ -1816,6 +2296,16 @@ QPushButton[quickAction="true"] {
     padding: 9px 12px;
     background-color: transparent;
     border: none;
+}
+/* The grid-tile variant (_build_quick_actions_box's two-column layout) --
+   tighter padding and a smaller face than the full-width rule above, since
+   a tile only has half the panel's width to work with. Both properties are
+   set together on every quick-action button, so this simply narrows what
+   the rule above already applies. */
+QPushButton[quickActionTile="true"] {
+    padding: 7px 9px;
+    font-size: 12px;
+    border-radius: 7px;
 }
 QPushButton[quickAction="true"]:hover {
     background-color: rgba(255, 255, 255, 0.06);
